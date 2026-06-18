@@ -1,0 +1,113 @@
+{
+  "provenance": {
+    "engine": "ORCA",
+    "version": "6.1.1",
+    "settings": "! <method> TightOpt Bohrs VeryTightSCF NoRI; basis injected via %basis NewGTO from vendored data/basis/*.json (BSE)",
+    "generated": "2026-06-07",
+    "generator": "ORCA generator script (--opt)",
+    "geometries": "tests/ref/geometries.json (starting geometries)",
+    "note": "Optimized geometry in BOHR. Compare via rotation/translation-invariant internals (bond lengths, angles), not raw Cartesians. ORCA is a data oracle only; raw ORCA files are never committed."
+  },
+  "entries": [
+    {
+      "molecule": "h2",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -1.128746115957,
+      "geometry_bohr": [
+        [
+          "H",
+          0.0,
+          0.0,
+          -0.006714
+        ],
+        [
+          "H",
+          0.0,
+          0.0,
+          1.406714
+        ]
+      ]
+    },
+    {
+      "molecule": "h2",
+      "basis": "sto-3g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -1.117505885156,
+      "geometry_bohr": [
+        [
+          "H",
+          0.0,
+          0.0,
+          0.02704
+        ],
+        [
+          "H",
+          0.0,
+          0.0,
+          1.37296
+        ]
+      ]
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.02705351266,
+      "geometry_bohr": [
+        [
+          "O",
+          -0.0,
+          -0.018965,
+          0.0
+        ],
+        [
+          "H",
+          1.415008,
+          1.074419,
+          0.0
+        ],
+        [
+          "H",
+          -1.415008,
+          1.074419,
+          0.0
+        ]
+      ]
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -74.965901217193,
+      "geometry_bohr": [
+        [
+          "O",
+          0.0,
+          -0.091037,
+          0.0
+        ],
+        [
+          "H",
+          1.432565,
+          1.110455,
+          0.0
+        ],
+        [
+          "H",
+          -1.432565,
+          1.110455,
+          0.0
+        ]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "provenance": {
+    "engine": "PySCF",
+    "version": "2.13.1",
+    "settings": "RHF-CCSD (spatial-orbital t1); SCF conv_tol 1e-11, CCSD conv_tol 1e-10; cart=False (spherical); basis built from vendored data/basis/*.json (BSE), never PySCF's internal library.",
+    "definition": "T1 = ||t1||_F / sqrt(N_corr_elec), N_corr_elec = 2 * n_correlated_occupied (Lee & Taylor; PySCF cc.get_t1_diagnostic, the ORCA/CFOUR closed-shell convention).",
+    "generated": "2026-06-11",
+    "generator": "PySCF generator script",
+    "geometries": "tests/ref/geometries.json",
+    "tolerances": "T1 is amplitude-level; hartree<->ref gate 1e-8 (CCSD amplitudes converged to 1e-10 in both programs)."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "ccsd",
+      "n_frozen": 1,
+      "n_corr_elec": 8,
+      "scf_energy": -75.95252907015949,
+      "correlation_energy": -0.1485241881507931,
+      "t1_diagnostic": 0.009982442609047513
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "ccsd",
+      "n_frozen": 0,
+      "n_corr_elec": 10,
+      "scf_energy": -75.95252907015951,
+      "correlation_energy": -0.14941268168004868,
+      "t1_diagnostic": 0.008928895227069768
+    }
+  ]
+}

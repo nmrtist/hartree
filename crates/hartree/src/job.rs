@@ -1,0 +1,1977 @@
+use crate::basis::BasisError;
+use crate::basis::BasisSet;
+use crate::cc::{
+    CcsdOptions, CcsdResult, CcsdTResult, Mp2Result, RiMp2Result, frozen_core_orbitals,
+    rccsd_spin_adapted, rccsd_t_spin_adapted, rhf_mp2, rhf_ri_mp2, uhf_mp2, uhf_ri_mp2,
+};
+use crate::core::Molecule;
+use crate::dft::{
+    COSX_DEFAULT_GRID, CosxExchange, CosxProvider, CubeParams, FodResult, FunctionalSpec, GridXc,
+};
+use crate::disp::Dispersion;
+use crate::integrals::{ConventionalProvider, DfProvider, DirectProvider, IntegralProvider};
+use crate::linalg::{mat_from_row_major, mat_to_row_major};
+use crate::opt::{OptOptions, OptResult, Surface, optimize};
+use crate::props::dipole::{center_of_mass, dipole_moment};
+use crate::props::frequencies::{FrequencyResult, harmonic_frequencies};
+use crate::props::hessian::numerical_hessian;
+use crate::props::population::{PopulationAnalysis, population_analysis};
+use crate::props::thermo::{ThermoResult, rrho_thermochemistry_w0};
+use crate::scf::{
+    Reference, ScfOptions, ScfResult, Smearing, SolventModel, XcContributor, run_scf_with_env,
+};
+use crate::solv::Cpcm;
+
+use crate::surface::HfSurface;
+
+pub(crate) struct EcpAwareSetup {
+    pub charges: Vec<([f64; 3], f64)>,
+    pub ecps: Vec<crate::integrals::integral::Ecp>,
+    pub nuclear_repulsion: f64,
+}
+
+pub(crate) fn ecp_setup(mol: &Molecule, ao: &crate::basis::AoBasis) -> EcpAwareSetup {
+    let charges: Vec<([f64; 3], f64)> = mol
+        .atoms
+        .iter()
+        .zip(ao.ecp_core())
+        .map(|(a, &c)| (a.position, a.z_eff() as f64 - c as f64))
+        .collect();
+    let zeff: Vec<f64> = charges.iter().map(|&(_, q)| q).collect();
+    EcpAwareSetup {
+        ecps: ao.ecps().to_vec(),
+        nuclear_repulsion: mol.nuclear_repulsion_with(&zeff),
+        charges,
+    }
+}
+
+pub(crate) fn x2c_hcore_override(
+    ao: &crate::basis::AoBasis,
+    charges: &[([f64; 3], f64)],
+    lindep: f64,
+) -> Result<Vec<f64>, String> {
+    let b = ao.integral();
+    let s = b.overlap();
+    let t = b.kinetic();
+    let v = b.nuclear(charges);
+    let w = b.pvp_charges(charges);
+    crate::scf::x2c::x2c1e_hcore(
+        &s,
+        &t,
+        &v,
+        &w,
+        b.nao(),
+        crate::scf::x2c::SPEED_OF_LIGHT_AU,
+        lindep,
+    )
+    .map(|out| out.h)
+    .map_err(|e| e.to_string())
+}
+
+pub fn ecp_summary(mol: &Molecule, set: &BasisSet) -> Vec<(String, u32, u32)> {
+    let mut seen = Vec::new();
+    for atom in &mol.atoms {
+        let z = atom.element.z();
+        if let Some(e) = set.ecp_for(z)
+            && !seen.iter().any(|&(_, sz, _)| sz == z)
+        {
+            seen.push((atom.element.symbol().to_string(), z, e.n_core));
+        }
+    }
+    seen
+}
+
+#[derive(Debug, Clone)]
+pub enum Method {
+    Rhf,
+    Uhf,
+    Rohf,
+    Mp2,
+    Ccsd,
+    CcsdT,
+    Dft(FunctionalSpec),
+}
+
+#[derive(Debug, Clone)]
+pub struct JobOptions {
+    pub all_electron: bool,
+    pub direct: bool,
+    pub ri: bool,
+    pub compute_properties: bool,
+    pub compute_frequencies: bool,
+    pub single_point_hessian: bool,
+    pub optimize_geometry: bool,
+    pub symmetry_number: u32,
+    pub qrrho_w0_cm1: f64,
+    pub grid_level: usize,
+    pub dispersion: Option<Dispersion>,
+    pub solvent_eps: Option<f64>,
+    pub smd: Option<String>,
+    pub alpb: Option<String>,
+    pub gbsa: Option<String>,
+    pub cosmo_file: Option<std::path::PathBuf>,
+    pub gcp: Option<crate::disp::GcpParams>,
+    pub srb: Option<crate::disp::SrbParams>,
+    pub smearing: Option<Smearing>,
+    pub fod: bool,
+    pub fod_cube: Option<std::path::PathBuf>,
+    pub ri_mp2: bool,
+    pub cosx: bool,
+    pub x2c: bool,
+}
+
+impl Default for JobOptions {
+    fn default() -> Self {
+        Self {
+            all_electron: false,
+            direct: false,
+            ri: false,
+            compute_properties: false,
+            compute_frequencies: false,
+            single_point_hessian: false,
+            optimize_geometry: false,
+            symmetry_number: 1,
+            qrrho_w0_cm1: crate::props::thermo::QRRHO_W0_DEFAULT_CM1,
+            grid_level: 3,
+            dispersion: None,
+            solvent_eps: None,
+            smd: None,
+            alpb: None,
+            gbsa: None,
+            cosmo_file: None,
+            gcp: None,
+            srb: None,
+            smearing: None,
+            fod: false,
+            fod_cube: None,
+            ri_mp2: false,
+            cosx: false,
+            x2c: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PostHfResult {
+    Mp2 {
+        result: Mp2Result,
+        n_frozen: usize,
+    },
+    RiMp2 {
+        result: RiMp2Result,
+        n_frozen: usize,
+        aux_basis: String,
+    },
+    Ccsd {
+        result: CcsdResult,
+        n_frozen: usize,
+    },
+    CcsdT {
+        result: CcsdTResult,
+        n_frozen: usize,
+    },
+}
+
+impl PostHfResult {
+    pub fn total_energy(&self) -> f64 {
+        match self {
+            Self::Mp2 { result, .. } => result.total_energy,
+            Self::RiMp2 { result, .. } => result.total_energy,
+            Self::Ccsd { result, .. } => result.total_energy,
+            Self::CcsdT { result, .. } => result.total_energy,
+        }
+    }
+
+    pub fn converged(&self) -> bool {
+        match self {
+            Self::Mp2 { .. } | Self::RiMp2 { .. } => true,
+            Self::Ccsd { result, .. } => result.converged,
+            Self::CcsdT { result, .. } => result.ccsd.converged,
+        }
+    }
+
+    pub fn n_frozen(&self) -> usize {
+        match self {
+            Self::Mp2 { n_frozen, .. }
+            | Self::RiMp2 { n_frozen, .. }
+            | Self::Ccsd { n_frozen, .. }
+            | Self::CcsdT { n_frozen, .. } => *n_frozen,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DoubleHybridData {
+    pub functional_name: String,
+    pub scf_functional_name: String,
+    pub e_scf: f64,
+    pub e_os: f64,
+    pub e_ss: f64,
+    pub c_os: f64,
+    pub c_ss: f64,
+    pub n_frozen: usize,
+    pub vv10_scale: f64,
+    pub pt2_aux_basis: Option<String>,
+}
+
+impl DoubleHybridData {
+    pub fn pt2_energy(&self) -> f64 {
+        self.pt2_energy_with(self.c_os, self.c_ss)
+    }
+
+    pub fn pt2_energy_with(&self, c_os: f64, c_ss: f64) -> f64 {
+        c_os * self.e_os + c_ss * self.e_ss
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SmdData {
+    pub solvent: String,
+    pub epsilon: f64,
+    pub e_gas: f64,
+    pub e_solution: f64,
+    pub g_ep: f64,
+    pub g_cds: f64,
+    pub dg_solv: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct GbsaData {
+    pub model: &'static str,
+    pub solvent: String,
+    pub epsilon: f64,
+    pub g_born: f64,
+    pub g_hb: f64,
+    pub g_sasa: f64,
+    pub g_shift: f64,
+    pub g_solv: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PropertiesResult {
+    pub dipole_au: [f64; 3],
+    pub population: PopulationAnalysis,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrequencyData {
+    pub frequencies: FrequencyResult,
+    pub thermochemistry: ThermoResult,
+    pub is_sph: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DftDiagnostics {
+    pub functional_name: String,
+    pub grid_level: usize,
+    pub n_grid_points: usize,
+    pub exx_fraction: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CosxDiagnostics {
+    pub grid: String,
+    pub n_points: usize,
+    pub overlap_fitted: bool,
+    pub rs_omega: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RiDiagnostics {
+    pub aux_basis: String,
+    pub naux: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct JobResult {
+    pub scf: ScfResult,
+    pub optimized_geometry: Option<OptResult>,
+    pub post_hf: Option<PostHfResult>,
+    pub properties: Option<PropertiesResult>,
+    pub frequencies: Option<FrequencyData>,
+    pub dft: Option<DftDiagnostics>,
+    pub ri: Option<RiDiagnostics>,
+    pub cosx: Option<CosxDiagnostics>,
+    pub dispersion_energy: Option<f64>,
+    pub gcp_energy: Option<f64>,
+    pub srb_energy: Option<f64>,
+    pub fod: Option<FodResult>,
+    pub vv10_energy: Option<f64>,
+    pub double_hybrid: Option<DoubleHybridData>,
+    pub smd: Option<SmdData>,
+    pub gbsa: Option<GbsaData>,
+    pub method_warnings: Vec<String>,
+}
+
+impl JobResult {
+    pub fn best_energy(&self) -> f64 {
+        let base = match (&self.post_hf, &self.double_hybrid) {
+            (Some(p), _) => p.total_energy(),
+            (None, Some(dh)) => dh.e_scf + dh.pt2_energy(),
+            (None, None) => self.scf.energy,
+        };
+        base + self.dispersion_energy.unwrap_or(0.0)
+            + self.gcp_energy.unwrap_or(0.0)
+            + self.srb_energy.unwrap_or(0.0)
+            + self.vv10_energy.unwrap_or(0.0)
+            + self.smd.as_ref().map_or(0.0, |s| s.g_cds)
+            + self.gbsa.as_ref().map_or(0.0, |g| g.g_solv)
+    }
+
+    pub fn converged(&self) -> bool {
+        let scf_ok = self.scf.converged;
+        let post_ok = self.post_hf.as_ref().is_none_or(|p| p.converged());
+        let opt_ok = self.optimized_geometry.as_ref().is_none_or(|o| o.converged);
+        scf_ok && post_ok && opt_ok
+    }
+}
+
+pub struct Job {
+    pub molecule: Molecule,
+    pub basis: String,
+    pub method: Method,
+    pub options: JobOptions,
+}
+
+impl Job {
+    pub fn run(&self) -> Result<JobResult, String> {
+        let mut result = self.run_inner()?;
+        result.method_warnings = crate::guardrails::assess_job(self);
+        if let Some(name) = &self.options.smd
+            && result.converged()
+        {
+            let solvent = resolve_smd_solvent(name)?;
+            let mol = match &result.optimized_geometry {
+                Some(opt) => {
+                    let atoms = self
+                        .molecule
+                        .atoms
+                        .iter()
+                        .zip(&opt.positions)
+                        .map(|(a, p)| crate::core::Atom::new(a.element, *p))
+                        .collect();
+                    Molecule::new(atoms, self.molecule.charge, self.molecule.multiplicity)
+                }
+                None => self.molecule.clone(),
+            };
+            let zs: Vec<usize> = mol.atoms.iter().map(|a| a.element.z() as usize).collect();
+            let coords: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.position).collect();
+            let g_cds =
+                crate::solv::cds_energy(&zs, &coords, solvent, crate::solv::smd::DEFAULT_SASA_GRID)
+                    .map_err(|e| e.to_string())?;
+            let gas = Job {
+                molecule: mol,
+                basis: self.basis.clone(),
+                method: self.method.clone(),
+                options: JobOptions {
+                    smd: None,
+                    solvent_eps: None,
+                    optimize_geometry: false,
+                    compute_properties: false,
+                    compute_frequencies: false,
+                    dispersion: None,
+                    gcp: None,
+                    srb: None,
+                    fod: false,
+                    fod_cube: None,
+                    ..self.options.clone()
+                },
+            }
+            .run_inner()?;
+            if !gas.scf.converged {
+                return Err("SMD gas-phase reference SCF did not converge".into());
+            }
+            let g_ep = result.scf.energy - gas.scf.energy;
+            result.smd = Some(SmdData {
+                solvent: solvent.name.to_string(),
+                epsilon: solvent.epsilon,
+                e_gas: gas.scf.energy,
+                e_solution: result.scf.energy,
+                g_ep,
+                g_cds,
+                dg_solv: g_ep + g_cds,
+            });
+        }
+
+        if (self.options.alpb.is_some() || self.options.gbsa.is_some()) && result.scf.converged {
+            let (params, model_label) = if let Some(name) = &self.options.alpb {
+                (resolve_alpb_solvent(name)?, "ALPB")
+            } else {
+                (
+                    resolve_gbsa_solvent(self.options.gbsa.as_ref().unwrap())?,
+                    "GBSA",
+                )
+            };
+            let mol = &self.molecule;
+            let ao = BasisSet::load(&self.basis)
+                .map_err(|e| e.to_string())?
+                .build(mol)
+                .map_err(|e| e.to_string())?;
+            let setup = ecp_setup(mol, &ao);
+            let provider =
+                ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
+            let pop = population_analysis(
+                &provider,
+                mol,
+                &result.scf.density_alpha,
+                &result.scf.density_beta,
+            );
+            let zs: Vec<usize> = mol.atoms.iter().map(|a| a.element.z() as usize).collect();
+            let coords: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.position).collect();
+            let bd = crate::solv::gbsa_energy(
+                params,
+                &zs,
+                &coords,
+                &pop.mulliken_charges,
+                crate::solv::DEFAULT_GBSA_GRID,
+            )
+            .map_err(|e| e.to_string())?;
+            result.gbsa = Some(GbsaData {
+                model: model_label,
+                solvent: params.name.to_string(),
+                epsilon: params.epsv,
+                g_born: bd.g_born,
+                g_hb: bd.g_hb,
+                g_sasa: bd.g_sasa,
+                g_shift: bd.g_shift,
+                g_solv: bd.g_solv,
+            });
+        }
+        Ok(result)
+    }
+
+    fn run_cosmo_export(
+        &self,
+        mol: &Molecule,
+        n_alpha: usize,
+        n_beta: usize,
+        reference: Reference,
+    ) -> Result<JobResult, String> {
+        const BOHR_TO_AA: f64 = 0.529_177_210_903;
+        let opts = &self.options;
+        let path = opts.cosmo_file.as_ref().expect("cosmo_file path");
+        let ao = BasisSet::load(&self.basis)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?;
+        let setup = ecp_setup(mol, &ao);
+        let grid_xc = if let Method::Dft(spec) = &self.method {
+            Some(GridXc::new(mol, &ao, spec, opts.grid_level).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let dft_diag = grid_xc.as_ref().map(|g| DftDiagnostics {
+            functional_name: g.name().to_string(),
+            grid_level: g.level(),
+            n_grid_points: g.n_points(),
+            exx_fraction: g.exx_fraction(),
+        });
+        let scf_opts = if grid_xc.is_some() {
+            ScfOptions {
+                energy_tol: 1e-9,
+                error_tol: 1e-6,
+                ..ScfOptions::default()
+            }
+        } else {
+            ScfOptions::default()
+        };
+        let xc_ref = grid_xc.as_ref().map(|g| g as &dyn XcContributor);
+        let provider =
+            ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
+        let eps = f64::INFINITY;
+        let cpcm =
+            Cpcm::new(&provider, mol, eps, crate::solv::DEFAULT_GRID).map_err(|e| e.to_string())?;
+        let scf = run_scf_with_env(
+            &provider,
+            n_alpha,
+            n_beta,
+            reference,
+            setup.nuclear_repulsion,
+            &scf_opts,
+            xc_ref,
+            Some(&cpcm as &dyn SolventModel),
+        )
+        .map_err(|e| e.to_string())?;
+
+        if scf.converged {
+            let (segments, dielectric_energy) = cpcm.cosmo_segments(&scf.density, scf.n_basis);
+            let atoms = mol
+                .atoms
+                .iter()
+                .map(|a| {
+                    let r = crate::solv::cavity_radius(a.element.z() as usize)
+                        .map_err(|e| e.to_string())?;
+                    Ok::<_, String>(crate::solv::CosmoAtom {
+                        symbol: a.element.symbol().to_string(),
+                        position: a.position,
+                        radius: r * BOHR_TO_AA,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let export = crate::solv::CosmoExport {
+                epsilon: eps,
+                total_energy: scf.energy,
+                dielectric_energy,
+                atoms,
+                segments,
+            };
+            std::fs::write(path, crate::solv::write_cosmo(&export))
+                .map_err(|e| format!("writing COSMO file {}: {e}", path.display()))?;
+        }
+
+        Ok(JobResult {
+            method_warnings: Vec::new(),
+            scf,
+            optimized_geometry: None,
+            post_hf: None,
+            properties: None,
+            frequencies: None,
+            dft: dft_diag,
+            ri: None,
+            cosx: None,
+            dispersion_energy: None,
+            gcp_energy: None,
+            srb_energy: None,
+            fod: None,
+            vv10_energy: None,
+            double_hybrid: None,
+            smd: None,
+            gbsa: None,
+        })
+    }
+
+    fn run_inner(&self) -> Result<JobResult, String> {
+        let mol = &self.molecule;
+        let opts = &self.options;
+        let n_solv = [
+            opts.solvent_eps.is_some(),
+            opts.smd.is_some(),
+            opts.alpb.is_some(),
+            opts.gbsa.is_some(),
+            opts.cosmo_file.is_some(),
+        ]
+        .iter()
+        .filter(|&&x| x)
+        .count();
+        if n_solv > 1 {
+            return Err(
+                "the solvation models are mutually exclusive: choose at most one of \
+                 --solvent/--eps (C-PCM), --smd, --alpb, --gbsa, or --cosmo-file"
+                    .into(),
+            );
+        }
+        if let Some(name) = &opts.smd {
+            resolve_smd_solvent(name)?;
+        }
+        if let Some(name) = &opts.alpb {
+            resolve_alpb_solvent(name)?;
+        }
+        if let Some(name) = &opts.gbsa {
+            resolve_gbsa_solvent(name)?;
+        }
+        if opts.alpb.is_some() || opts.gbsa.is_some() {
+            let model = if opts.alpb.is_some() { "ALPB" } else { "GBSA" };
+            if opts.optimize_geometry {
+                return Err(format!(
+                    "{model} is a post-SCF single-point correction: geometry \
+                     optimization is not supported (no {model} gradient on ab-initio charges)"
+                ));
+            }
+            if opts.compute_frequencies {
+                return Err(format!(
+                    "{model} is a post-SCF single-point correction: frequencies are \
+                     not supported"
+                ));
+            }
+        }
+        let solvated = opts.solvent_eps.is_some()
+            || opts.smd.is_some()
+            || opts.alpb.is_some()
+            || opts.gbsa.is_some()
+            || opts.cosmo_file.is_some();
+
+        if mol.has_ghosts() {
+            if mol.n_real_atoms() == 0 {
+                return Err(
+                    "ghost-only molecule: every atom is a ghost (basis functions only); \
+                     at least one real atom is required"
+                        .into(),
+                );
+            }
+            if opts.optimize_geometry {
+                return Err("geometry optimization with ghost atoms is not supported \
+                     (the internal-coordinate model assumes real nuclei); run single points"
+                    .into());
+            }
+            if opts.compute_frequencies {
+                return Err(
+                    "frequencies with ghost atoms are not supported (RRHO mass-weighting \
+                     assumes real nuclei on every center)"
+                        .into(),
+                );
+            }
+            if opts.compute_properties {
+                return Err("properties with ghost atoms are not supported (nuclear \
+                     dipole and Mulliken charges need the ghost-aware Z convention)"
+                    .into());
+            }
+            if solvated {
+                return Err(
+                    "implicit solvation (C-PCM/SMD) with ghost atoms is not supported this \
+                     round (the cavity construction assumes real atoms)"
+                        .into(),
+                );
+            }
+        }
+
+        if let Method::Dft(spec) = &self.method
+            && spec.double_hybrid().is_some()
+        {
+            let name = spec.name();
+            if mol.multiplicity > 1 {
+                return Err(format!(
+                    "{name} is a double hybrid: only closed-shell (RKS) references are \
+                     supported (got multiplicity {}); open-shell double hybrids \
+                     are out of scope",
+                    mol.multiplicity
+                ));
+            }
+            if opts.optimize_geometry {
+                return Err(format!(
+                    "{name} is a double hybrid: geometry optimization is not supported \
+                     (no PT2 gradient)"
+                ));
+            }
+            if opts.compute_frequencies {
+                return Err(format!(
+                    "{name} is a double hybrid: frequencies are not supported (no PT2 gradient)"
+                ));
+            }
+            if opts.direct {
+                return Err(format!(
+                    "{name} is a double hybrid: --direct is not supported (the PT2 step \
+                     needs the conventional in-core ERI tensor)"
+                ));
+            }
+            if opts.ri {
+                return Err(format!(
+                    "{name} is a double hybrid: --ri is not supported (the PT2 step needs \
+                     the conventional in-core ERI tensor)"
+                ));
+            }
+            if opts.cosx {
+                return Err(format!(
+                    "{name} is a double hybrid: --cosx is not supported (the PT2 step needs \
+                     orbitals from exact exchange)"
+                ));
+            }
+            if opts.smearing.is_some() {
+                return Err(format!(
+                    "{name} is a double hybrid: Fermi smearing is not supported (fractional \
+                     occupations have no single-determinant PT2 treatment)"
+                ));
+            }
+            if opts.fod {
+                return Err(format!(
+                    "{name} is a double hybrid: FOD analysis is not supported (the smeared \
+                     diagnostic has no PT2 counterpart)"
+                ));
+            }
+            if solvated {
+                return Err(format!(
+                    "{name} is a double hybrid: implicit solvation (C-PCM/SMD) is not \
+                     supported (the PT2 step on solvated KS orbitals is unvalidated)"
+                ));
+            }
+        }
+
+        if let Method::Dft(spec) = &self.method {
+            let rs = spec.cam().is_some();
+            let vv10 = spec.vv10().is_some();
+            if rs || vv10 {
+                let what = match (rs, vv10) {
+                    (true, true) => "range-separated (CAM) and VV10-carrying",
+                    (true, false) => "range-separated (CAM)",
+                    _ => "VV10-carrying",
+                };
+                let name = spec.name();
+                if opts.direct {
+                    return Err(format!(
+                        "{name} is {what}: --direct is not supported (erf-attenuated exchange \
+                         and the VV10 evaluation need a backend that stores its integrals)"
+                    ));
+                }
+                if rs && opts.ri && !opts.cosx {
+                    return Err(format!(
+                        "{name} is range-separated (CAM): --ri alone is not supported (the \
+                         RI-JK backend has no erf-attenuated long-range exchange); add --cosx \
+                         to serve K semi-numerically over the RI-J Coulomb, or use the \
+                         conventional in-core backend"
+                    ));
+                }
+                if vv10 && opts.optimize_geometry {
+                    return Err(format!(
+                        "{name} is VV10-carrying: geometry optimization is not supported (the \
+                         nonlocal VV10 energy E_nl has no gradient, so the optimizer would \
+                         converge on a surface missing E_nl)"
+                    ));
+                }
+                if vv10 && opts.compute_frequencies {
+                    return Err(format!(
+                        "{name} is VV10-carrying: frequencies are not supported (the nonlocal \
+                         VV10 energy E_nl has no gradient, so the Hessian would differentiate \
+                         a surface missing E_nl)"
+                    ));
+                }
+            }
+        }
+        if opts.x2c {
+            if opts.optimize_geometry {
+                return Err(
+                    "X2C is energy-only: geometry optimization is not supported \
+                     (no X2C analytic gradient; the picture-change gradient terms are \
+                     unimplemented)"
+                        .into(),
+                );
+            }
+            if opts.compute_frequencies {
+                return Err("X2C is energy-only: frequencies are not supported (no X2C \
+                     analytic gradient)"
+                    .into());
+            }
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err("X2C with post-HF methods is not supported (the correlated \
+                     treatment of X2C orbitals is unvalidated); use an SCF-level method"
+                    .into());
+            }
+            if let Method::Dft(spec) = &self.method
+                && spec.double_hybrid().is_some()
+            {
+                return Err(format!(
+                    "{} is a double hybrid: X2C is not supported (the PT2 step \
+                     on X2C orbitals is unvalidated)",
+                    spec.name()
+                ));
+            }
+        }
+
+        if opts.cosx {
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "COSX applies to SCF-level methods only (HF and DFT functionals), not \
+                     post-HF (the correlated steps need exact-exchange orbitals and in-core ERIs)"
+                        .into(),
+                );
+            }
+            if opts.direct {
+                return Err(
+                    "--cosx with --direct is not wired; use COSX with the default \
+                     in-core backend or with --ri"
+                        .into(),
+                );
+            }
+            if opts.optimize_geometry {
+                return Err(
+                    "COSX is energy-only: geometry optimization is not supported (no COSX \
+                     gradient)"
+                        .into(),
+                );
+            }
+            if opts.compute_frequencies {
+                return Err(
+                    "COSX is energy-only: frequencies are not supported (no COSX gradient)".into(),
+                );
+            }
+            if opts.fod {
+                return Err(
+                    "FOD analysis with COSX is not supported (the diagnostic is calibrated on \
+                     exact exchange); run --fod without --cosx"
+                        .into(),
+                );
+            }
+        }
+        if opts.ri_mp2 {
+            let dh = matches!(&self.method, Method::Dft(spec) if spec.double_hybrid().is_some());
+            if !matches!(self.method, Method::Mp2) && !dh {
+                return Err(
+                    "ri_mp2 (RI-MP2) applies to the MP2 method only (--method mp2), or to the \
+                     PT2 step of a double-hybrid functional"
+                        .into(),
+                );
+            }
+            if opts.direct {
+                return Err(
+                    "ri_mp2 with --direct is not supported; use the default in-core \
+                     backend or --ri for the SCF step"
+                        .into(),
+                );
+            }
+        }
+        if opts.ri {
+            if opts.direct {
+                return Err(
+                    "--ri and --direct are contradictory: density fitting builds and stores \
+                     the fitted B tensor, the direct backend stores nothing"
+                        .into(),
+                );
+            }
+            if opts.optimize_geometry {
+                return Err("the RI-JK backend does not support geometry optimization".into());
+            }
+            let ri_mp2_exception = matches!(self.method, Method::Mp2) && opts.ri_mp2;
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT)
+                && !ri_mp2_exception
+            {
+                return Err(
+                    "the RI-JK backend does not support post-HF methods (needs in-core ERI); \
+                     RI-MP2 (ri_mp2 / --ri-mp2) is the density-fitted exception"
+                        .into(),
+                );
+            }
+            if opts.compute_properties || opts.compute_frequencies {
+                return Err("the RI-JK backend does not support properties or frequencies".into());
+            }
+        }
+        if opts.direct {
+            if opts.optimize_geometry {
+                return Err(
+                    "integral-direct backend does not support geometry optimization".into(),
+                );
+            }
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "integral-direct backend does not support post-HF methods (needs in-core ERI)"
+                        .into(),
+                );
+            }
+            if opts.compute_properties || opts.compute_frequencies {
+                return Err(
+                    "integral-direct backend does not support properties or frequencies".into(),
+                );
+            }
+        }
+        if opts.compute_frequencies
+            && !matches!(self.method, Method::Rhf | Method::Uhf | Method::Dft(_))
+        {
+            return Err(
+                "vibrational frequencies require a method with a gradient path (RHF, UHF, or a \
+                 DFT functional); post-HF and ROHF have no analytic gradient"
+                    .into(),
+            );
+        }
+        if opts.optimize_geometry
+            && matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT)
+        {
+            return Err(
+                "geometry optimization is not supported for post-HF methods (no analytic CC gradient)".into(),
+            );
+        }
+        if opts.dispersion.is_some()
+            && matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT)
+        {
+            return Err(
+                "dispersion corrections apply to SCF-level methods only (HF and DFT functionals), not post-HF".into(),
+            );
+        }
+        if solvated {
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "implicit solvation (C-PCM/SMD) applies to SCF-level methods only (HF and DFT functionals), not post-HF".into(),
+                );
+            }
+            if opts.compute_frequencies {
+                return Err(
+                    "frequencies in solvent are not supported (the numerical Hessian of the \
+                     finite-difference-effective solvated surface is noise-prone); run --freq \
+                     in gas phase"
+                        .into(),
+                );
+            }
+        }
+
+        if opts.fod_cube.is_some() && !opts.fod {
+            return Err("fod_cube requires the FOD analysis itself (set fod = true)".into());
+        }
+        if opts.fod {
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "FOD analysis applies to SCF-level methods only (HF and DFT functionals), \
+                     not post-HF (the diagnostic is defined on the smeared mean-field \
+                     occupations)"
+                        .into(),
+                );
+            }
+            if opts.direct || opts.ri {
+                return Err(
+                    "FOD analysis requires the conventional in-core backend (not --direct/--ri)"
+                        .into(),
+                );
+            }
+        }
+        let fod_temperature = opts.fod.then(|| match opts.smearing {
+            Some(Smearing::Fermi { temperature_k }) => temperature_k,
+            None => {
+                let a_x = match &self.method {
+                    Method::Dft(spec) => spec.exx_fraction(),
+                    _ => 1.0, // Hartree–Fock: full exact exchange
+                };
+                crate::dft::fod_default_temperature(a_x)
+            }
+        });
+        let smearing = opts
+            .smearing
+            .or(fod_temperature.map(|temperature_k| Smearing::Fermi { temperature_k }));
+
+        if smearing.is_some() {
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "Fermi smearing applies to SCF-level methods only (HF and DFT functionals), \
+                     not post-HF (fractional occupations have no single-determinant correlation \
+                     treatment)"
+                        .into(),
+                );
+            }
+            if opts.optimize_geometry {
+                return Err(
+                    "Fermi smearing is energy-only: geometry optimization with smearing is not \
+                     supported (no smeared gradient)"
+                        .into(),
+                );
+            }
+            if opts.compute_frequencies {
+                return Err(
+                    "Fermi smearing is energy-only: frequencies with smearing are not supported \
+                     (no smeared gradient)"
+                        .into(),
+                );
+            }
+            if matches!(self.method, Method::Rohf) {
+                return Err(
+                    "Fermi smearing requires the RHF or UHF reference (RKS/UKS for DFT); ROHF is \
+                     not supported"
+                        .into(),
+                );
+            }
+        }
+
+        let basis_set = BasisSet::load(&self.basis).map_err(|e| e.to_string())?;
+        let ecp_core = basis_set.ecp_core_electrons(mol) as i64;
+        if ecp_core > 0 {
+            let what = ecp_summary(mol, &basis_set)
+                .iter()
+                .map(|(sym, z, nc)| format!("{sym} (Z={z}, ECP-{nc})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if opts.x2c {
+                return Err(format!(
+                    "X2C with ECP atoms ({what}) double-counts relativity: the ECP already \
+                     folds scalar-relativistic core effects into the potential; use an \
+                     all-electron basis with --x2c, or drop --x2c and keep the ECP"
+                ));
+            }
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(format!(
+                    "post-HF methods with ECP atoms ({what}) are not supported \
+                     (the frozen-core convention for ECP cores is unvalidated)"
+                ));
+            }
+            if let Method::Dft(spec) = &self.method
+                && spec.double_hybrid().is_some()
+            {
+                return Err(format!(
+                    "double hybrids with ECP atoms ({what}) are not supported \
+                     (the PT2 step's frozen-core convention for ECP cores is unvalidated)"
+                ));
+            }
+            if opts.compute_properties {
+                return Err(format!(
+                    "properties with ECP atoms ({what}) are not supported \
+                     (nuclear dipole and Mulliken charges need the effective-Z convention)"
+                ));
+            }
+            if solvated {
+                return Err(format!(
+                    "implicit solvation (C-PCM/SMD) with ECP atoms ({what}) is not supported \
+                     (the nuclear surface potential needs the effective-Z convention)"
+                ));
+            }
+            if opts.fod {
+                return Err(format!(
+                    "FOD analysis with ECP atoms ({what}) is not supported \
+                     (the diagnostic is calibrated on all-electron references)"
+                ));
+            }
+            if opts.ri {
+                return Err(format!(
+                    "RI-JK with ECP atoms ({what}) is not supported: the                      def2-universal-jkfit auxiliary set is vendored for H-Kr only"
+                ));
+            }
+        }
+
+        let n_elec = mol.n_electrons() - ecp_core;
+        if n_elec < 0 {
+            return Err("charge exceeds nuclear charge (negative electron count)".into());
+        }
+        let n_elec = n_elec as usize;
+        let two_s = (mol.multiplicity.saturating_sub(1)) as usize;
+        if two_s > n_elec {
+            return Err("multiplicity is too high for the electron count".into());
+        }
+        let n_alpha = (n_elec + two_s) / 2;
+        let n_beta = (n_elec - two_s) / 2;
+
+        let reference = method_reference(&self.method, mol.multiplicity);
+        if reference == Reference::Rhf && n_alpha != n_beta {
+            return Err("RHF requires a closed shell; use Method::Uhf or Method::Rohf".into());
+        }
+
+        if opts.cosmo_file.is_some() {
+            if opts.direct || opts.ri {
+                return Err(
+                    "--cosmo-file uses the conventional in-core backend (not --direct/--ri)".into(),
+                );
+            }
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "--cosmo-file applies to SCF-level methods only (HF and DFT functionals)"
+                        .into(),
+                );
+            }
+            return self.run_cosmo_export(mol, n_alpha, n_beta, reference);
+        }
+
+        if let Method::Dft(spec) = &self.method
+            && spec.double_hybrid().is_some()
+        {
+            if n_alpha != n_beta {
+                return Err("double hybrids require a closed shell (RKS reference)".into());
+            }
+            return self.run_double_hybrid(mol, n_alpha, n_beta);
+        }
+
+        if opts.optimize_geometry {
+            let opt_opts = OptOptions::default();
+            let mut surface = if let Method::Dft(spec) = &self.method {
+                HfSurface::new_dft(mol, &self.basis, reference, spec.clone(), opts.grid_level)?
+            } else {
+                HfSurface::new(mol, &self.basis, reference)?
+            };
+            if let Some(disp) = opts.dispersion {
+                surface.set_dispersion(disp);
+            }
+            if let Some(gcp) = opts.gcp {
+                surface.set_gcp(gcp);
+            }
+            if let Some(srb) = opts.srb {
+                surface.set_srb(srb);
+            }
+            if let Some(eps) = opts.solvent_eps {
+                surface.set_solvent(eps);
+            }
+            if let Some(name) = &opts.smd {
+                surface.set_smd(*resolve_smd_solvent(name)?);
+            }
+            let opt = optimize(mol, &mut surface, &opt_opts).map_err(|e| e.to_string())?;
+            let scf = surface
+                .last_scf()
+                .cloned()
+                .ok_or("surface has no cached SCF after optimization")?;
+            let final_mol = (opts.dispersion.is_some() || opts.gcp.is_some() || opts.srb.is_some())
+                .then(|| {
+                    let atoms = mol
+                        .atoms
+                        .iter()
+                        .zip(&opt.positions)
+                        .map(|(a, p)| crate::core::Atom::new(a.element, *p))
+                        .collect();
+                    Molecule::new(atoms, mol.charge, mol.multiplicity)
+                });
+            let dispersion_energy = opts
+                .dispersion
+                .map(|disp| disp.energy(final_mol.as_ref().unwrap()));
+            let gcp_energy = opts
+                .gcp
+                .map(|p| crate::disp::gcp_energy(final_mol.as_ref().unwrap(), &p));
+            let srb_energy = opts
+                .srb
+                .map(|p| crate::disp::srb_energy(final_mol.as_ref().unwrap(), &p));
+            return Ok(JobResult {
+                method_warnings: Vec::new(),
+                scf,
+                optimized_geometry: Some(opt),
+                post_hf: None,
+                properties: None,
+                frequencies: None,
+                dft: None,
+                ri: None,
+                cosx: None,
+                dispersion_energy,
+                gcp_energy,
+                srb_energy,
+                fod: None,
+                vv10_energy: None,
+                double_hybrid: None,
+                smd: None,
+                gbsa: None,
+            });
+        }
+
+        let dispersion_energy = opts.dispersion.map(|disp| disp.energy(mol));
+        let gcp_energy = opts.gcp.map(|p| crate::disp::gcp_energy(mol, &p));
+        let srb_energy = opts.srb.map(|p| crate::disp::srb_energy(mol, &p));
+
+        if opts.ri {
+            let (scf, ri_diag, dft_diag, cosx_diag, vv10_energy) =
+                self.run_ri(mol, n_alpha, n_beta, reference, smearing)?;
+            let post_hf = if opts.ri_mp2 && scf.converged {
+                Some(self.run_ri_mp2_step(mol, &scf)?)
+            } else {
+                None
+            };
+            return Ok(JobResult {
+                method_warnings: Vec::new(),
+                scf,
+                optimized_geometry: None,
+                post_hf,
+                properties: None,
+                frequencies: None,
+                dft: dft_diag,
+                ri: Some(ri_diag),
+                cosx: cosx_diag,
+                dispersion_energy,
+                gcp_energy,
+                srb_energy,
+                fod: None,
+                vv10_energy,
+                double_hybrid: None,
+                smd: None,
+                gbsa: None,
+            });
+        }
+
+        if opts.direct {
+            let scf = self.run_direct(mol, n_alpha, n_beta, reference, smearing)?;
+            return Ok(JobResult {
+                method_warnings: Vec::new(),
+                scf,
+                optimized_geometry: None,
+                post_hf: None,
+                properties: None,
+                frequencies: None,
+                dft: None,
+                ri: None,
+                cosx: None,
+                dispersion_energy,
+                gcp_energy,
+                srb_energy,
+                fod: None,
+                vv10_energy: None,
+                double_hybrid: None,
+                smd: None,
+                gbsa: None,
+            });
+        }
+
+        let (scf, provider, dft_diag, vv10_energy, cosx_diag) =
+            self.run_conventional(mol, n_alpha, n_beta, reference, smearing)?;
+
+        if !scf.converged {
+            return Ok(JobResult {
+                method_warnings: Vec::new(),
+                scf,
+                optimized_geometry: None,
+                post_hf: None,
+                properties: None,
+                frequencies: None,
+                dft: dft_diag,
+                ri: None,
+                cosx: cosx_diag,
+                dispersion_energy,
+                gcp_energy,
+                srb_energy,
+                fod: None,
+                vv10_energy: None,
+                double_hybrid: None,
+                smd: None,
+                gbsa: None,
+            });
+        }
+
+        let fod = if opts.fod {
+            let temperature_k = fod_temperature.expect("fod implies a FOD temperature");
+            let fod_result =
+                crate::dft::fod_analysis(&scf, temperature_k).map_err(|e| e.to_string())?;
+            if let Some(path) = &opts.fod_cube {
+                let ao = BasisSet::load(&self.basis)
+                    .map_err(|e| e.to_string())?
+                    .build(mol)
+                    .map_err(|e| e.to_string())?;
+                let (da, db) = crate::dft::fod_density_matrices(&scf).map_err(|e| e.to_string())?;
+                let d_tot: Vec<f64> = da.iter().zip(&db).map(|(a, b)| a + b).collect();
+                crate::dft::write_fod_cube(
+                    path,
+                    mol,
+                    ao.shells(),
+                    ao.n_ao(),
+                    &d_tot,
+                    &CubeParams::default(),
+                )
+                .map_err(|e| format!("writing FOD cube {}: {e}", path.display()))?;
+            }
+            Some(fod_result)
+        } else {
+            None
+        };
+
+        let n_frozen = if opts.all_electron {
+            0
+        } else {
+            frozen_core_orbitals(mol)
+        };
+        let post_hf = match &self.method {
+            Method::Mp2 if opts.ri_mp2 => Some(self.run_ri_mp2_step(mol, &scf)?),
+            Method::Mp2 => Some(PostHfResult::Mp2 {
+                result: match scf.reference {
+                    Reference::Uhf => uhf_mp2(&provider, &scf, n_frozen),
+                    _ => rhf_mp2(&provider, &scf, n_frozen),
+                },
+                n_frozen,
+            }),
+            Method::Ccsd => Some(PostHfResult::Ccsd {
+                result: rccsd_spin_adapted(&provider, &scf, n_frozen, &CcsdOptions::default()),
+                n_frozen,
+            }),
+            Method::CcsdT => Some(PostHfResult::CcsdT {
+                result: rccsd_t_spin_adapted(&provider, &scf, n_frozen, &CcsdOptions::default()),
+                n_frozen,
+            }),
+            _ => None,
+        };
+
+        let properties = if opts.compute_properties {
+            let com = center_of_mass(mol);
+            let dipole_au = dipole_moment(&provider, mol, &scf.density, com);
+            let population =
+                population_analysis(&provider, mol, &scf.density_alpha, &scf.density_beta);
+            Some(PropertiesResult {
+                dipole_au,
+                population,
+            })
+        } else {
+            None
+        };
+
+        let frequencies = if opts.compute_frequencies {
+            let fd_step = OptOptions::default().fd_step;
+            let method = &self.method;
+            let basis = &self.basis;
+            let make_surface = |m: &Molecule| -> Result<HfSurface, String> {
+                let mut surface = if let Method::Dft(spec) = method {
+                    HfSurface::new_dft(m, basis, reference, spec.clone(), opts.grid_level)
+                } else {
+                    HfSurface::new(m, basis, reference)
+                }
+                .map_err(|e| e.to_string())?;
+                if let Some(disp) = opts.dispersion {
+                    surface.set_dispersion(disp);
+                }
+                if let Some(gcp) = opts.gcp {
+                    surface.set_gcp(gcp);
+                }
+                if let Some(srb) = opts.srb {
+                    surface.set_srb(srb);
+                }
+                Ok(surface)
+            };
+            let grad_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+            let hess = numerical_hessian(mol, 0.005, |m: &Molecule| {
+                let pos: Vec<[f64; 3]> = m.atoms.iter().map(|a| a.position).collect();
+                let mut surface = match make_surface(m) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        grad_err.lock().unwrap().get_or_insert(e);
+                        return vec![0.0; 3 * m.len()];
+                    }
+                };
+                let grad = match surface.analytic_gradient(&pos) {
+                    Some(r) => r,
+                    None => crate::opt::fd::central_difference(&mut surface, &pos, fd_step),
+                };
+                match grad {
+                    Ok(g) => g.iter().flat_map(|x| x.iter().copied()).collect(),
+                    Err(e) => {
+                        grad_err
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(|| e.to_string());
+                        vec![0.0; 3 * m.len()]
+                    }
+                }
+            });
+            if let Some(e) = grad_err.into_inner().unwrap() {
+                return Err(format!("frequency gradient evaluation failed: {e}"));
+            }
+            let freq = if opts.single_point_hessian {
+                let central: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.position).collect();
+                let mut surface = make_surface(mol)?;
+                let grad = surface
+                    .analytic_gradient(&central)
+                    .unwrap_or_else(|| {
+                        crate::opt::fd::central_difference(&mut surface, &central, fd_step)
+                    })
+                    .map_err(|e| format!("SPH central-geometry gradient failed: {e}"))?;
+                let g_flat: Vec<f64> = grad.iter().flat_map(|x| x.iter().copied()).collect();
+                crate::props::sph::sph_frequencies(mol, &hess, &g_flat)
+            } else {
+                harmonic_frequencies(mol, &hess)
+            };
+            let thermo = rrho_thermochemistry_w0(
+                mol,
+                &freq,
+                scf.energy
+                    + dispersion_energy.unwrap_or(0.0)
+                    + gcp_energy.unwrap_or(0.0)
+                    + srb_energy.unwrap_or(0.0),
+                298.15,
+                opts.symmetry_number,
+                mol.multiplicity,
+                opts.qrrho_w0_cm1,
+            );
+            Some(FrequencyData {
+                frequencies: freq,
+                thermochemistry: thermo,
+                is_sph: opts.single_point_hessian,
+            })
+        } else {
+            None
+        };
+
+        Ok(JobResult {
+            method_warnings: Vec::new(),
+            scf,
+            optimized_geometry: None,
+            post_hf,
+            properties,
+            frequencies,
+            dft: dft_diag,
+            ri: None,
+            cosx: cosx_diag,
+            dispersion_energy,
+            gcp_energy,
+            srb_energy,
+            fod,
+            vv10_energy,
+            double_hybrid: None,
+            smd: None,
+            gbsa: None,
+        })
+    }
+
+    fn build_cpcm<'a, P: IntegralProvider>(
+        &self,
+        provider: &'a P,
+        mol: &Molecule,
+    ) -> Result<Option<Cpcm<'a, P>>, String> {
+        if let Some(name) = &self.options.smd {
+            let s = resolve_smd_solvent(name)?;
+            let zs: Vec<usize> = mol.atoms.iter().map(|a| a.element.z() as usize).collect();
+            let radii = crate::solv::smd_coulomb_radii(&zs, s.alpha).map_err(|e| e.to_string())?;
+            return Cpcm::with_radii(provider, mol, s.epsilon, crate::solv::DEFAULT_GRID, &radii)
+                .map(Some)
+                .map_err(|e| e.to_string());
+        }
+        self.options
+            .solvent_eps
+            .map(|eps| Cpcm::new(provider, mol, eps, crate::solv::DEFAULT_GRID))
+            .transpose()
+            .map_err(|e| e.to_string())
+    }
+
+    fn run_ri_mp2_step(&self, mol: &Molecule, scf: &ScfResult) -> Result<PostHfResult, String> {
+        let n_frozen = if self.options.all_electron {
+            0
+        } else {
+            frozen_core_orbitals(mol)
+        };
+        let (aux_name, result) = self.run_ri_mp2_correlation(mol, scf, n_frozen)?;
+        Ok(PostHfResult::RiMp2 {
+            result,
+            n_frozen,
+            aux_basis: aux_name,
+        })
+    }
+
+    fn run_ri_mp2_correlation(
+        &self,
+        mol: &Molecule,
+        scf: &ScfResult,
+        n_frozen: usize,
+    ) -> Result<(String, RiMp2Result), String> {
+        let aux_name = format!("{}/c", self.basis.to_ascii_lowercase());
+        let aux_set = BasisSet::load_aux(&aux_name).map_err(|e| match e {
+            BasisError::UnknownAuxSet(_) => format!(
+                "RI-MP2 needs the MP2-fit auxiliary basis {aux_name:?}, but no /C partner is \
+                 bundled for orbital basis {:?} (available: def2-svp/c, def2-tzvp/c); there is \
+                 no silent fallback to the JK fitting set",
+                self.basis
+            ),
+            other => other.to_string(),
+        })?;
+        let aux = aux_set
+            .build(mol)
+            .map_err(|e| e.to_string())?
+            .into_integral();
+        let ao = BasisSet::load(&self.basis)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?
+            .into_integral();
+        let result = match scf.reference {
+            Reference::Uhf => uhf_ri_mp2(&ao, &aux, scf, n_frozen),
+            _ => rhf_ri_mp2(&ao, &aux, scf, n_frozen),
+        }
+        .map_err(|e| e.to_string())?;
+        Ok((aux_name, result))
+    }
+
+    fn run_double_hybrid(
+        &self,
+        mol: &Molecule,
+        n_alpha: usize,
+        n_beta: usize,
+    ) -> Result<JobResult, String> {
+        let opts = &self.options;
+        let Method::Dft(spec) = &self.method else {
+            return Err("run_double_hybrid requires a DFT method".into());
+        };
+        let dh = spec
+            .double_hybrid()
+            .ok_or("run_double_hybrid requires double-hybrid metadata")?;
+
+        let xdh = spec.name() == "wb97m(2)";
+        let scf_spec = if xdh {
+            FunctionalSpec::parse("wb97m-v").map_err(|e| e.to_string())?
+        } else {
+            spec.clone()
+        };
+
+        let ao = BasisSet::load(&self.basis)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?;
+        let setup = ecp_setup(mol, &ao);
+        let grid_xc =
+            GridXc::new(mol, &ao, &scf_spec, opts.grid_level).map_err(|e| e.to_string())?;
+        let grid_xc_dh = if xdh {
+            Some(GridXc::new(mol, &ao, spec, opts.grid_level).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let dft_diag = Some(DftDiagnostics {
+            functional_name: spec.name().to_string(),
+            grid_level: grid_xc.level(),
+            n_grid_points: grid_xc.n_points(),
+            exx_fraction: spec.exx_fraction(),
+        });
+        let provider =
+            ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
+        let scf_opts = ScfOptions {
+            energy_tol: 1e-9,
+            error_tol: 1e-6,
+            ..ScfOptions::default()
+        };
+        let scf = run_scf_with_env(
+            &provider,
+            n_alpha,
+            n_beta,
+            Reference::Rhf,
+            setup.nuclear_repulsion,
+            &scf_opts,
+            Some(&grid_xc as &dyn XcContributor),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let dispersion_energy = opts.dispersion.map(|disp| disp.energy(mol));
+
+        if !scf.converged {
+            return Ok(JobResult {
+                method_warnings: Vec::new(),
+                scf,
+                optimized_geometry: None,
+                post_hf: None,
+                properties: None,
+                frequencies: None,
+                dft: dft_diag,
+                ri: None,
+                cosx: None,
+                dispersion_energy,
+                gcp_energy: None,
+                srb_energy: None,
+                fod: None,
+                vv10_energy: None,
+                double_hybrid: None,
+                smd: None,
+                gbsa: None,
+            });
+        }
+
+        let n = scf.n_basis;
+        let (e_scf, vv10_energy, vv10_scale) = if xdh {
+            let gx_dh = grid_xc_dh.as_ref().expect("xdh builds the target GridXc");
+            let (exc_mv, _) = grid_xc.energy(&scf.density_alpha, &scf.density_beta, true);
+            let (exc_m2, _) = gx_dh.energy(&scf.density_alpha, &scf.density_beta, true);
+            let cam_mv = scf_spec.cam().ok_or("ωB97M-V must carry CAM parameters")?;
+            let cam_m2 = spec.cam().ok_or("ωB97M(2) must carry CAM parameters")?;
+            let da = mat_from_row_major(n, &scf.density_alpha);
+            let jk = provider.build_jk(std::slice::from_ref(&da));
+            let k = mat_to_row_major(&jk.exchange[0]);
+            let exx_for = |omega: f64, alpha: f64, beta: f64| -> Result<f64, String> {
+                let klr = provider
+                    .build_k_erf(std::slice::from_ref(&da), omega)
+                    .ok_or("double hybrids need the in-core erf-attenuated exchange")?;
+                let klr = mat_to_row_major(&klr[0]);
+                let mut e = 0.0;
+                for i in 0..n * n {
+                    e += scf.density_alpha[i] * (alpha * k[i] + beta * klr[i]);
+                }
+                Ok(-e)
+            };
+            let exx_mv = exx_for(cam_mv.omega, cam_mv.alpha, cam_mv.beta)?;
+            let exx_m2 = exx_for(cam_m2.omega, cam_m2.alpha, cam_m2.beta)?;
+            let e_scf = scf.energy - exc_mv - exx_mv + exc_m2 + exx_m2;
+            let scale = 1.0 - dh.c_os;
+            let e_nl = gx_dh
+                .vv10_energy(mol, &scf.density)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            (e_scf, e_nl.map(|e| scale * e), scale)
+        } else {
+            (scf.energy, None, 1.0)
+        };
+
+        let n_frozen = if opts.all_electron {
+            0
+        } else {
+            frozen_core_orbitals(mol)
+        };
+        let (e_os, e_ss, pt2_aux_basis) = if opts.ri_mp2 {
+            let (aux_name, ri) = self.run_ri_mp2_correlation(mol, &scf, n_frozen)?;
+            (ri.opposite_spin, ri.same_spin, Some(aux_name))
+        } else {
+            let mp2 = rhf_mp2(&provider, &scf, n_frozen);
+            (mp2.opposite_spin, mp2.same_spin, None)
+        };
+        let double_hybrid = Some(DoubleHybridData {
+            functional_name: spec.name().to_string(),
+            scf_functional_name: scf_spec.name().to_string(),
+            e_scf,
+            e_os,
+            e_ss,
+            c_os: dh.c_os,
+            c_ss: dh.c_ss,
+            n_frozen,
+            vv10_scale,
+            pt2_aux_basis,
+        });
+
+        let properties = if opts.compute_properties {
+            let com = center_of_mass(mol);
+            let dipole_au = dipole_moment(&provider, mol, &scf.density, com);
+            let population =
+                population_analysis(&provider, mol, &scf.density_alpha, &scf.density_beta);
+            Some(PropertiesResult {
+                dipole_au,
+                population,
+            })
+        } else {
+            None
+        };
+
+        Ok(JobResult {
+            method_warnings: Vec::new(),
+            scf,
+            optimized_geometry: None,
+            post_hf: None,
+            properties,
+            frequencies: None,
+            dft: dft_diag,
+            ri: None,
+            cosx: None,
+            dispersion_energy,
+            gcp_energy: None,
+            srb_energy: None,
+            fod: None,
+            vv10_energy,
+            double_hybrid,
+            smd: None,
+            gbsa: None,
+        })
+    }
+
+    fn run_ri(
+        &self,
+        mol: &Molecule,
+        n_alpha: usize,
+        n_beta: usize,
+        reference: Reference,
+        smearing: Option<Smearing>,
+    ) -> Result<RiRun, String> {
+        const AUX_BASIS: &str = "def2-universal-jkfit";
+        let opts = &self.options;
+        let ao = BasisSet::load(&self.basis)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?;
+        let aux = BasisSet::load_aux(AUX_BASIS)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?
+            .into_integral();
+        let setup = ecp_setup(mol, &ao);
+        let grid_xc = if let Method::Dft(spec) = &self.method {
+            Some(GridXc::new(mol, &ao, spec, opts.grid_level).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let dft_diag = grid_xc.as_ref().map(|g| DftDiagnostics {
+            functional_name: g.name().to_string(),
+            grid_level: g.level(),
+            n_grid_points: g.n_points(),
+            exx_fraction: g.exx_fraction(),
+        });
+        let base_opts = if grid_xc.is_some() {
+            ScfOptions {
+                energy_tol: 1e-9,
+                error_tol: 1e-6,
+                ..ScfOptions::default()
+            }
+        } else {
+            ScfOptions::default()
+        };
+        let base_opts = ScfOptions {
+            smearing,
+            ..base_opts
+        };
+        let hcore_override = opts
+            .x2c
+            .then(|| x2c_hcore_override(&ao, &setup.charges, base_opts.lindep_thresh))
+            .transpose()?;
+        let base_opts = ScfOptions {
+            hcore_override,
+            ..base_opts
+        };
+        let xc_ref = grid_xc.as_ref().map(|g| g as &dyn XcContributor);
+        let cosx_setup = opts.cosx.then(|| (ao.shells().to_vec(), ao.n_ao()));
+        let provider = DfProvider::new(ao.into_integral(), &aux, setup.charges)
+            .map_err(|e| e.to_string())?
+            .with_ecps(setup.ecps);
+        let ri_diag = RiDiagnostics {
+            aux_basis: AUX_BASIS.to_string(),
+            naux: provider.naux(),
+        };
+        let cpcm = self.build_cpcm(&provider, mol)?;
+        let solv_ref = cpcm.as_ref().map(|c| c as &dyn SolventModel);
+        let (scf, cosx_diag) = if let Some((shells, nao)) = cosx_setup {
+            let cam = match &self.method {
+                Method::Dft(spec) => spec.cam(),
+                _ => None,
+            };
+            let s = mat_to_row_major(&provider.overlap());
+            let cosx = CosxExchange::new(mol, &shells, nao, &s, COSX_DEFAULT_GRID)
+                .map_err(|e| e.to_string())?;
+            let diag = CosxDiagnostics {
+                grid: cosx.description().to_string(),
+                n_points: cosx.n_points(),
+                overlap_fitted: cosx.fitted(),
+                rs_omega: cam.map(|c| c.omega),
+            };
+            let wrapped = match cam {
+                Some(c) => CosxProvider::with_range_separation(&provider, cosx, c.omega),
+                None => CosxProvider::new(&provider, cosx),
+            }
+            .map_err(|e| e.to_string())?;
+            let scf = run_scf_with_env(
+                &wrapped,
+                n_alpha,
+                n_beta,
+                reference,
+                setup.nuclear_repulsion,
+                &base_opts,
+                xc_ref,
+                solv_ref,
+            )
+            .map_err(|e| e.to_string())?;
+            (scf, Some(diag))
+        } else {
+            let scf = run_scf_with_env(
+                &provider,
+                n_alpha,
+                n_beta,
+                reference,
+                setup.nuclear_repulsion,
+                &base_opts,
+                xc_ref,
+                solv_ref,
+            )
+            .map_err(|e| e.to_string())?;
+            (scf, None)
+        };
+        let vv10_energy = match (&grid_xc, scf.converged) {
+            (Some(g), true) => g
+                .vv10_energy(mol, &scf.density)
+                .transpose()
+                .map_err(|e| e.to_string())?,
+            _ => None,
+        };
+        Ok((scf, ri_diag, dft_diag, cosx_diag, vv10_energy))
+    }
+
+    fn run_direct(
+        &self,
+        mol: &Molecule,
+        n_alpha: usize,
+        n_beta: usize,
+        reference: Reference,
+        smearing: Option<Smearing>,
+    ) -> Result<ScfResult, String> {
+        let opts = &self.options;
+        let ao = BasisSet::load(&self.basis)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?;
+        let setup = ecp_setup(mol, &ao);
+        let grid_xc = if let Method::Dft(spec) = &self.method {
+            Some(GridXc::new(mol, &ao, spec, opts.grid_level).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let base_opts = if grid_xc.is_some() {
+            ScfOptions {
+                energy_tol: 1e-9,
+                error_tol: 1e-6,
+                ..ScfOptions::default()
+            }
+        } else {
+            ScfOptions::default()
+        };
+        let base_opts = ScfOptions {
+            smearing,
+            ..base_opts
+        };
+        let hcore_override = opts
+            .x2c
+            .then(|| x2c_hcore_override(&ao, &setup.charges, base_opts.lindep_thresh))
+            .transpose()?;
+        let base_opts = ScfOptions {
+            hcore_override,
+            ..base_opts
+        };
+        let xc_ref = grid_xc.as_ref().map(|g| g as &dyn XcContributor);
+        let provider = DirectProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
+        let cpcm = self.build_cpcm(&provider, mol)?;
+        let solv_ref = cpcm.as_ref().map(|c| c as &dyn SolventModel);
+        run_scf_with_env(
+            &provider,
+            n_alpha,
+            n_beta,
+            reference,
+            setup.nuclear_repulsion,
+            &ScfOptions {
+                incremental_fock: true,
+                ..base_opts
+            },
+            xc_ref,
+            solv_ref,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn run_conventional(
+        &self,
+        mol: &Molecule,
+        n_alpha: usize,
+        n_beta: usize,
+        reference: Reference,
+        smearing: Option<Smearing>,
+    ) -> Result<ConventionalRun, String> {
+        let opts = &self.options;
+        let ao = BasisSet::load(&self.basis)
+            .map_err(|e| e.to_string())?
+            .build(mol)
+            .map_err(|e| e.to_string())?;
+        let setup = ecp_setup(mol, &ao);
+        let grid_xc = if let Method::Dft(spec) = &self.method {
+            Some(GridXc::new(mol, &ao, spec, opts.grid_level).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let dft_diag = grid_xc.as_ref().map(|g| DftDiagnostics {
+            functional_name: g.name().to_string(),
+            grid_level: g.level(),
+            n_grid_points: g.n_points(),
+            exx_fraction: g.exx_fraction(),
+        });
+        let base_opts = if grid_xc.is_some() {
+            ScfOptions {
+                energy_tol: 1e-9,
+                error_tol: 1e-6,
+                ..ScfOptions::default()
+            }
+        } else {
+            ScfOptions::default()
+        };
+        let base_opts = ScfOptions {
+            smearing,
+            ..base_opts
+        };
+        let hcore_override = opts
+            .x2c
+            .then(|| x2c_hcore_override(&ao, &setup.charges, base_opts.lindep_thresh))
+            .transpose()?;
+        let base_opts = ScfOptions {
+            hcore_override,
+            ..base_opts
+        };
+        let xc_ref = grid_xc.as_ref().map(|g| g as &dyn XcContributor);
+        let cosx_setup = opts.cosx.then(|| (ao.shells().to_vec(), ao.n_ao()));
+        let provider =
+            ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
+        let cpcm = self.build_cpcm(&provider, mol)?;
+        let solv_ref = cpcm.as_ref().map(|c| c as &dyn SolventModel);
+        let (scf, cosx_diag) = if let Some((shells, nao)) = cosx_setup {
+            let cam = match &self.method {
+                Method::Dft(spec) => spec.cam(),
+                _ => None,
+            };
+            let s = mat_to_row_major(&provider.overlap());
+            let cosx = CosxExchange::new(mol, &shells, nao, &s, COSX_DEFAULT_GRID)
+                .map_err(|e| e.to_string())?;
+            let diag = CosxDiagnostics {
+                grid: cosx.description().to_string(),
+                n_points: cosx.n_points(),
+                overlap_fitted: cosx.fitted(),
+                rs_omega: cam.map(|c| c.omega),
+            };
+            let wrapped = match cam {
+                Some(c) => CosxProvider::with_range_separation(&provider, cosx, c.omega),
+                None => CosxProvider::new(&provider, cosx),
+            }
+            .map_err(|e| e.to_string())?;
+            let scf = run_scf_with_env(
+                &wrapped,
+                n_alpha,
+                n_beta,
+                reference,
+                setup.nuclear_repulsion,
+                &base_opts,
+                xc_ref,
+                solv_ref,
+            )
+            .map_err(|e| e.to_string())?;
+            (scf, Some(diag))
+        } else {
+            let scf = run_scf_with_env(
+                &provider,
+                n_alpha,
+                n_beta,
+                reference,
+                setup.nuclear_repulsion,
+                &base_opts,
+                xc_ref,
+                solv_ref,
+            )
+            .map_err(|e| e.to_string())?;
+            (scf, None)
+        };
+        let vv10_energy = match (&grid_xc, scf.converged) {
+            (Some(g), true) => g
+                .vv10_energy(mol, &scf.density)
+                .transpose()
+                .map_err(|e| e.to_string())?,
+            _ => None,
+        };
+        Ok((scf, provider, dft_diag, vv10_energy, cosx_diag))
+    }
+}
+
+type RiRun = (
+    ScfResult,
+    RiDiagnostics,
+    Option<DftDiagnostics>,
+    Option<CosxDiagnostics>,
+    Option<f64>,
+);
+
+type ConventionalRun = (
+    ScfResult,
+    ConventionalProvider,
+    Option<DftDiagnostics>,
+    Option<f64>,
+    Option<CosxDiagnostics>,
+);
+
+fn resolve_smd_solvent(name: &str) -> Result<&'static crate::solv::SmdSolvent, String> {
+    crate::solv::smd_solvent(name).ok_or_else(|| {
+        let names: Vec<&str> = crate::solv::SMD_SOLVENTS.iter().map(|s| s.name).collect();
+        format!(
+            "unknown SMD solvent {name:?} (available: {})",
+            names.join(", ")
+        )
+    })
+}
+
+fn resolve_alpb_solvent(name: &str) -> Result<&'static crate::solv::GbsaParams, String> {
+    crate::solv::alpb_solvent(name).ok_or_else(|| {
+        format!(
+            "unknown ALPB solvent {name:?} (available: {})",
+            crate::solv::alpb_solvent_names().join(", ")
+        )
+    })
+}
+
+fn resolve_gbsa_solvent(name: &str) -> Result<&'static crate::solv::GbsaParams, String> {
+    crate::solv::gbsa_solvent(name).ok_or_else(|| {
+        format!(
+            "unknown GBSA solvent {name:?} (available: {})",
+            crate::solv::gbsa_solvent_names().join(", ")
+        )
+    })
+}
+
+fn method_reference(method: &Method, multiplicity: u32) -> Reference {
+    match method {
+        Method::Rhf | Method::Ccsd | Method::CcsdT => Reference::Rhf,
+        Method::Uhf => Reference::Uhf,
+        Method::Rohf => Reference::Rohf,
+        Method::Mp2 | Method::Dft(_) => {
+            if multiplicity > 1 {
+                Reference::Uhf
+            } else {
+                Reference::Rhf
+            }
+        }
+    }
+}
+
+pub fn optimize_geometry(
+    molecule: &Molecule,
+    basis: &str,
+    reference: Reference,
+    options: &OptOptions,
+) -> Result<OptResult, String> {
+    let mut surface = HfSurface::new(molecule, basis, reference)?;
+    optimize(molecule, &mut surface, options).map_err(|e| e.to_string())
+}
+
+pub fn optimize_geometry_dft(
+    molecule: &Molecule,
+    basis: &str,
+    reference: Reference,
+    functional: FunctionalSpec,
+    grid_level: usize,
+    options: &OptOptions,
+) -> Result<OptResult, String> {
+    let mut surface = HfSurface::new_dft(molecule, basis, reference, functional, grid_level)?;
+    optimize(molecule, &mut surface, options).map_err(|e| e.to_string())
+}

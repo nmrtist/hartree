@@ -1,0 +1,145 @@
+{
+  "provenance": {
+    "engine": "ORCA",
+    "version": "6.1.1",
+    "settings": "! MP2 NoRI Bohrs VeryTightSCF [NoFrozenCore]; conventional (non-RI) RHF-MP2; basis injected via %basis NewGTO from vendored data/basis/*.json (BSE)",
+    "generated": "2026-06-07",
+    "generator": "ORCA generator script (--mp2)",
+    "geometries": "tests/ref/geometries.json",
+    "note": "frozen_core=true uses ORCA's default chemical core (noble-gas); false is all-electron. ORCA is a data oracle only."
+  },
+  "entries": [
+    {
+      "molecule": "h2",
+      "basis": "6-31g",
+      "method": "rhf-mp2",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.12674270069994,
+      "mp2_total_energy": -1.144133158335,
+      "mp2_correlation": -0.017390458
+    },
+    {
+      "molecule": "h2",
+      "basis": "6-31g",
+      "method": "rhf-mp2",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.12674270069994,
+      "mp2_total_energy": -1.144133158335,
+      "mp2_correlation": -0.017390458
+    },
+    {
+      "molecule": "h2",
+      "basis": "cc-pvdz",
+      "method": "rhf-mp2",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.12870944897922,
+      "mp2_total_energy": -1.155088688267,
+      "mp2_correlation": -0.026379239
+    },
+    {
+      "molecule": "h2",
+      "basis": "cc-pvdz",
+      "method": "rhf-mp2",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.12870944897922,
+      "mp2_total_energy": -1.155088688267,
+      "mp2_correlation": -0.026379239
+    },
+    {
+      "molecule": "h2",
+      "basis": "sto-3g",
+      "method": "rhf-mp2",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.11671432517507,
+      "mp2_total_energy": -1.129872195221,
+      "mp2_correlation": -0.01315787
+    },
+    {
+      "molecule": "h2",
+      "basis": "sto-3g",
+      "method": "rhf-mp2",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.11671432517507,
+      "mp2_total_energy": -1.129872195221,
+      "mp2_correlation": -0.01315787
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "rhf-mp2",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.95252907005333,
+      "mp2_total_energy": -76.094648893457,
+      "mp2_correlation": -0.142119823
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "rhf-mp2",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.95252907005333,
+      "mp2_total_energy": -76.093628009914,
+      "mp2_correlation": -0.14109894
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf-mp2",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.98979581981321,
+      "mp2_total_energy": -76.204143417645,
+      "mp2_correlation": -0.214347598
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf-mp2",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.98979581981321,
+      "mp2_total_energy": -76.202025776099,
+      "mp2_correlation": -0.212229956
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf-mp2",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -74.94207995394143,
+      "mp2_total_energy": -74.991229590641,
+      "mp2_correlation": -0.049149637
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf-mp2",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -74.94207995394153,
+      "mp2_total_energy": -74.991140235385,
+      "mp2_correlation": -0.049060281
+    }
+  ]
+}

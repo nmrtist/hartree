@@ -1,0 +1,60 @@
+[package]
+name = "hartree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Quantum chemistry and solid-state physics in Rust: HF/DFT/MP2/CCSD/CCSD(T), gradients, geometry optimization, dispersion, implicit solvation, and periodic GPW DFT."
+repository.workspace = true
+keywords = ["chemistry", "quantum", "hartree-fock", "ccsd", "dft"]
+categories = ["science"]
+
+[dependencies]
+faer.workspace = true
+# The `integrals` module is the only place depending on `integral` directly; it forwards the
+# periodic grid/FFT/Poisson/collocation API to the rest of hartree via `pub use integral`.
+integral = { workspace = true, features = ["periodic"] }
+latx.workspace = true
+rayon.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+xcx.workspace = true
+thiserror.workspace = true
+# erf/erfc for the Ewald real-space term and solvation kernels (pure Rust).
+libm = "0.2"
+
+[features]
+# Enables latx's `moyo` backend so a Monkhorst–Pack mesh can be folded to the
+# irreducible Brillouin zone before the periodic SCF. Off by default.
+symmetry = ["latx/symmetry"]
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Per-stage pipeline timing harness — plain main() + Instant (not Criterion), run on
+# demand (`cargo bench --bench perf_pipeline -- <mol> <basis> <method>`).
+# `test = false` keeps it out of `cargo test`/nextest (it asserts no physics).
+[[bench]]
+name = "perf_pipeline"
+harness = false
+test = false
+
+# GEMM/tensordot cost-decomposition probe: isolates per-call copy overhead vs raw
+# faer matmul, and Par::Seq vs Par::Rayon, at real CCSD shapes.
+[[bench]]
+name = "perf_gemm_decomp"
+harness = false
+test = false
+
+# J/K build timing harness — Criterion, run on demand (`cargo bench --bench bench_jk`).
+[[bench]]
+name = "bench_jk"
+harness = false
+test = false
+
+# Kohn–Sham XC timing harness — Criterion, run on demand (`cargo bench --bench bench_xc`).
+[[bench]]
+name = "bench_xc"
+harness = false
+test = false

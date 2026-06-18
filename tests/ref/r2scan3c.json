@@ -1,0 +1,84 @@
+{
+ "provenance": {
+  "engines": {
+   "scf": "PySCF 2.13.1 RKS r2scan (libxc 497,498), grids.level 9, conv_tol 1e-11, spherical, vendored def2-mTZVPP (data/basis/def2-mtzvpp.json), never PySCF's internal library",
+   "d4": "dftd4 4.2.0, method 'r2scan-3c' (s6=1, s8=0, a1=0.42, a2=5.65, s9=2)",
+   "gcp": "mctc-gcp 2.3.2 (grimme-lab/gcp bae24c6, built from source), --level r2scan-3c, TURBOMOLE coord input (exact bohr)"
+  },
+  "generated": "2026-06-11",
+  "generator": "composite generator script (PySCF + dftd4 + mctc-gcp)",
+  "geometries": "tests/ref/geometries.json",
+  "tolerances": "hartree gates: e_scf 1.3e-5 (grid-4 r2scan quadrature floor, see mgga_oracle.rs), e_d4 and e_gcp 1e-9, e_total at their sum"
+ },
+ "entries": [
+  {
+   "molecule": "water",
+   "charge": 0,
+   "multiplicity": 1,
+   "basis": "def2-mtzvpp",
+   "e_scf": -76.39375985994856,
+   "e_d4": -6.606412924066882e-05,
+   "d4_gradient": [
+    [
+     1.6940658945086007e-21,
+     1.743064429207187e-05,
+     0.0
+    ],
+    [
+     -8.308981918847944e-06,
+     -8.715322146035934e-06,
+     0.0
+    ],
+    [
+     8.30898191884794e-06,
+     -8.71532214603593e-06,
+     0.0
+    ]
+   ],
+   "e_gcp": 0.0023547123,
+   "e_total": -76.3914712117778
+  },
+  {
+   "molecule": "methanol_distorted",
+   "charge": 0,
+   "multiplicity": 1,
+   "basis": "def2-mtzvpp",
+   "e_scf": -115.68771149057838,
+   "e_d4": -0.0004633256805535477,
+   "d4_gradient": [
+    [
+     -2.144001226294833e-05,
+     2.633078006591141e-06,
+     1.1209673885806417e-06
+    ],
+    [
+     8.90728993931258e-06,
+     1.0383229156823814e-05,
+     3.4028254124177542e-06
+    ],
+    [
+     -2.2287721096968202e-06,
+     -9.767204713180116e-06,
+     -4.045763615583416e-06
+    ],
+    [
+     4.494237182690838e-06,
+     -3.7697090324733616e-06,
+     -1.75186165039529e-06
+    ],
+    [
+     4.629944737652124e-06,
+     -5.094148385608768e-07,
+     -2.367387304939462e-06
+    ],
+    [
+     5.637312512989615e-06,
+     1.030021420799411e-06,
+     3.6412197699197787e-06
+    ]
+   ],
+   "e_gcp": 0.0048210727,
+   "e_total": -115.68335374355894
+  }
+ ]
+}

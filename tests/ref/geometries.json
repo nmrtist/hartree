@@ -1,0 +1,561 @@
+{
+ "_comment": "Pinned reference geometries in BOHR (atomic units). Single source of truth: loaded verbatim by hartree tests AND by ORCA generator script. Do not edit coordinates without regenerating scf_references.json.",
+ "_units": "bohr",
+ "molecules": {
+  "h2": {
+   "charge": 0,
+   "multiplicity": 1,
+   "atoms": [
+    [
+     "H",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     0.0,
+     0.0,
+     1.4
+    ]
+   ]
+  },
+  "water": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Crawford Group programming-project geometry.",
+   "atoms": [
+    [
+     "O",
+     0.0,
+     -0.143225816552,
+     0.0
+    ],
+    [
+     "H",
+     1.638036840407,
+     1.136548822547,
+     0.0
+    ],
+    [
+     "H",
+     -1.638036840407,
+     1.136548822547,
+     0.0
+    ]
+   ]
+  },
+  "nh3": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Pyramidal C3v ammonia, r(N-H) = 1.012 A, angle(H-N-H) = 106.7 deg; C3 axis along z, H atoms below the N apex. RKS DFT validation target.",
+   "atoms": [
+    [
+     "N",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     1.771769,
+     0.0,
+     -0.719802
+    ],
+    [
+     "H",
+     -0.885885,
+     1.534397,
+     -0.719802
+    ],
+    [
+     "H",
+     -0.885885,
+     -1.534397,
+     -0.719802
+    ]
+   ]
+  },
+  "h2s": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Bent C2v hydrogen sulfide, r(S-H) = 1.336 A, angle(H-S-H) = 92.1 deg; molecule in the xy-plane, C2 axis along -y. Na-Ar (third-row) RKS DFT validation target.",
+   "atoms": [
+    [
+     "S",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     1.817629,
+     -1.7522,
+     0.0
+    ],
+    [
+     "H",
+     -1.817629,
+     -1.7522,
+     0.0
+    ]
+   ]
+  },
+  "oh_minus": {
+   "charge": -1,
+   "multiplicity": 1,
+   "_note": "Hydroxide anion, closed shell; r = 1.8344 bohr (same bond length as the oh radical entry). Diffuse-basis (def2-TZVPD/def2-SVPD) HF validation target.",
+   "atoms": [
+    [
+     "O",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     0.0,
+     0.0,
+     1.8344
+    ]
+   ]
+  },
+  "oh": {
+   "charge": 0,
+   "multiplicity": 2,
+   "_note": "OH radical, r = 1.8344 bohr (~0.971 A).",
+   "atoms": [
+    [
+     "O",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     0.0,
+     0.0,
+     1.8344
+    ]
+   ]
+  },
+  "nh2": {
+   "charge": 0,
+   "multiplicity": 2,
+   "_note": "NH2 radical, non-degenerate 2B1 doublet. r(N-H) = 1.024 A, angle(H-N-H) = 103.3 deg; molecule in the xy-plane so the SOMO is the out-of-plane b1. Unlike OH 2-Pi, 2B1 is non-degenerate, so hartree (C1) and ORCA (C1) converge to the same ROHF state -> strict-equality reference case.",
+   "atoms": [
+    [
+     "N",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     1.517557414215,
+     -1.200646420296,
+     0.0
+    ],
+    [
+     "H",
+     -1.517557414215,
+     -1.200646420296,
+     0.0
+    ]
+   ]
+  },
+  "ch3": {
+   "charge": 0,
+   "multiplicity": 2,
+   "_note": "Planar D3h methyl radical, r(C-H) = 2.0386 bohr (~1.079 A).",
+   "atoms": [
+    [
+     "C",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     2.0386,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     -1.0193,
+     1.765492,
+     0.0
+    ],
+    [
+     "H",
+     -1.0193,
+     -1.765492,
+     0.0
+    ]
+   ]
+  },
+  "o2": {
+   "charge": 0,
+   "multiplicity": 3,
+   "_note": "Triplet O2 ground state, r = 2.2831 bohr (~1.208 A).",
+   "atoms": [
+    [
+     "O",
+     0.0,
+     0.0,
+     1.14155
+    ],
+    [
+     "O",
+     0.0,
+     0.0,
+     -1.14155
+    ]
+   ]
+  },
+  "benzene": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Planar D6h benzene, C-C = 1.39 A (= circumradius), C-H = 1.09 A radially outward. Functional-verification target (RHF/6-31G); cc-pVDZ is past the in-core ERI ceiling.",
+   "atoms": [
+    [
+     "C",
+     2.62671931323,
+     0.0,
+     0.0
+    ],
+    [
+     "C",
+     1.313359656615,
+     2.274805653868,
+     0.0
+    ],
+    [
+     "C",
+     -1.313359656615,
+     2.274805653868,
+     0.0
+    ],
+    [
+     "C",
+     -2.62671931323,
+     0.0,
+     0.0
+    ],
+    [
+     "C",
+     -1.313359656615,
+     -2.274805653868,
+     0.0
+    ],
+    [
+     "C",
+     1.313359656615,
+     -2.274805653868,
+     0.0
+    ],
+    [
+     "H",
+     4.686520789072,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     2.343260394536,
+     4.0586460587,
+     0.0
+    ],
+    [
+     "H",
+     -2.343260394536,
+     4.0586460587,
+     0.0
+    ],
+    [
+     "H",
+     -4.686520789072,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     -2.343260394536,
+     -4.0586460587,
+     0.0
+    ],
+    [
+     "H",
+     2.343260394536,
+     -4.0586460587,
+     0.0
+    ]
+   ]
+  },
+  "ethylene": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Planar D2h ethylene, C=C = 1.339 A, C-H = 1.087 A, angle(H-C-C) = 121.2 deg. CCSD functional-verification target (cc-pVDZ, frozen-core).",
+   "atoms": [
+    [
+     "C",
+     -1.265171640437,
+     0.0,
+     0.0
+    ],
+    [
+     "C",
+     1.265171640437,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     -2.329267651351,
+     1.757031352896,
+     0.0
+    ],
+    [
+     "H",
+     -2.329267651351,
+     -1.757031352896,
+     0.0
+    ],
+    [
+     "H",
+     2.329267651351,
+     1.757031352896,
+     0.0
+    ],
+    [
+     "H",
+     2.329267651351,
+     -1.757031352896,
+     0.0
+    ]
+   ]
+  },
+  "water_dimer": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Constructed dimer (NOT a stationary point): two copies of the 'water' geometry, second translated +5.6 bohr along x (O-O ~ 2.96 A). D3(BJ) dispersion validation target.",
+   "atoms": [
+    [
+     "O",
+     0.0,
+     -0.143225816552,
+     0.0
+    ],
+    [
+     "H",
+     1.638036840407,
+     1.136548822547,
+     0.0
+    ],
+    [
+     "H",
+     -1.638036840407,
+     1.136548822547,
+     0.0
+    ],
+    [
+     "O",
+     5.6,
+     -0.143225816552,
+     0.0
+    ],
+    [
+     "H",
+     7.238036840407,
+     1.136548822547,
+     0.0
+    ],
+    [
+     "H",
+     3.961963159593,
+     1.136548822547,
+     0.0
+    ]
+   ]
+  },
+  "methane_dimer": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Constructed dimer (NOT a stationary point): two Td methanes, r(C-H) = 1.087 A, second translated +7.0 bohr along x (C-C ~ 3.70 A). D3(BJ) dispersion validation target.",
+   "atoms": [
+    [
+     "C",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     1.185992,
+     1.185992,
+     1.185992
+    ],
+    [
+     "H",
+     1.185992,
+     -1.185992,
+     -1.185992
+    ],
+    [
+     "H",
+     -1.185992,
+     1.185992,
+     -1.185992
+    ],
+    [
+     "H",
+     -1.185992,
+     -1.185992,
+     1.185992
+    ],
+    [
+     "C",
+     7.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     8.185992,
+     1.185992,
+     1.185992
+    ],
+    [
+     "H",
+     8.185992,
+     -1.185992,
+     -1.185992
+    ],
+    [
+     "H",
+     5.814008,
+     1.185992,
+     -1.185992
+    ],
+    [
+     "H",
+     5.814008,
+     -1.185992,
+     1.185992
+    ]
+   ]
+  },
+  "hcl_dimer": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Constructed dimer (NOT a stationary point): two HCl molecules, r(H-Cl) = 1.27 A along z, second translated +7.1 bohr along x (Cl-Cl ~ 3.76 A). Third-row D3(BJ) dispersion validation target.",
+   "atoms": [
+    [
+     "Cl",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     0.0,
+     0.0,
+     2.400006
+    ],
+    [
+     "Cl",
+     7.1,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     7.1,
+     0.0,
+     2.400006
+    ]
+   ]
+  },
+  "nh4_plus": {
+   "charge": 1,
+   "multiplicity": 1,
+   "_note": "Ammonium cation, slightly distorted from Td (C1) so the D4 EEQ charge path and ATM term are both nontrivial. Constructed for tests/ref/d4.json.",
+   "atoms": [
+    [
+     "N",
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     "H",
+     1.1,
+     1.12,
+     1.08
+    ],
+    [
+     "H",
+     1.14,
+     -1.1,
+     -1.16
+    ],
+    [
+     "H",
+     -1.09,
+     1.15,
+     -1.11
+    ],
+    [
+     "H",
+     -1.13,
+     -1.12,
+     1.1
+    ]
+   ]
+  },
+  "methanol_distorted": {
+   "charge": 0,
+   "multiplicity": 1,
+   "_note": "Methanol with all atoms displaced off any symmetry element (C1); FD-gradient and ATM validation target. Constructed for tests/ref/d4.json.",
+   "atoms": [
+    [
+     "C",
+     0.02,
+     -0.05,
+     0.07
+    ],
+    [
+     "O",
+     2.64,
+     0.12,
+     -0.08
+    ],
+    [
+     "H",
+     3.28,
+     1.62,
+     0.55
+    ],
+    [
+     "H",
+     -0.66,
+     1.85,
+     0.41
+    ],
+    [
+     "H",
+     -0.74,
+     -0.98,
+     1.62
+    ],
+    [
+     "H",
+     -0.7,
+     -0.84,
+     -1.74
+    ]
+   ]
+  }
+ }
+}

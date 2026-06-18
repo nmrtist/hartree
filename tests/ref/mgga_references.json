@@ -1,0 +1,140 @@
+{
+  "provenance": {
+    "engine": "PySCF",
+    "version": "2.13.1",
+    "settings": "RKS/UKS by multiplicity; xc by numeric libxc ids (tpss=202,231; r2scan=497,498); conv_tol 1e-11; cart=False (spherical); basis built from vendored data/basis/*.json (BSE), never PySCF's internal library.",
+    "grid": "grids.level = 9",
+    "scf_thresholds": "conv_tol = 1e-11",
+    "generated": "2026-06-11",
+    "generator": "PySCF generator script",
+    "geometries": "tests/ref/geometries.json",
+    "tolerances": "DFT cross-program agreement is grid-limited. PySCF and hartree both evaluate libxc-equivalent functionals (xcx is golden-locked against libxc 6.1), so the residual is quadrature: PySCF grids.level 9 vs hartree grid level 3 (tpss) / 4 (r2scan; its level-3 residual is ~1e-5, converging 2->3->4 as 4.4e-5 -> 1.0e-5 -> ~2e-6). hartree<->ref test gates: tpss 3e-6 at level 3, r2scan 1.3e-5 at level 4 (~2x the worst observed delta each; see mgga_oracle.rs).",
+    "note": "tau-meta-GGA Kohn-Sham single points. PySCF is the primary oracle here (ORCA unavailable at generation time); an ORCA cross-check is welcome later."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "functional": "tpss",
+      "libxc_ids": "202,231",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.37385067538533
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "functional": "r2scan",
+      "libxc_ids": "497,498",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.32446816871345
+    },
+    {
+      "molecule": "nh3",
+      "basis": "6-31g",
+      "functional": "tpss",
+      "libxc_ids": "202,231",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -56.53196533064944
+    },
+    {
+      "molecule": "nh3",
+      "basis": "6-31g",
+      "functional": "r2scan",
+      "libxc_ids": "497,498",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -56.489304413831945
+    },
+    {
+      "molecule": "oh",
+      "basis": "6-31g",
+      "functional": "tpss",
+      "libxc_ids": "202,231",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.71358102599707,
+      "s2": 0.751143
+    },
+    {
+      "molecule": "oh",
+      "basis": "6-31g",
+      "functional": "r2scan",
+      "libxc_ids": "497,498",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.66875043318296,
+      "s2": 0.751561
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "functional": "tpss",
+      "libxc_ids": "202,231",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.40343868130348
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "functional": "r2scan",
+      "libxc_ids": "497,498",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.35695432011127
+    },
+    {
+      "molecule": "nh3",
+      "basis": "cc-pvdz",
+      "functional": "tpss",
+      "libxc_ids": "202,231",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -56.55670313701037
+    },
+    {
+      "molecule": "nh3",
+      "basis": "cc-pvdz",
+      "functional": "r2scan",
+      "libxc_ids": "497,498",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -56.518196500513454
+    },
+    {
+      "molecule": "oh",
+      "basis": "cc-pvdz",
+      "functional": "tpss",
+      "libxc_ids": "202,231",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.73808638556802,
+      "s2": 0.751778
+    },
+    {
+      "molecule": "oh",
+      "basis": "cc-pvdz",
+      "functional": "r2scan",
+      "libxc_ids": "497,498",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.69580741419345,
+      "s2": 0.752517
+    }
+  ]
+}

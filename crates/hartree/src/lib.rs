@@ -1,0 +1,53 @@
+//! hartree — a quantum chemistry and solid-state physics package implemented in Rust.
+//!
+//! The library is organized by layer: foundation (`core`, `linalg`, `tensor`),
+//! basis/integrals, SCF and post-SCF methods, corrections/extensions, and the
+//! higher-level drivers (`job`, `multilevel`, `w1`, …) that orchestrate them.
+
+// Foundation
+pub mod core;
+pub mod linalg;
+pub mod tensor;
+
+// Basis sets and the integral seam
+pub mod basis;
+pub mod integrals;
+
+// SCF and post-SCF methods
+pub mod cc;
+pub mod dft;
+pub mod grad;
+pub mod props;
+pub mod scf;
+
+// Corrections and extensions
+pub mod disp;
+pub mod ext;
+pub mod opt;
+pub mod solv;
+
+// Periodic (solid-state) GPW Kohn–Sham
+pub mod periodic;
+
+// High-level orchestration
+pub mod composite;
+pub mod cp;
+pub mod guardrails;
+mod job;
+pub mod multilevel;
+mod periodic_job;
+mod surface;
+pub mod w1;
+
+pub use cp::{CpFragments, CpResult, counterpoise};
+pub use job::{
+    CosxDiagnostics, DftDiagnostics, FrequencyData, GbsaData, Job, JobOptions, JobResult, Method,
+    PostHfResult, PropertiesResult, RiDiagnostics, SmdData, ecp_summary, optimize_geometry,
+    optimize_geometry_dft,
+};
+pub use periodic_job::{PeriodicFunctional, PeriodicJob, PeriodicJobResult, run_periodic};
+pub use surface::HfSurface;
+
+// Flagship types lifted to the crate root for convenience.
+pub use basis::BasisSet;
+pub use core::{Atom, Element, Molecule};

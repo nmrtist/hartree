@@ -1,0 +1,97 @@
+{
+  "provenance": {
+    "engine": "ORCA",
+    "version": "6.1.1",
+    "settings": "! CCSD(T) NoRI Bohrs VeryTightSCF [NoFrozenCore]; canonical (non-RI) RHF-CCSD(T), %mdci KCOpt KC_MO, STol 1e-9; basis injected via %basis NewGTO from vendored data/basis/*.json (BSE)",
+    "generated": "2026-06-07",
+    "generator": "ORCA generator script (--ccsd-t)",
+    "geometries": "tests/ref/geometries.json",
+    "note": "frozen_core=true uses ORCA's default chemical core (noble-gas); false is all-electron. The all-electron water/sto-3g entry is the Crawford Project #6 (T) anchor. ORCA is a data oracle only."
+  },
+  "entries": [
+    {
+      "molecule": "ethylene",
+      "basis": "cc-pvdz",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -78.03969941692048,
+      "ccsd_total_energy": -78.34527826539,
+      "triples_correction": -0.009877505,
+      "ccsd_t_total_energy": -78.35515577039
+    },
+    {
+      "molecule": "h2",
+      "basis": "6-31g",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.12674270069994,
+      "ccsd_total_energy": -1.151679027411,
+      "triples_correction": 0.0,
+      "ccsd_t_total_energy": -1.151679027411
+    },
+    {
+      "molecule": "h2",
+      "basis": "6-31g",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -1.12674270069994,
+      "ccsd_total_energy": -1.151679027411,
+      "triples_correction": 0.0,
+      "ccsd_t_total_energy": -1.151679027411
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.95252907005302,
+      "ccsd_total_energy": -76.101941755128,
+      "triples_correction": -0.001598594,
+      "ccsd_t_total_energy": -76.103540349128
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.95252907005302,
+      "ccsd_total_energy": -76.101053261299,
+      "triples_correction": -0.001585435,
+      "ccsd_t_total_energy": -76.102638696299
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": true,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -75.98979581981222,
+      "ccsd_total_energy": -76.21182563076201,
+      "triples_correction": -0.003861234,
+      "ccsd_t_total_energy": -76.215686864762
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf-ccsd(t)",
+      "frozen_core": false,
+      "charge": 0,
+      "multiplicity": 1,
+      "hf_energy": -74.94207995394163,
+      "ccsd_total_energy": -75.01276004293301,
+      "triples_correction": -9.9877e-05,
+      "ccsd_t_total_energy": -75.012859919933
+    }
+  ]
+}

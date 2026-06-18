@@ -1,0 +1,33 @@
+{
+  "provenance": {
+    "engine": "PySCF",
+    "version": "2.13.1",
+    "settings": "scf.RHF(mol).density_fit(auxbasis=...); conv_tol 1e-11; cart=False (spherical); orbital AND auxiliary bases built from vendored data/basis/*.json (BSE), never PySCF's internal library, so hartree and the oracle use byte-identical exponents/coefficients and the identical fit space.",
+    "scf_thresholds": "conv_tol = 1e-11",
+    "generated": "2026-06-11",
+    "generator": "PySCF generator script",
+    "geometries": "tests/ref/geometries.json",
+    "tolerances": "Same fit, same integrals: hartree<->ref gate 1e-9 Eh. (The shared ~1e-4 Eh fitting error vs non-fitted HF cancels.)",
+    "note": "water/6-31g was deliberately replaced by water/def2-svp: hartree's 6-31G is Cartesian while the JKFIT aux set is spherical, and PySCF's DF applies mol.cart to the auxiliary basis too, so it cannot mirror hartree's cart-orbital/spherical-aux combination."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "def2-svp",
+      "aux_basis": "def2-universal-jkfit",
+      "method": "ri-rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -75.92284744937352
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-tzvp",
+      "aux_basis": "def2-universal-jkfit",
+      "method": "ri-rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.02056717142032
+    }
+  ]
+}

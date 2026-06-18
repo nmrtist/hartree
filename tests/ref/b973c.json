@@ -1,0 +1,32 @@
+{
+  "provenance": {
+    "note": "SELF-GENERATED regression fixture (NOT an external oracle): produced by hartree itself (round 10) to pin the B97-3c composite against drift. Geometries from tests/ref/geometries.json (bohr).",
+    "engines": {
+      "scf": "hartree RKS gga_xc_b97_3c (xcx, libxc 327 convention), def2-mTZVP (mTZVP, vendored from the Psi4 distribution), grid 3",
+      "d3": "hartree D3(BJ)-ATM, b97-3c parameters (s6=1, s8=1.50, a1=0.37, a2=4.10, s9=1; ATM zero damping alp=16, rs9=4/3 over D3 cutoff radii, simple-dftd3 convention)",
+      "srb": "hartree SRB, B97-3c parameters (gamma=10, s=0.08, E=-s*sum sqrt(ZA*ZB)*exp(-gamma*R/R0AB) over the D3 cutoff radii; mctc-gcp srb_egrad2 convention, 30 bohr cutoff)"
+    },
+    "method": "B97-3c: refitted B97 GGA/mTZVP + D3(BJ)-ATM + SRB (no gCP); Brandenburg, Bannwarth, Hansen, Grimme, J. Chem. Phys. 148, 064104 (2018)"
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "e_scf": -76.36850427004927,
+      "e_disp": -0.0008532090130323394,
+      "e_srb": -0.002919391762783544,
+      "e_total": -76.37227687082509
+    },
+    {
+      "molecule": "water_dimer",
+      "e_scf": -152.7186314830629,
+      "e_disp": -0.0030625566453855485,
+      "e_srb": -0.006146959021823849,
+      "e_total": -152.7278409987301
+    }
+  ],
+  "bare_functional": {
+    "molecule": "water",
+    "e_scf": -76.36850427004927,
+    "note": "plain gga_xc_b97_3c/def2-mTZVP grid-3 SCF, no corrections (functional-wiring sanity pin)"
+  }
+}

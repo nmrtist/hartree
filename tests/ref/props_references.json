@@ -1,0 +1,71 @@
+{
+  "provenance": {
+    "engine": "ORCA",
+    "version": "6.1.1",
+    "settings": "! HF Bohrs VeryTightSCF NoRI; %output Mulliken/Loewdin/Mayer; basis injected via %basis NewGTO from vendored data/basis/*.json (BSE)",
+    "generated": "2026-06-07",
+    "generator": "ORCA generator script (--props)",
+    "geometries": "opt_references.json (ORCA-optimized geometries)",
+    "note": "Dipole magnitude/vector in atomic units (e\u00b7a\u2080) \u2014 the convention-free quantity hartree is checked against; Debye is ORCA's own value, kept for reference (its a.u.\u2192Debye factor differs from CODATA at ~2e-5). Charges in a.u. (net charge = \u03a3 q_A); Mayer bond orders dimensionless. ORCA is a data oracle only."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "geometry_source": "water/cc-pvdz/rhf",
+      "dipole_magnitude_au": 0.80425467,
+      "dipole_vector_au": [
+        0.0,
+        0.80425467,
+        0.0
+      ],
+      "dipole_magnitude_debye": 2.044252911,
+      "mulliken_charges": [
+        -0.292228,
+        0.146114,
+        0.146114
+      ],
+      "lowdin_charges": [
+        -0.473552,
+        0.236776,
+        0.236776
+      ],
+      "mayer_bond_orders": {
+        "0,1": 1.0255,
+        "0,2": 1.0255
+      }
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "geometry_source": "water/sto-3g/rhf",
+      "dipole_magnitude_au": 0.672454035,
+      "dipole_vector_au": [
+        -0.0,
+        0.672454035,
+        -0.0
+      ],
+      "dipole_magnitude_debye": 1.709242321,
+      "mulliken_charges": [
+        -0.33053,
+        0.165265,
+        0.165265
+      ],
+      "lowdin_charges": [
+        -0.231553,
+        0.115776,
+        0.115776
+      ],
+      "mayer_bond_orders": {
+        "0,1": 0.9642,
+        "0,2": 0.9642
+      }
+    }
+  ]
+}

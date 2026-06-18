@@ -1,0 +1,63 @@
+{
+  "provenance": {
+    "engine": "ORCA",
+    "version": "6.1.1",
+    "settings": "! HF NumFreq Bohrs VeryTightSCF NoRI; %freq Temp 298.15 Pressure 1.0 (atm; = 101325 Pa, hartree's standard state); basis injected via %basis NewGTO from vendored data/basis/*.json (BSE)",
+    "generated": "2026-06-07",
+    "generator": "ORCA generator script (--freq)",
+    "geometries": "opt_references.json (ORCA-optimized geometries)",
+    "note": "Frequencies in cm\u207b\u00b9 (imaginary as negative). Thermo in hartree (and hartree/K for entropy). ORCA symmetry_number=2 for H\u2082O. ORCA is a data oracle only."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "geometry_source": "water/cc-pvdz/rhf",
+      "temperature": 298.15,
+      "symmetry_number": 2,
+      "frequencies_cm1": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1775.65,
+        4113.52,
+        4211.84
+      ],
+      "zpe_hartree": 0.02301178,
+      "enthalpy_hartree": -76.00026344,
+      "entropy_hartree_per_k": 7.169565654874587e-05,
+      "gibbs_hartree": -76.0216395
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "geometry_source": "water/sto-3g/rhf",
+      "temperature": 298.15,
+      "symmetry_number": 2,
+      "frequencies_cm1": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2169.75,
+        4139.68,
+        4390.7
+      ],
+      "zpe_hartree": 0.02437669,
+      "enthalpy_hartree": -74.9377475,
+      "entropy_hartree_per_k": 7.216243501595057e-05,
+      "gibbs_hartree": -74.95926273
+    }
+  ]
+}

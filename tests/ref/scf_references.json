@@ -1,0 +1,409 @@
+{
+  "provenance": {
+    "engine": "ORCA",
+    "version": "6.1.1",
+    "settings": "! <method> Bohrs VeryTightSCF NoRI; basis injected via %basis NewGTO from vendored data/basis/*.json (BSE)",
+    "generated": "2026-06-07",
+    "generator": "ORCA generator script",
+    "geometries": "tests/ref/geometries.json",
+    "note": "ORCA is a data oracle only; raw ORCA files are never committed."
+  },
+  "entries": [
+    {
+      "molecule": "benzene",
+      "basis": "6-31g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -230.623286110311,
+      "s2": null
+    },
+    {
+      "molecule": "benzene",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -230.722082253927,
+      "s2": null
+    },
+    {
+      "molecule": "ch3",
+      "basis": "cc-pvdz",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -39.559636807865,
+      "s2": null
+    },
+    {
+      "molecule": "ch3",
+      "basis": "cc-pvdz",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -39.563804614063,
+      "s2": 0.761197
+    },
+    {
+      "molecule": "ch3",
+      "basis": "sto-3g",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -39.072135397157,
+      "s2": null
+    },
+    {
+      "molecule": "ch3",
+      "basis": "sto-3g",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -39.076709687362,
+      "s2": 0.76521
+    },
+    {
+      "molecule": "h2",
+      "basis": "6-31g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -1.1267427007,
+      "s2": null
+    },
+    {
+      "molecule": "h2",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -1.128709448979,
+      "s2": null
+    },
+    {
+      "molecule": "h2",
+      "basis": "def2-svp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -1.128901697491,
+      "s2": null
+    },
+    {
+      "molecule": "h2",
+      "basis": "sto-3g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -1.116714325175,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "6-311++g(d,p)",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.702051174528,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "6-311+g(d,p)",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.70194855336,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "6-311g(d,p)",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.70107975888,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "6-311g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.654319886046,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "aug-cc-pvtz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.713858866903,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "cc-pvqz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.717942730896,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "cc-pvtz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.712950035421,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "def2-qzvp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.719547295618,
+      "s2": null
+    },
+    {
+      "molecule": "h2s",
+      "basis": "def2-tzvp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -398.706592314269,
+      "s2": null
+    },
+    {
+      "molecule": "nh2",
+      "basis": "cc-pvdz",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -55.562844602076,
+      "s2": null
+    },
+    {
+      "molecule": "nh2",
+      "basis": "cc-pvdz",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -55.567092578429,
+      "s2": 0.757826
+    },
+    {
+      "molecule": "nh2",
+      "basis": "sto-3g",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -54.834515316474,
+      "s2": null
+    },
+    {
+      "molecule": "nh2",
+      "basis": "sto-3g",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -54.836942234367,
+      "s2": 0.757222
+    },
+    {
+      "molecule": "o2",
+      "basis": "cc-pvdz",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 3,
+      "energy": -149.607954233519,
+      "s2": null
+    },
+    {
+      "molecule": "o2",
+      "basis": "cc-pvdz",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 3,
+      "energy": -149.627639705655,
+      "s2": 2.033087
+    },
+    {
+      "molecule": "o2",
+      "basis": "sto-3g",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 3,
+      "energy": -147.632198663386,
+      "s2": null
+    },
+    {
+      "molecule": "o2",
+      "basis": "sto-3g",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 3,
+      "energy": -147.633976879524,
+      "s2": 2.003411
+    },
+    {
+      "molecule": "oh",
+      "basis": "cc-pvdz",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.38937564159,
+      "s2": null
+    },
+    {
+      "molecule": "oh",
+      "basis": "cc-pvdz",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.39382110662,
+      "s2": 0.754613
+    },
+    {
+      "molecule": "oh",
+      "basis": "sto-3g",
+      "method": "rohf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -74.361636219403,
+      "s2": null
+    },
+    {
+      "molecule": "oh",
+      "basis": "sto-3g",
+      "method": "uhf",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -74.362744531837,
+      "s2": 0.753277
+    },
+    {
+      "molecule": "water",
+      "basis": "6-311++g(d,p)",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.013594411746,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "6-311+g(d,p)",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.013487215158,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "6-311g(d,p)",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.007058905669,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "6-311g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -75.976302073394,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -75.952529070053,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "aug-cc-pvtz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.021633140456,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvdz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -75.989795819812,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvqz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.025202855528,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "cc-pvtz",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.017921851069,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-qzvp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.027129687588,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-svp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -75.922903267786,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-tzvp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.020577684834,
+      "s2": null
+    },
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -74.942079953941,
+      "s2": null
+    }
+  ]
+}

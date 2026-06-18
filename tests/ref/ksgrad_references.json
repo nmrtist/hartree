@@ -1,0 +1,168 @@
+{
+  "provenance": {
+    "engine": "PySCF",
+    "version": "2.13.1",
+    "settings": "RKS/UKS by multiplicity; xc by numeric libxc ids (pbe=101,130; b3lyp=402 i.e. VWN_RPA); conv_tol 1e-12; cart=False (spherical); basis built from vendored data/basis/*.json (BSE), never PySCF's internal library. Gradients: mf.nuc_grad_method() with grid_response=True (exact derivative of the quadrature energy, matching hartree's weight-derivative convention). Units: hartree/bohr, molecule atom order.",
+    "grid": "grids.level = 9",
+    "scf_thresholds": "conv_tol = 1e-12",
+    "generated": "2026-06-11",
+    "generator": "PySCF generator script",
+    "geometries": "tests/ref/geometries.json",
+    "tolerances": "Gradient cross-program agreement is grid-difference-limited (hartree level 3 vs PySCF level 9): expect ~1e-6/component. Gate set in hartree-grad/tests/ksgrad_oracle.rs from the measured worst.",
+    "note": "Analytic KS nuclear gradients (LDA/GGA/global hybrids). PySCF is the primary oracle (ORCA unavailable at generation time)."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "functional": "pbe",
+      "libxc_ids": "101,130",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.28438910089265,
+      "gradient": [
+        [
+          -9.853333002504105e-16,
+          -0.07236921303477528,
+          2.3471905739282e-17
+        ],
+        [
+          0.05225397609120752,
+          0.03618460651738875,
+          8.743758228439666e-17
+        ],
+        [
+          -0.05225397609120597,
+          0.03618460651738764,
+          -1.0897168839859746e-16
+        ]
+      ]
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "functional": "b3lyp",
+      "libxc_ids": "402",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.3671160458455,
+      "gradient": [
+        [
+          -6.949354984204916e-17,
+          -0.08359807960801868,
+          -2.88848079752574e-17
+        ],
+        [
+          0.05737456992316736,
+          0.04179903980400934,
+          1.112577519842106e-16
+        ],
+        [
+          -0.05737456992316581,
+          0.041799039804008675,
+          -8.252339823620782e-17
+        ]
+      ]
+    },
+    {
+      "molecule": "oh",
+      "basis": "6-31g",
+      "functional": "pbe",
+      "libxc_ids": "101,130",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.62129476578863,
+      "gradient": [
+        [
+          -8.705660027379363e-17,
+          -2.0449505703212263e-17,
+          0.03160912074541322
+        ],
+        [
+          8.705660027378905e-17,
+          2.04495057032106e-17,
+          -0.031609120745409225
+        ]
+      ]
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-svp",
+      "functional": "pbe",
+      "libxc_ids": "101,130",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.25112673779897,
+      "gradient": [
+        [
+          -1.6125076826357542e-16,
+          -0.08217258875296807,
+          -3.006373342618242e-17
+        ],
+        [
+          0.06580034096066667,
+          0.04108629437648692,
+          1.1930352390510787e-16
+        ],
+        [
+          -0.06580034096066956,
+          0.04108629437648692,
+          -8.985410112392437e-17
+        ]
+      ]
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-svp",
+      "functional": "b3lyp",
+      "libxc_ids": "402",
+      "reference": "rks",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.33342015616982,
+      "gradient": [
+        [
+          -1.4711588426867522e-16,
+          -0.09261427139069411,
+          4.820904726644434e-17
+        ],
+        [
+          0.07084330024313257,
+          0.04630713569534506,
+          -9.929087039993773e-16
+        ],
+        [
+          -0.07084330024313301,
+          0.04630713569534839,
+          9.44306633445401e-16
+        ]
+      ]
+    },
+    {
+      "molecule": "oh",
+      "basis": "def2-svp",
+      "functional": "pbe",
+      "libxc_ids": "101,130",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "energy": -75.58121667796068,
+      "gradient": [
+        [
+          -1.1088740865133893e-15,
+          5.91488199240369e-16,
+          0.017494140130243974
+        ],
+        [
+          1.1088740865137042e-15,
+          -5.914881992405043e-16,
+          -0.017494140130243974
+        ]
+      ]
+    }
+  ]
+}

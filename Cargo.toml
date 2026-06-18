@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hartree",
+    "crates/hartree-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Jiekang Tian"]
+rust-version = "1.87"
+repository = "https://github.com/nmrtist/hartree"
+
+[workspace.dependencies]
+hartree = { path = "crates/hartree", version = "0.1.0" }
+
+integral = "0.2.0"
+# latx: periodic-systems foundation (cells, reciprocal lattices, k-points).
+latx = "0.1.0"
+faer = "0.24"
+rayon = "1"
+num-complex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+xcx = "0.3.1"
+
+# Keep debug assertions on while making the numerics-heavy test suite fast: light
+# optimization of workspace code, full optimization of dependencies.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Fast edit-test loop: release-level opt-level without thin-LTO/serial codegen, which
+# only cost compile time. Build with `--profile quick`; use `--release` for shipping.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 256

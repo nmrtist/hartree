@@ -1,0 +1,114 @@
+{
+  "provenance": {
+    "engine": "PySCF",
+    "version": "2.13.1",
+    "settings": "scf.RHF/UHF or dft.RKS/UKS (xc by numeric libxc ids) with .PCM(): method='C-PCM', SWIG discretization, lebedev_order=29 (302 pts/sphere), default radii (modified Bondi, H=1.1 A, x1.2 vdw_scale, r_probe=0); conv_tol 1e-12; cart=False; basis built from vendored data/basis/*.json (BSE), never PySCF's internal library. 'energy' is e_tot (includes e_solv); 'e_solv' is the C-PCM component (with_solvent.e).",
+    "generated": "2026-06-11",
+    "generator": "PySCF generator script",
+    "geometries": "tests/ref/geometries.json",
+    "tolerances": "hartree ports the SWIG discretization 1:1, so HF agreement is at the SCF-convergence/solver level. KS (pbe) entries additionally carry the usual XC quadrature residual (PySCF grids.level 9 vs hartree --grid); see cpcm oracle test gates."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "sto-3g",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "eps": 78.3553,
+      "energy": -74.9470315344001,
+      "e_solv": -0.0052884418015419965
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "eps": 78.3553,
+      "energy": -75.96795203964008,
+      "e_solv": -0.017400355791126972
+    },
+    {
+      "molecule": "oh_minus",
+      "basis": "6-31g",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": -1,
+      "multiplicity": 1,
+      "eps": 78.3553,
+      "energy": -75.45829385770865,
+      "e_solv": -0.14843865983027638
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-svp",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "eps": 78.3553,
+      "energy": -75.93499389299375,
+      "e_solv": -0.013624660892522374
+    },
+    {
+      "molecule": "oh_minus",
+      "basis": "def2-svp",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": -1,
+      "multiplicity": 1,
+      "eps": 78.3553,
+      "energy": -75.4127480681719,
+      "e_solv": -0.14660910703423363
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-tzvp",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "eps": 78.3553,
+      "energy": -76.03334726677036,
+      "e_solv": -0.014653223573098385
+    },
+    {
+      "molecule": "water",
+      "basis": "6-31g",
+      "method": "hf",
+      "reference": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "eps": 4.7113,
+      "energy": -75.96452300569209,
+      "e_solv": -0.01320306539291318
+    },
+    {
+      "molecule": "oh",
+      "basis": "6-31g",
+      "method": "pbe",
+      "libxc_ids": "101,130",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "eps": 78.3553,
+      "energy": -75.62931633477372,
+      "e_solv": -0.008970365129779
+    },
+    {
+      "molecule": "oh",
+      "basis": "def2-svp",
+      "method": "pbe",
+      "libxc_ids": "101,130",
+      "reference": "uks",
+      "charge": 0,
+      "multiplicity": 2,
+      "eps": 78.3553,
+      "energy": -75.58733379008594,
+      "e_solv": -0.0068385185474798445
+    }
+  ]
+}

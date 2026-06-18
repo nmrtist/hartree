@@ -1,0 +1,23 @@
+[package]
+name = "hartree-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Command-line driver for hartree: an XYZ file plus a basis and method, to an SCF energy."
+repository.workspace = true
+keywords = ["chemistry", "quantum", "hartree-fock", "ccsd", "cli"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "hartree"
+path = "src/main.rs"
+
+[dependencies]
+hartree.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+hartree.workspace = true

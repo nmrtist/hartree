@@ -1,0 +1,79 @@
+{
+  "provenance": {
+    "engine": "PySCF",
+    "version": "2.13.1",
+    "settings": "RHF; conv_tol 1e-11; cart=False (spherical); basis built from vendored data/basis/*.json (BSE), never PySCF's internal library, so hartree and the oracle use byte-identical exponents/coefficients.",
+    "scf_thresholds": "conv_tol = 1e-11",
+    "generated": "2026-06-11",
+    "generator": "PySCF generator script",
+    "geometries": "tests/ref/geometries.json",
+    "tolerances": "HF is grid-free; hartree<->ref gate 2e-10 Eh (the standard HF-reference gate).",
+    "note": "Karlsruhe sets: def2-TZVPP/def2-QZVPP energy bases (water), def2-TZVPD/def2-SVPD diffuse property bases (water + OH- anion), and def2-mTZVPP (the r2scan-3c modified TZVPP, water + nh3). PySCF is the primary oracle."
+  },
+  "entries": [
+    {
+      "molecule": "water",
+      "basis": "def2-tzvpp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.02301873212943
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-qzvpp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.02712968769266
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-tzvpd",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.02295511159016
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-svpd",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -75.93574077098661
+    },
+    {
+      "molecule": "oh_minus",
+      "basis": "def2-tzvpd",
+      "method": "rhf",
+      "charge": -1,
+      "multiplicity": 1,
+      "energy": -75.4136558024885
+    },
+    {
+      "molecule": "oh_minus",
+      "basis": "def2-svpd",
+      "method": "rhf",
+      "charge": -1,
+      "multiplicity": 1,
+      "energy": -75.3282433885659
+    },
+    {
+      "molecule": "water",
+      "basis": "def2-mtzvpp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -76.02024619298875
+    },
+    {
+      "molecule": "nh3",
+      "basis": "def2-mtzvpp",
+      "method": "rhf",
+      "charge": 0,
+      "multiplicity": 1,
+      "energy": -56.21781224112908
+    }
+  ]
+}
