@@ -11,7 +11,8 @@ use crate::dft::{
 use crate::disp::Dispersion;
 use crate::integrals::{ConventionalProvider, DfProvider, DirectProvider, IntegralProvider};
 use crate::linalg::{mat_from_row_major, mat_to_row_major};
-use crate::opt::{OptOptions, OptResult, Surface, optimize};
+use crate::opt::ts::{Progress, TsError, TsOptions, TsResult, find_transition_state};
+use crate::opt::{OptError, OptOptions, OptResult, Surface, optimize};
 use crate::props::dipole::{center_of_mass, dipole_moment};
 use crate::props::frequencies::{FrequencyResult, harmonic_frequencies};
 use crate::props::hessian::numerical_hessian;
@@ -101,6 +102,10 @@ pub struct JobOptions {
     pub compute_frequencies: bool,
     pub single_point_hessian: bool,
     pub optimize_geometry: bool,
+    /// Request a transition-state (saddle-point) search instead of a relaxation;
+    /// gated to the same gradient-capable method/backend combinations as
+    /// `optimize_geometry`. Mutually exclusive with it.
+    pub transition_state: bool,
     pub symmetry_number: u32,
     pub qrrho_w0_cm1: f64,
     pub grid_level: usize,
@@ -118,6 +123,9 @@ pub struct JobOptions {
     pub ri_mp2: bool,
     pub cosx: bool,
     pub x2c: bool,
+    /// Knobs for the transition-state search (algorithm, trust radii, IRC, ...);
+    /// only consulted when `transition_state` is set. See [`TsOptions`].
+    pub ts_options: TsOptions,
 }
 
 impl Default for JobOptions {
@@ -130,6 +138,7 @@ impl Default for JobOptions {
             compute_frequencies: false,
             single_point_hessian: false,
             optimize_geometry: false,
+            transition_state: false,
             symmetry_number: 1,
             qrrho_w0_cm1: crate::props::thermo::QRRHO_W0_DEFAULT_CM1,
             grid_level: 3,
@@ -147,6 +156,7 @@ impl Default for JobOptions {
             ri_mp2: false,
             cosx: false,
             x2c: false,
+            ts_options: TsOptions::default(),
         }
     }
 }
@@ -286,6 +296,7 @@ pub struct RiDiagnostics {
 pub struct JobResult {
     pub scf: ScfResult,
     pub optimized_geometry: Option<OptResult>,
+    pub transition_state: Option<TsResult>,
     pub post_hf: Option<PostHfResult>,
     pub properties: Option<PropertiesResult>,
     pub frequencies: Option<FrequencyData>,
@@ -322,7 +333,8 @@ impl JobResult {
         let scf_ok = self.scf.converged;
         let post_ok = self.post_hf.as_ref().is_none_or(|p| p.converged());
         let opt_ok = self.optimized_geometry.as_ref().is_none_or(|o| o.converged);
-        scf_ok && post_ok && opt_ok
+        let ts_ok = self.transition_state.as_ref().is_none_or(|t| t.converged());
+        scf_ok && post_ok && opt_ok && ts_ok
     }
 }
 
@@ -523,6 +535,7 @@ impl Job {
             method_warnings: Vec::new(),
             scf,
             optimized_geometry: None,
+            transition_state: None,
             post_hf: None,
             properties: None,
             frequencies: None,
@@ -639,6 +652,12 @@ impl Job {
             if opts.optimize_geometry {
                 return Err(format!(
                     "{name} is a double hybrid: geometry optimization is not supported \
+                     (no PT2 gradient)"
+                ));
+            }
+            if opts.transition_state {
+                return Err(format!(
+                    "{name} is a double hybrid: transition-state search is not supported \
                      (no PT2 gradient)"
                 ));
             }
@@ -859,6 +878,20 @@ impl Job {
                     .into(),
             );
         }
+        if opts.optimize_geometry && opts.transition_state {
+            return Err(
+                "geometry optimization and transition-state search are mutually exclusive: \
+                 request at most one"
+                    .into(),
+            );
+        }
+        if opts.cosmo_file.is_some() && (opts.optimize_geometry || opts.transition_state) {
+            return Err(
+                "COSMO file export cannot be combined with geometry optimization or \
+                 transition-state search: request one at a time"
+                    .into(),
+            );
+        }
         if opts.optimize_geometry
             && matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT)
         {
@@ -1071,7 +1104,7 @@ impl Job {
             if let Some(name) = &opts.smd {
                 surface.set_smd(*resolve_smd_solvent(name)?);
             }
-            let opt = optimize(mol, &mut surface, &opt_opts).map_err(|e| e.to_string())?;
+            let opt = optimize(mol, &mut surface, &opt_opts).map_err(|e| opt_error_message(&e))?;
             let scf = surface
                 .last_scf()
                 .cloned()
@@ -1099,6 +1132,149 @@ impl Job {
                 method_warnings: Vec::new(),
                 scf,
                 optimized_geometry: Some(opt),
+                transition_state: None,
+                post_hf: None,
+                properties: None,
+                frequencies: None,
+                dft: None,
+                ri: None,
+                cosx: None,
+                dispersion_energy,
+                gcp_energy,
+                srb_energy,
+                fod: None,
+                vv10_energy: None,
+                double_hybrid: None,
+                smd: None,
+                gbsa: None,
+            });
+        }
+
+        if opts.transition_state {
+            // A transition-state search drives the same energy+gradient `Surface`
+            // as `optimize`, so it is gated to a SUBSET of the gradient-capable
+            // combinations `optimize_geometry` allows: TS additionally rejects
+            // implicit solvent, because the saddle search relies on the analytic
+            // gradient path that the solvated surface does not expose (see
+            // `surface.rs` `analytic_gradient`, which returns `None` for solvent),
+            // whereas relaxation tolerates the finite-difference fallback. The
+            // mutual-exclusion and double-hybrid gates live in the validation
+            // prologue above, alongside their `optimize_geometry` counterparts.
+            if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+                return Err(
+                    "transition-state search is not supported for post-HF methods \
+                     (no analytic CC gradient)"
+                        .into(),
+                );
+            }
+            if opts.ri {
+                return Err("the RI-JK backend does not support transition-state search".into());
+            }
+            if opts.direct {
+                return Err(
+                    "integral-direct backend does not support transition-state search".into(),
+                );
+            }
+            if opts.cosx {
+                return Err(
+                    "COSX is energy-only: transition-state search is not supported \
+                     (no COSX gradient)"
+                        .into(),
+                );
+            }
+            if opts.x2c {
+                return Err(
+                    "X2C is energy-only: transition-state search is not supported \
+                     (no X2C analytic gradient)"
+                        .into(),
+                );
+            }
+            if opts.smearing.is_some() {
+                return Err(
+                    "Fermi smearing is energy-only: transition-state search is not \
+                     supported (no smeared gradient)"
+                        .into(),
+                );
+            }
+            if solvated {
+                return Err(
+                    "transition-state search in implicit solvent is not supported \
+                     (no analytic solvation gradient on this path)"
+                        .into(),
+                );
+            }
+            if mol.has_ghosts() {
+                return Err(
+                    "transition-state search with ghost atoms is not supported (ghost \
+                     centers carry no nuclei, so the mass-weighted reaction coordinate is \
+                     undefined)"
+                        .into(),
+                );
+            }
+            // (The double-hybrid "no PT2 gradient" rejection is handled in the
+            // consolidated double-hybrid block above, before that method dispatches
+            // to `run_double_hybrid`. Only the VV10 gate must be inline: the
+            // consolidated VV10 block gates `optimize_geometry`, not TS.)
+            if let Method::Dft(spec) = &self.method
+                && spec.vv10().is_some()
+            {
+                return Err(format!(
+                    "{} is VV10-carrying: transition-state search is not supported (the \
+                     nonlocal VV10 energy E_nl has no gradient)",
+                    spec.name()
+                ));
+            }
+
+            // Build the surface exactly as the relaxation branch does, then drive
+            // the saddle search. The algorithm and the per-job knobs (trust radii,
+            // IRC confirmation, ...) come from the job's `ts_options`, which the
+            // CLI populates from `--ts-*` flags; an empty job keeps the defaults.
+            let ts_opts = self.options.ts_options.clone();
+            let mut surface = if let Method::Dft(spec) = &self.method {
+                HfSurface::new_dft(mol, &self.basis, reference, spec.clone(), opts.grid_level)?
+            } else {
+                HfSurface::new(mol, &self.basis, reference)?
+            };
+            prepare_ts_surface(&mut surface);
+            if let Some(disp) = opts.dispersion {
+                surface.set_dispersion(disp);
+            }
+            if let Some(gcp) = opts.gcp {
+                surface.set_gcp(gcp);
+            }
+            if let Some(srb) = opts.srb {
+                surface.set_srb(srb);
+            }
+            let ts = find_transition_state(mol, &mut surface, &ts_opts, None)
+                .map_err(|e| ts_error_message(&e))?;
+            let scf = surface
+                .last_scf()
+                .cloned()
+                .ok_or("surface has no cached SCF after transition-state search")?;
+            let final_mol = (opts.dispersion.is_some() || opts.gcp.is_some() || opts.srb.is_some())
+                .then(|| {
+                    let atoms = mol
+                        .atoms
+                        .iter()
+                        .zip(&ts.positions)
+                        .map(|(a, p)| crate::core::Atom::new(a.element, *p))
+                        .collect();
+                    Molecule::new(atoms, mol.charge, mol.multiplicity)
+                });
+            let dispersion_energy = opts
+                .dispersion
+                .map(|disp| disp.energy(final_mol.as_ref().unwrap()));
+            let gcp_energy = opts
+                .gcp
+                .map(|p| crate::disp::gcp_energy(final_mol.as_ref().unwrap(), &p));
+            let srb_energy = opts
+                .srb
+                .map(|p| crate::disp::srb_energy(final_mol.as_ref().unwrap(), &p));
+            return Ok(JobResult {
+                method_warnings: Vec::new(),
+                scf,
+                optimized_geometry: None,
+                transition_state: Some(ts),
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1132,6 +1308,7 @@ impl Job {
                 method_warnings: Vec::new(),
                 scf,
                 optimized_geometry: None,
+                transition_state: None,
                 post_hf,
                 properties: None,
                 frequencies: None,
@@ -1155,6 +1332,7 @@ impl Job {
                 method_warnings: Vec::new(),
                 scf,
                 optimized_geometry: None,
+                transition_state: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1180,6 +1358,7 @@ impl Job {
                 method_warnings: Vec::new(),
                 scf,
                 optimized_geometry: None,
+                transition_state: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1350,6 +1529,7 @@ impl Job {
             method_warnings: Vec::new(),
             scf,
             optimized_geometry: None,
+            transition_state: None,
             post_hf,
             properties,
             frequencies,
@@ -1499,6 +1679,7 @@ impl Job {
                 method_warnings: Vec::new(),
                 scf,
                 optimized_geometry: None,
+                transition_state: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1592,6 +1773,7 @@ impl Job {
             method_warnings: Vec::new(),
             scf,
             optimized_geometry: None,
+            transition_state: None,
             post_hf: None,
             properties,
             frequencies: None,
@@ -1911,6 +2093,33 @@ type ConventionalRun = (
     Option<CosxDiagnostics>,
 );
 
+/// Recovery hint shown when an SCF fails to converge during a geometry/TS run; the
+/// `Job` path flattens typed errors to a single user-facing `String`.
+const SCF_RECOVERY_HINT: &str = "SCF did not converge — try a better initial geometry, a larger SCF level shift, \
+     or more SCF iterations";
+
+/// Flatten an [`OptError`] for the CLI, replacing the bare SCF-non-convergence
+/// message with an actionable recovery hint.
+fn opt_error_message(e: &OptError) -> String {
+    match e {
+        OptError::ScfNotConverged { .. } => SCF_RECOVERY_HINT.to_string(),
+        // `OptError` is `#[non_exhaustive]`; everything else keeps its own message.
+        other => other.to_string(),
+    }
+}
+
+/// Flatten a [`TsError`] for the CLI; an SCF non-convergence reaching the surface
+/// (the common TS failure) gets the same recovery hint as the minimizer path.
+fn ts_error_message(e: &TsError) -> String {
+    match e {
+        TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. }) => {
+            SCF_RECOVERY_HINT.to_string()
+        }
+        // `TsError` is `#[non_exhaustive]`; everything else keeps its own message.
+        other => other.to_string(),
+    }
+}
+
 fn resolve_smd_solvent(name: &str) -> Result<&'static crate::solv::SmdSolvent, String> {
     crate::solv::smd_solvent(name).ok_or_else(|| {
         let names: Vec<&str> = crate::solv::SMD_SOLVENTS.iter().map(|s| s.name).collect();
@@ -1975,3 +2184,57 @@ pub fn optimize_geometry_dft(
     let mut surface = HfSurface::new_dft(molecule, basis, reference, functional, grid_level)?;
     optimize(molecule, &mut surface, options).map_err(|e| e.to_string())
 }
+
+/// Apply the SCF settings a saddle search needs: transition-state geometries have
+/// small HOMO–LUMO gaps, so the SCF gets extra iterations and a level shift to
+/// converge.
+fn prepare_ts_surface(surface: &mut HfSurface) {
+    surface.set_scf_max_iter(400);
+    surface.set_scf_level_shift(0.3);
+}
+
+/// Locate a first-order saddle point on a Hartree–Fock (or wavefunction-SCF)
+/// surface, returning the TYPED [`TsResult`]/[`TsError`] contract.
+///
+/// The transition-state analogue of [`optimize_geometry`], and the entry point a
+/// programmatic agent should prefer over the `Job` flag: it preserves the
+/// [`TsError`] variant, which the `Job` path necessarily flattens to `String`
+/// (because `Job::run` returns `Result<_, String>`). Builds an
+/// [`HfSurface`] with the same saddle-search SCF settings the `Job` path uses;
+/// `progress` is the optional per-iteration
+/// observer (see [`Progress`]). Surface-construction failures (e.g. an
+/// inconsistent charge/multiplicity) are reported as
+/// [`TsError::SurfaceEvaluation`].
+pub fn transition_state(
+    molecule: &Molecule,
+    basis: &str,
+    reference: Reference,
+    options: &TsOptions,
+    progress: Option<&dyn Progress>,
+) -> Result<TsResult, TsError> {
+    let mut surface = HfSurface::new(molecule, basis, reference)
+        .map_err(|e| TsError::SurfaceEvaluation(OptError::Evaluation(e)))?;
+    prepare_ts_surface(&mut surface);
+    find_transition_state(molecule, &mut surface, options, progress)
+}
+
+/// Locate a first-order saddle point on a Kohn–Sham (DFT) surface; the DFT
+/// analogue of [`optimize_geometry_dft`]. See [`transition_state`].
+pub fn transition_state_dft(
+    molecule: &Molecule,
+    basis: &str,
+    reference: Reference,
+    functional: FunctionalSpec,
+    grid_level: usize,
+    options: &TsOptions,
+    progress: Option<&dyn Progress>,
+) -> Result<TsResult, TsError> {
+    let mut surface = HfSurface::new_dft(molecule, basis, reference, functional, grid_level)
+        .map_err(|e| TsError::SurfaceEvaluation(OptError::Evaluation(e)))?;
+    prepare_ts_surface(&mut surface);
+    find_transition_state(molecule, &mut surface, options, progress)
+}
+
+#[cfg(test)]
+#[path = "job_tests.rs"]
+mod tests;

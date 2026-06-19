@@ -2,17 +2,30 @@
 
 pub mod fd;
 pub mod internals;
+pub mod ts;
 
 use crate::core::Molecule;
 use crate::linalg::{mat_from_row_major, mat_to_row_major, symmetric_eigh};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use internals::Internal;
 
+// `#[non_exhaustive]` (matching `TsError`) so future surface-failure modes can be
+// added non-breakingly; the only matches on `OptError` (the job error flatteners)
+// carry a wildcard arm, so this stays safe.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OptError {
     #[error("surface evaluation failed: {0}")]
     Evaluation(String),
+    /// The SCF did not reach self-consistency within its iteration cap. A distinct,
+    /// branchable signal (rather than prose inside `Evaluation`) so a caller can
+    /// respond programmatically — tighten the SCF, change the initial guess, or
+    /// raise the level shift — and retry. `iterations` is the SCF iteration count
+    /// reached (the cap, when the cap was exhausted).
+    #[error("SCF did not converge in {iterations} iterations")]
+    ScfNotConverged { iterations: usize },
 }
 
 pub trait Surface {
@@ -22,6 +35,17 @@ pub trait Surface {
         &mut self,
         positions: &[[f64; 3]],
     ) -> Option<Result<Vec<[f64; 3]>, OptError>>;
+
+    /// Optional fast Cartesian finite-difference Hessian (row-major, symmetrized);
+    /// an implementation may run the `2·ndof` independent gradient evaluations in
+    /// parallel. `None` (the default) selects the driver's serial finite difference.
+    fn fd_hessian(
+        &mut self,
+        _positions: &[[f64; 3]],
+        _fd_step: f64,
+    ) -> Option<Result<Vec<f64>, OptError>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +77,9 @@ impl Default for OptOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+// `Serialize`/`Deserialize` so the trace can travel inside the (serde) TS
+// result objects the agent consumes; `OptResult` reuses the same step record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct OptStep {
     pub iteration: usize,
     pub energy: f64,
@@ -454,5 +480,27 @@ mod tests {
         assert!((r01 - 1.81).abs() < 1e-4, "r01 = {r01}");
         assert!((r02 - 1.81).abs() < 1e-4, "r02 = {r02}");
         assert!((th - 1.823).abs() < 1e-4, "theta = {th}");
+    }
+
+    /// A SCF non-convergence on the real `HfSurface` propagates out of `optimize`
+    /// as the typed `OptError::ScfNotConverged` (via the first `surface.energy`
+    /// call), not a prose `Evaluation` string. Water/sto-3g cannot converge in one
+    /// SCF iteration, so `set_scf_max_iter(1)` forces the failure.
+    #[test]
+    fn scf_non_convergence_propagates_through_optimize() {
+        use crate::scf::Reference;
+        use crate::surface::HfSurface;
+
+        let mol =
+            Molecule::from_xyz("3\nwater\nO 0 0 0.117\nH 0 0.757 -0.470\nH 0 -0.757 -0.470\n")
+                .unwrap();
+        let mut surface = HfSurface::new(&mol, "sto-3g", Reference::Rhf).unwrap();
+        surface.set_scf_max_iter(1);
+
+        let err = optimize(&mol, &mut surface, &OptOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, OptError::ScfNotConverged { iterations: 1 }),
+            "expected ScfNotConverged {{ iterations: 1 }}, got {err:?}"
+        );
     }
 }

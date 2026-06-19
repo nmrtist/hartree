@@ -43,7 +43,7 @@ pub use cp::{CpFragments, CpResult, counterpoise};
 pub use job::{
     CosxDiagnostics, DftDiagnostics, FrequencyData, GbsaData, Job, JobOptions, JobResult, Method,
     PostHfResult, PropertiesResult, RiDiagnostics, SmdData, ecp_summary, optimize_geometry,
-    optimize_geometry_dft,
+    optimize_geometry_dft, transition_state, transition_state_dft,
 };
 pub use periodic_job::{PeriodicFunctional, PeriodicJob, PeriodicJobResult, run_periodic};
 pub use surface::HfSurface;

@@ -5,6 +5,7 @@ use hartree::core::units::{ANGSTROM_TO_BOHR, AU_DIPOLE_TO_DEBYE};
 use hartree::dft::FunctionalSpec;
 use hartree::disp::Dispersion;
 use hartree::opt::OptResult;
+use hartree::opt::ts::{TsResult, TsStatus};
 use hartree::props::frequencies::FrequencyResult;
 use hartree::props::population::PopulationAnalysis;
 use hartree::props::thermo::ThermoResult;
@@ -12,6 +13,7 @@ use hartree::scf::{Reference, ScfResult, Smearing};
 use hartree::{DftDiagnostics, Job, JobOptions, Method, PostHfResult};
 
 mod periodic;
+mod ts_flags;
 
 fn main() -> ExitCode {
     match run() {
@@ -42,6 +44,9 @@ fn run() -> Result<bool, String> {
     let mut charge: i32 = 0;
     let mut multiplicity: u32 = 1;
     let mut do_opt = false;
+    let mut do_ts = false;
+    let mut ts_options = hartree::opt::ts::TsOptions::default();
+    let mut ts_flag_seen = false;
     let mut all_electron = false;
     let mut direct = false;
     let mut ri = false;
@@ -97,6 +102,7 @@ fn run() -> Result<bool, String> {
                     .map_err(|_| "--spin must be a positive integer (2S+1)".to_string())?
             }
             "--opt" => do_opt = true,
+            "--ts" => do_ts = true,
             "--all-electron" => all_electron = true,
             "--direct" => direct = true,
             "--ri" => ri = true,
@@ -190,10 +196,24 @@ fn run() -> Result<bool, String> {
                         .map_err(|_| "--eps must be a number (dielectric constant)".to_string())?,
                 )
             }
+            "--ts-irc" => {
+                ts_options.confirm_irc = true;
+                ts_flag_seen = true;
+            }
+            f if ts_flags::TS_VALUE_FLAGS.contains(&f) => {
+                let flag = args[i].clone();
+                let value = take(&args, &mut i, &flag)?;
+                ts_flags::apply_ts_option(&mut ts_options, &flag, &value)?;
+                ts_flag_seen = true;
+            }
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             path => xyz_path = Some(path.to_string()),
         }
         i += 1;
+    }
+
+    if ts_flag_seen && !do_ts {
+        eprintln!("warning: --ts-* flags are ignored without --ts");
     }
 
     if let Some(task) = &recommend_task {
@@ -653,6 +673,7 @@ fn run() -> Result<bool, String> {
             compute_frequencies: do_freq,
             single_point_hessian: do_sph,
             optimize_geometry: do_opt,
+            transition_state: do_ts,
             symmetry_number,
             qrrho_w0_cm1: qrrho_w0,
             grid_level,
@@ -670,6 +691,7 @@ fn run() -> Result<bool, String> {
             ri_mp2,
             cosx,
             x2c,
+            ts_options,
         },
     };
 
@@ -752,6 +774,14 @@ fn run() -> Result<bool, String> {
             print_method_warnings(&result.method_warnings);
         }
         return Ok(opt.converged);
+    }
+
+    if let Some(ts) = &result.transition_state {
+        report_transition_state(&molecule, &basis, &method_str, &ecp_atoms, ts);
+        if !no_method_warnings {
+            print_method_warnings(&result.method_warnings);
+        }
+        return Ok(ts.converged());
     }
 
     report(
@@ -1397,6 +1427,108 @@ fn report_optimization(
     }
     println!();
     println!("total energy        {:>20.12} Eh", result.energy);
+}
+
+fn report_transition_state(
+    molecule: &Molecule,
+    basis: &str,
+    method: &str,
+    ecp_atoms: &[(String, u32, u32)],
+    result: &TsResult,
+) {
+    println!(
+        "hartree -- {} / {}   [transition-state search]",
+        method.to_ascii_uppercase(),
+        basis
+    );
+    println!(
+        "atoms: {}   charge: {}   multiplicity: {}",
+        molecule.len(),
+        molecule.charge,
+        molecule.multiplicity,
+    );
+    print_ecp_line(ecp_atoms);
+    println!();
+
+    println!(
+        "{:>5}  {:>22}  {:>11}  {:>11}  {:>11}",
+        "step", "energy / Eh", "max force", "rms force", "max disp"
+    );
+    for step in &result.history {
+        println!(
+            "{:>5}  {:>22.12}  {:>11.2e}  {:>11.2e}  {:>11.2e}",
+            step.iteration, step.energy, step.max_force, step.rms_force, step.max_disp
+        );
+    }
+    println!();
+
+    match result.status {
+        TsStatus::Converged => {
+            println!("transition state converged in {} steps", result.iterations)
+        }
+        TsStatus::NotConverged => println!(
+            "transition-state search NOT CONVERGED after {} steps",
+            result.iterations
+        ),
+        TsStatus::WrongImaginaryModeCount => println!(
+            "geometry converged in {} steps, but it is NOT a first-order saddle \
+             (wrong number of imaginary modes)",
+            result.iterations
+        ),
+        TsStatus::StoppedEarly => {
+            println!("transition-state search stopped early by an observer")
+        }
+        _ => println!("transition-state search finished with an unrecognized status"),
+    }
+
+    if let Some(v) = &result.verification {
+        let n_neg = v.negative_eigenvalues.len();
+        println!(
+            "saddle check: {} imaginary mode{}",
+            n_neg,
+            if n_neg == 1 { "" } else { "s" }
+        );
+        if let Some(freq) = v.imaginary_frequency_cm1 {
+            println!("  imaginary frequency {:>13.2} cm^-1", freq);
+        }
+    }
+    println!();
+
+    println!("transition-state geometry (angstrom):");
+    for (atom, pos) in molecule.atoms.iter().zip(&result.positions) {
+        println!(
+            "{:<2}  {:>14.8}  {:>14.8}  {:>14.8}",
+            atom.element.symbol(),
+            pos[0] / ANGSTROM_TO_BOHR,
+            pos[1] / ANGSTROM_TO_BOHR,
+            pos[2] / ANGSTROM_TO_BOHR,
+        );
+    }
+    println!();
+    println!("total energy        {:>20.12} Eh", result.energy);
+
+    if let Some(irc) = &result.irc {
+        println!();
+        println!("IRC endpoint confirmation (short downhill trace along the reaction mode):");
+        let df = irc.forward_energy - result.energy;
+        let dr = irc.reverse_energy - result.energy;
+        println!(
+            "  forward endpoint energy  {:>20.12} Eh   ΔE = {:>9.2e} Eh",
+            irc.forward_energy, df
+        );
+        println!(
+            "  reverse endpoint energy  {:>20.12} Eh   ΔE = {:>9.2e} Eh",
+            irc.reverse_energy, dr
+        );
+        if df <= 0.0 && dr <= 0.0 {
+            println!("  both endpoints relaxed below the saddle (ΔE <= 0).");
+        } else {
+            println!(
+                "  note: an endpoint did not relax below the saddle (ΔE > 0); \
+                 inspect the geometry."
+            );
+        }
+    }
 }
 
 fn report_properties(molecule: &Molecule, mu_au: [f64; 3], pop: &PopulationAnalysis) {
@@ -2060,6 +2192,30 @@ fn print_usage() {
          \x20                           noble-gas frozen core)\n\
          \x20   --opt                   optimize the geometry (analytic gradient for rhf/uhf,\n\
          \x20                           finite differences for rohf and DFT functionals)\n\
+         \x20   --ts                    locate a transition state (first-order saddle) by P-RFO\n\
+         \x20                           eigenvector-following from the input geometry, which must\n\
+         \x20                           be a guess near the saddle; verifies one imaginary mode\n\
+         \x20                           and reports its frequency (rhf/uhf/rohf/DFT; mutually\n\
+         \x20                           exclusive with --opt; no post-HF/RI/direct/COSX/X2C/\n\
+         \x20                           smearing/implicit-solvent)\n\
+         \x20   --ts-irc                after a converged TS, trace the IRC a short way downhill\n\
+         \x20                           in both senses of the reaction mode and report the two\n\
+         \x20                           endpoint energies (confirms the basins the saddle joins)\n\
+         \x20   --ts-algo <prfo|dimer>  saddle-point algorithm [default: prfo]; both prfo\n\
+         \x20                           (Hessian eigenvector-following) and dimer (Hessian-free,\n\
+         \x20                           midpoint-gradient curvature estimate) are available\n\
+         \x20   --ts-max-iter <int>     max saddle-search iterations [default: 300] (>= 1)\n\
+         \x20   --ts-trust <bohr>       initial trust radius for the climbing step [default: 0.2]\n\
+         \x20   --ts-follow <int>       P-RFO mode to follow uphill, 0 = softest [default: 0]\n\
+         \x20   --ts-recalc-hessian <int>  recompute the FD Hessian every N accepted steps;\n\
+         \x20                           0 = compute once, then Bofill update [default: 0]\n\
+         \x20   --ts-fd-step <bohr>     finite-difference step for gradients/Hessian [default:\n\
+         \x20                           5e-3]\n\
+         \x20   --ts-neg-tol <a.u.>     eigenvalue cutoff for a negative (reaction) mode\n\
+         \x20                           [default: 1e-4]\n\
+         \x20                           (TS runs raise the SCF cap to 400 and add a 0.3 level\n\
+         \x20                           shift for small-gap stability)\n\
+         \x20                           (the --ts-* knobs take effect only with --ts)\n\
          \x20   --direct                integral-direct SCF: recompute ERIs each iteration\n\
          \x20                           instead of storing the nao^4 tensor (rhf/uhf/rohf\n\
          \x20                           single points; reaches larger systems, slower)\n\

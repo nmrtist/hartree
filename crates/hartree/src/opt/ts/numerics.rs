@@ -1,0 +1,357 @@
+//! Mass-weighting, the translation/rotation-projected Hessian spectrum, the
+//! finite-difference Hessian, and saddle verification, shared by
+//! [`verify_saddle`](super::verify_saddle) and the [`super::prfo`] driver.
+
+use super::SaddleVerification;
+use crate::core::Molecule;
+use crate::core::units::FREQ_CONV_CM1;
+use crate::linalg::{mat_from_row_major, mat_to_row_major, matmul, symmetric_eigh};
+use crate::opt::{OptError, Surface};
+
+pub(super) struct MwSpectrum {
+    /// Ascending eigenvalues (atomic units).
+    pub(super) eigenvalues: Vec<f64>,
+    /// Row-major `ndof x ndof`; column `k` is mode `k`.
+    pub(super) eigenvectors: Vec<f64>,
+}
+
+/// Eigenvalue magnitude below which a mode is the projected-out translation /
+/// rotation residue (driven to rounding by the exact projection) rather than a
+/// physical mode.
+const NULL_EPS: f64 = 1e-6;
+
+pub(super) fn flatten(g: &[[f64; 3]]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(g.len() * 3);
+    for v in g {
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+pub(super) fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+pub(super) fn norm(a: &[f64]) -> f64 {
+    dot(a, a).sqrt()
+}
+
+pub(super) fn force_norms(gx: &[[f64; 3]]) -> (f64, f64) {
+    let mut max = 0.0_f64;
+    let mut sum_sq = 0.0;
+    let mut count = 0;
+    for v in gx {
+        for &c in v {
+            max = max.max(c.abs());
+            sum_sq += c * c;
+            count += 1;
+        }
+    }
+    (max, (sum_sq / count as f64).sqrt())
+}
+
+pub(super) fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
+    let mut max = 0.0_f64;
+    let mut sum_sq = 0.0;
+    let mut count = 0;
+    for (a, b) in x.iter().zip(x_prev) {
+        for k in 0..3 {
+            let d = a[k] - b[k];
+            max = max.max(d.abs());
+            sum_sq += d * d;
+            count += 1;
+        }
+    }
+    (max, (sum_sq / count as f64).sqrt())
+}
+
+pub(super) fn masses_of(molecule: &Molecule) -> Vec<f64> {
+    molecule.atoms.iter().map(|a| a.element.mass()).collect()
+}
+
+pub(super) fn positions_of(molecule: &Molecule) -> Vec<[f64; 3]> {
+    molecule.atoms.iter().map(|a| a.position).collect()
+}
+
+pub(super) fn with_positions(molecule: &Molecule, x: &[[f64; 3]]) -> Molecule {
+    let mut atoms = molecule.atoms.clone();
+    for (atom, p) in atoms.iter_mut().zip(x) {
+        atom.position = *p;
+    }
+    Molecule::new(atoms, molecule.charge, molecule.multiplicity)
+}
+
+pub(super) fn gradient<S: Surface>(
+    surface: &mut S,
+    x: &[[f64; 3]],
+    fd_step: f64,
+) -> Result<Vec<[f64; 3]>, OptError> {
+    match surface.analytic_gradient(x) {
+        Some(result) => result,
+        None => crate::opt::fd::central_difference(surface, x, fd_step),
+    }
+}
+
+/// Cartesian Hessian by central finite difference of the gradient. Uses the
+/// surface's own (e.g. parallel) Hessian when it offers one, else `2*ndof`
+/// serial gradient evaluations.
+pub(super) fn fd_hessian<S: Surface>(
+    surface: &mut S,
+    x: &[[f64; 3]],
+    fd_step: f64,
+) -> Result<Vec<f64>, OptError> {
+    if let Some(result) = surface.fd_hessian(x, fd_step) {
+        return result;
+    }
+
+    let natom = x.len();
+    let ndof = 3 * natom;
+    let mut h = vec![0.0f64; ndof * ndof];
+    for dof in 0..ndof {
+        let (atom, axis) = (dof / 3, dof % 3);
+        let mut xp = x.to_vec();
+        xp[atom][axis] += fd_step;
+        let mut xm = x.to_vec();
+        xm[atom][axis] -= fd_step;
+        let gp = flatten(&gradient(surface, &xp, fd_step)?);
+        let gm = flatten(&gradient(surface, &xm, fd_step)?);
+        for j in 0..ndof {
+            h[dof * ndof + j] = (gp[j] - gm[j]) / (2.0 * fd_step);
+        }
+    }
+    for i in 0..ndof {
+        for j in (i + 1)..ndof {
+            let avg = 0.5 * (h[i * ndof + j] + h[j * ndof + i]);
+            h[i * ndof + j] = avg;
+            h[j * ndof + i] = avg;
+        }
+    }
+    Ok(h)
+}
+
+pub(super) fn mass_weight_grad(g: &[[f64; 3]], masses: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0f64; 3 * g.len()];
+    for (a, gi) in g.iter().enumerate() {
+        let s = masses[a].sqrt();
+        for c in 0..3 {
+            out[3 * a + c] = gi[c] / s;
+        }
+    }
+    out
+}
+
+pub(super) fn unmass_weight_step(dxi: &[f64], masses: &[f64]) -> Vec<[f64; 3]> {
+    (0..masses.len())
+        .map(|a| {
+            let s = masses[a].sqrt();
+            [dxi[3 * a] / s, dxi[3 * a + 1] / s, dxi[3 * a + 2] / s]
+        })
+        .collect()
+}
+
+pub(super) fn add_step(x: &[[f64; 3]], dx: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    x.iter()
+        .zip(dx)
+        .map(|(a, d)| [a[0] + d[0], a[1] + d[1], a[2] + d[2]])
+        .collect()
+}
+
+pub(super) fn predicted_change_cart(g: &[[f64; 3]], hess: &[f64], dx: &[[f64; 3]]) -> f64 {
+    let gf = flatten(g);
+    let df = flatten(dx);
+    let n = df.len();
+    let mut p = dot(&gf, &df);
+    for i in 0..n {
+        let mut hd = 0.0;
+        for j in 0..n {
+            hd += hess[i * n + j] * df[j];
+        }
+        p += 0.5 * df[i] * hd;
+    }
+    p
+}
+
+pub(super) fn matvec(h: &[f64], s: &[f64], n: usize) -> Vec<f64> {
+    (0..n)
+        .map(|i| (0..n).map(|j| h[i * n + j] * s[j]).sum())
+        .collect()
+}
+
+pub(super) fn mw_projected_hessian(
+    x: &[[f64; 3]],
+    masses: &[f64],
+    hess_cart: &[f64],
+) -> MwSpectrum {
+    let natom = x.len();
+    let ndof = 3 * natom;
+
+    let mut mw = hess_cart.to_vec();
+    for i in 0..natom {
+        for ki in 0..3 {
+            let row = 3 * i + ki;
+            for j in 0..natom {
+                for kj in 0..3 {
+                    let col = 3 * j + kj;
+                    mw[row * ndof + col] /= (masses[i] * masses[j]).sqrt();
+                }
+            }
+        }
+    }
+
+    let orth = gram_schmidt(&trans_rot_vectors(x, masses));
+    let mut proj = vec![0.0f64; ndof * ndof];
+    for i in 0..ndof {
+        proj[i * ndof + i] = 1.0;
+    }
+    for v in &orth {
+        for i in 0..ndof {
+            for j in 0..ndof {
+                proj[i * ndof + j] -= v[i] * v[j];
+            }
+        }
+    }
+
+    let p = mat_from_row_major(ndof, &proj);
+    let f = mat_from_row_major(ndof, &mw);
+    let fp = matmul(&matmul(&p, &f), &p);
+    let eigh = symmetric_eigh(&fp);
+    MwSpectrum {
+        eigenvalues: eigh.values,
+        eigenvectors: mat_to_row_major(&eigh.vectors),
+    }
+}
+
+/// The mass-weighted translation (3) and rotation (3, or 2 if linear) vectors,
+/// matching `crate::props::frequencies`.
+pub(super) fn trans_rot_vectors(x: &[[f64; 3]], masses: &[f64]) -> Vec<Vec<f64>> {
+    let natom = x.len();
+    let ndof = 3 * natom;
+    let total: f64 = masses.iter().sum();
+    let mut com = [0.0f64; 3];
+    for (i, xi) in x.iter().enumerate() {
+        for k in 0..3 {
+            com[k] += masses[i] * xi[k];
+        }
+    }
+    for c in &mut com {
+        *c /= total;
+    }
+
+    let mut vecs: Vec<Vec<f64>> = Vec::with_capacity(6);
+    for k in 0..3 {
+        let mut v = vec![0.0f64; ndof];
+        for i in 0..natom {
+            v[3 * i + k] = masses[i].sqrt();
+        }
+        vecs.push(v);
+    }
+    let r: Vec<[f64; 3]> = x
+        .iter()
+        .map(|xi| [xi[0] - com[0], xi[1] - com[1], xi[2] - com[2]])
+        .collect();
+    type RotDisp = fn(&[f64; 3]) -> [f64; 3];
+    let rot: [RotDisp; 3] = [
+        |r| [0.0, -r[2], r[1]],
+        |r| [r[2], 0.0, -r[0]],
+        |r| [-r[1], r[0], 0.0],
+    ];
+    for disp in &rot {
+        let mut v = vec![0.0f64; ndof];
+        for i in 0..natom {
+            let d = disp(&r[i]);
+            for k in 0..3 {
+                v[3 * i + k] = masses[i].sqrt() * d[k];
+            }
+        }
+        vecs.push(v);
+    }
+    vecs
+}
+
+/// Orthonormalize, dropping vectors that collapse to ~0 (a linear molecule's
+/// redundant rotation).
+pub(super) fn gram_schmidt(vecs: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let mut orth: Vec<Vec<f64>> = Vec::new();
+    for v in vecs {
+        let mut u = v.clone();
+        for prev in &orth {
+            let proj: f64 = u.iter().zip(prev).map(|(a, b)| a * b).sum();
+            for (ui, &pi) in u.iter_mut().zip(prev.iter()) {
+                *ui -= proj * pi;
+            }
+        }
+        let n: f64 = u.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if n > 1e-10 {
+            for x in &mut u {
+                *x /= n;
+            }
+            orth.push(u);
+        }
+    }
+    orth
+}
+
+pub(super) fn non_null_modes(spec: &MwSpectrum) -> Vec<usize> {
+    (0..spec.eigenvalues.len())
+        .filter(|&k| spec.eigenvalues[k].abs() > NULL_EPS)
+        .collect()
+}
+
+pub(super) fn column(eigenvectors: &[f64], ndof: usize, k: usize) -> Vec<f64> {
+    (0..ndof).map(|i| eigenvectors[i * ndof + k]).collect()
+}
+
+pub(super) fn overlap(spec: &MwSpectrum, ndof: usize, k: usize, reference: &[f64]) -> f64 {
+    (0..ndof)
+        .map(|i| spec.eigenvectors[i * ndof + k] * reference[i])
+        .sum::<f64>()
+        .abs()
+}
+
+pub(super) fn saddle_from_hessian(
+    molecule: &Molecule,
+    hessian: &[f64],
+    tol: f64,
+) -> SaddleVerification {
+    let natom = molecule.len();
+    let ndof = 3 * natom;
+    let masses = masses_of(molecule);
+    let spec = mw_projected_hessian(&positions_of(molecule), &masses, hessian);
+
+    let negative_eigenvalues: Vec<f64> = spec
+        .eigenvalues
+        .iter()
+        .copied()
+        .filter(|&l| l < -tol)
+        .collect();
+
+    let (reaction_mode, imaginary_frequency_cm1) =
+        if spec.eigenvalues.first().is_some_and(|&l| l < -tol) {
+            let lambda = spec.eigenvalues[0];
+            // Un-mass-weight the lowest mode to a Cartesian displacement, then normalize.
+            let q = column(&spec.eigenvectors, ndof, 0);
+            let mut mode: Vec<[f64; 3]> = (0..natom)
+                .map(|a| {
+                    let s = masses[a].sqrt();
+                    [q[3 * a] / s, q[3 * a + 1] / s, q[3 * a + 2] / s]
+                })
+                .collect();
+            let nrm = norm(&flatten(&mode));
+            if nrm > 0.0 {
+                for m in &mut mode {
+                    for c in m.iter_mut() {
+                        *c /= nrm;
+                    }
+                }
+            }
+            (Some(mode), Some(-(-lambda).sqrt() * FREQ_CONV_CM1))
+        } else {
+            (None, None)
+        };
+
+    SaddleVerification {
+        negative_eigenvalues,
+        reaction_mode,
+        imaginary_frequency_cm1,
+    }
+}
