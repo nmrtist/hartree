@@ -243,9 +243,10 @@ fn recommend_outputs_match_snapshots() {
 
     let (ok, _, stderr) = run(&["--recommend", "everything"]);
     assert!(!ok);
-    assert!(
-        stderr.contains("unknown --recommend task")
-            && stderr.contains("general, barriers, nci, thermochemistry"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("unknown --recommend task"), "{stderr}");
+    // Assert each available task is listed rather than a brittle contiguous
+    // substring, so adding a recommendation task doesn't break this test.
+    for task in hartree::guardrails::recommendation_tasks() {
+        assert!(stderr.contains(task), "missing `{task}` in: {stderr}");
+    }
 }
