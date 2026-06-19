@@ -231,6 +231,7 @@ fn ts_result(status: TsStatus) -> TsResult {
         history: Vec::new(),
         verification: None,
         irc: None,
+        diagnostic: None,
     }
 }
 

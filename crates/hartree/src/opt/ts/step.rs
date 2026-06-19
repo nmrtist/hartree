@@ -241,10 +241,12 @@ fn restrict_alpha(modes: &PartitionedModes, trust: f64) -> f64 {
 
 /// First step: the non-null mode of maximum overlap with the reaction-coordinate
 /// `seed` if one is supplied (anchoring the climb to the forming/breaking-bond
-/// direction, immune to an avoided-crossing reordering of the soft modes), else
-/// the `follow_mode`-th non-null mode by ascending eigenvalue. Later steps (once
-/// `previous` is set): the non-null mode of maximum overlap with the previous one.
-/// `seed` and `previous` are both in the mass-weighted frame of `spec`.
+/// direction, immune to an avoided-crossing reordering of the soft modes). With no
+/// seed and the default `follow_mode == 0`, the most-negative-curvature mode (the
+/// reaction coordinate, when one is present); an explicit nonzero `follow_mode`
+/// instead selects that mode by ascending eigenvalue. Later steps (once `previous`
+/// is set): the non-null mode of maximum overlap with the previous one. `seed` and
+/// `previous` are both in the mass-weighted frame of `spec`.
 pub(super) fn select_followed(
     spec: &MwSpectrum,
     non_null: &[usize],
@@ -269,8 +271,20 @@ pub(super) fn select_followed(
         (Some(reference), _) => max_overlap_with(reference),
         // First step with a seed: anchor to the reaction coordinate.
         (None, Some(seed)) => max_overlap_with(seed),
-        // First step, no seed: the requested softest mode.
-        (None, None) => non_null[follow_mode.min(non_null.len() - 1)],
+        // First step, no seed: honour an explicit by-softness request; otherwise
+        // climb the most-negative-curvature mode (the reaction coordinate) rather
+        // than the softest, which may be a spectator.
+        (None, None) => {
+            if follow_mode != 0 {
+                non_null[follow_mode.min(non_null.len() - 1)]
+            } else {
+                non_null
+                    .iter()
+                    .copied()
+                    .find(|&k| spec.eigenvalues[k] < 0.0)
+                    .unwrap_or(non_null[0])
+            }
+        }
     }
 }
 

@@ -12,7 +12,9 @@ use super::*;
 use crate::core::{Atom, Element, Molecule};
 use crate::ext::kabsch::kabsch_rmsd;
 use crate::opt::OptStep;
-use crate::opt::ts::{Flow, Progress, TsAlgorithm, TsOptions, TsStatus, find_transition_state};
+use crate::opt::ts::{
+    Flow, Progress, TsAlgorithm, TsError, TsOptions, TsStatus, find_transition_state,
+};
 use std::cell::Cell;
 
 /// The reaction mode the dimer converged to (from verification) must align with
@@ -156,6 +158,117 @@ fn dimer_converges_heteronuclear() {
     let v = result.verification.unwrap();
     assert_eq!(v.negative_eigenvalues.len(), 1);
     assert!(v.negative_eigenvalues[0] < 0.0);
+}
+
+/// Seeding the dimer axis with the reaction-coordinate direction (the handoff a
+/// two-endpoint/NEB guess provides) climbs to the saddle: the first axis starts
+/// aligned with the reaction mode `w0` rather than the gradient, and the search
+/// converges to the single-imaginary saddle. The seed is consumed up front (it is
+/// not silently ignored).
+#[test]
+fn dimer_consumes_reaction_mode_seed() {
+    let x0 = h3_positions();
+    let basis = internal_basis(&x0);
+    let h = hessian_from(&basis, &[-0.4, 0.6, 0.9]);
+    let mut start = x0.clone();
+    for a in 0..3 {
+        for c in 0..3 {
+            let i = 3 * a + c;
+            start[a][c] += 0.06 * basis[0][i] + 0.04 * basis[1][i];
+        }
+    }
+    let mol = h3_molecule(&start);
+
+    // The reaction coordinate w0 as a Cartesian per-atom seed.
+    let seed: Vec<[f64; 3]> = (0..mol.len())
+        .map(|a| [basis[0][3 * a], basis[0][3 * a + 1], basis[0][3 * a + 2]])
+        .collect();
+    let mut opts = TsOptions::default();
+    opts.algorithm = TsAlgorithm::Dimer;
+    opts.reaction_mode_seed = Some(seed);
+
+    let mut surf = Quadratic { x0: x0.clone(), h };
+    let result = find_transition_state(&mol, &mut surf, &opts, None).unwrap();
+    assert_eq!(
+        result.status,
+        TsStatus::Converged,
+        "seeded dimer status {:?} after {} iters",
+        result.status,
+        result.iterations
+    );
+    let rmsd = kabsch_rmsd(&result.positions, &x0).unwrap();
+    assert!(rmsd < 5e-3, "RMSD to saddle = {rmsd:e}");
+    let v = result.verification.unwrap();
+    assert_eq!(v.negative_eigenvalues.len(), 1);
+    let overlap = mode_overlap(v.reaction_mode.as_ref().unwrap(), &basis[0]);
+    assert!(overlap > 0.99, "reaction mode overlap with w0 = {overlap}");
+}
+
+/// A reaction-coordinate seed whose length does not match the molecule cannot be a
+/// reaction coordinate; the dimer rejects it up front as a bad initial guess
+/// (before any surface evaluation), exactly as P-RFO does.
+#[test]
+fn dimer_wrong_length_seed_is_bad_initial_guess() {
+    let x0 = h3_positions();
+    let basis = internal_basis(&x0);
+    let h = hessian_from(&basis, &[-0.4, 0.6, 0.9]);
+    let mut surf = Quadratic { x0: x0.clone(), h };
+    let mut opts = TsOptions::default();
+    opts.algorithm = TsAlgorithm::Dimer;
+    // One atom direction, but the molecule has three atoms.
+    opts.reaction_mode_seed = Some(vec![[1.0, 0.0, 0.0]]);
+    let err = find_transition_state(&h3_molecule(&x0), &mut surf, &opts, None).unwrap_err();
+    assert!(matches!(err, TsError::BadInitialGuess(_)), "got {err:?}");
+}
+
+/// A surface whose gradient is non-finite at the dimer's starting midpoint, but
+/// finite at the displaced finite-difference probe points (so the verification
+/// Hessian would build cleanly). The driver must reject the poisoned midpoint
+/// gradient with a clear [`TsError::Numerical`] rather than churning through
+/// `max_iter` and reporting a silent non-convergence.
+struct NanGradAtPoint {
+    inner: Quadratic,
+    start: Vec<[f64; 3]>,
+    eps: f64,
+}
+impl Surface for NanGradAtPoint {
+    fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
+        self.inner.energy(x)
+    }
+    fn analytic_gradient(&mut self, x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
+        let d: f64 = x
+            .iter()
+            .zip(&self.start)
+            .flat_map(|(a, b)| (0..3).map(move |k| (a[k] - b[k]).powi(2)))
+            .sum::<f64>()
+            .sqrt();
+        if d < self.eps {
+            Some(Ok(vec![[f64::NAN; 3]; x.len()]))
+        } else {
+            self.inner.analytic_gradient(x)
+        }
+    }
+}
+
+#[test]
+fn dimer_nonfinite_gradient_is_numerical_not_silent() {
+    let x0 = h3_positions();
+    let basis = internal_basis(&x0);
+    let h = hessian_from(&basis, &[-0.4, 0.6, 0.9]);
+    let mut surf = NanGradAtPoint {
+        inner: Quadratic { x0: x0.clone(), h },
+        start: x0.clone(),
+        // Smaller than the 5e-3 finite-difference step, so only the central
+        // midpoint (where the driver reads the followed gradient) is poisoned.
+        eps: 1e-3,
+    };
+    let mut opts = TsOptions::default();
+    opts.algorithm = TsAlgorithm::Dimer;
+    let err = find_transition_state(&h3_molecule(&x0), &mut surf, &opts, None).unwrap_err();
+    assert!(
+        matches!(err, TsError::Numerical(_)),
+        "expected TsError::Numerical, got {err:?}"
+    );
 }
 
 struct StopAfter {

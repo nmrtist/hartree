@@ -347,7 +347,16 @@ fn eulerpc_step(
 /// descent direction, then find the point on the hypersphere of radius `step/2`
 /// about it whose true gradient is parallel to the radius (a point on the reaction
 /// path). Returns the mass-weighted step.
-fn gs2_step<S: Surface>(
+///
+/// The hypersphere meets the path at two points: the *descent* root, where the path
+/// gradient points back toward the pivot (the outward radial component `gn < 0`), and
+/// an *uphill* root essentially back at `x` (`gn > 0`). Only the descent root is a
+/// valid forward step. The constrained point is returned only when the micro-iteration
+/// converges to it; if the iteration instead exhausts its budget without converging (a
+/// silent stall) or settles on the uphill root, the step degrades to the plain
+/// steepest-descent (Euler) step — always a descent direction — rather than emitting
+/// the last half-rotated, off-path point.
+pub(super) fn gs2_step<S: Surface>(
     surface: &mut S,
     x: &[[f64; 3]],
     g_mw: &[f64],
@@ -358,7 +367,13 @@ fn gs2_step<S: Surface>(
     let r = 0.5 * step;
     let ghat = unit(g_mw);
     let pivot = scale(&ghat, -r); // mass-weighted offset from x to the pivot
-    let mut s = scale(&ghat, -step); // initial guess: a full Euler step
+    // The steepest-descent (Euler) step: both the initial guess and the
+    // guaranteed-descent fallback used when the constrained search fails to reach a
+    // valid on-path point.
+    let sd = scale(&ghat, -step);
+    let mut s = sd.clone();
+    // Set true only once the micro-iteration reaches the descent root (`gn < 0`).
+    let mut on_path = false;
     for _ in 0..GS2_INNER {
         let xp = add_step(x, &unmass_weight_step(&s, masses));
         let gp = mw_grad_projected(&gradient(surface, &xp, options.fd_step)?, masses, &xp);
@@ -367,6 +382,9 @@ fn gs2_step<S: Surface>(
         let gn = dot(&gp, &n);
         let gperp: Vec<f64> = gp.iter().zip(&n).map(|(g, ni)| g - gn * ni).collect();
         if norm(&gperp) < GS2_TOL {
+            // Accept the constrained point only at the descent root; the uphill root
+            // (gn > 0, ~back at x) would stall the trace, so reject it like a non-step.
+            on_path = gn < 0.0;
             break;
         }
         // Rotate the point around the pivot toward −g_perp, staying on the sphere.
@@ -378,7 +396,9 @@ fn gs2_step<S: Surface>(
         let nd = unit(&dirv);
         s = pivot.iter().zip(&nd).map(|(p, d)| p + r * d).collect();
     }
-    Ok(s)
+    // The constrained point only when the micro-iteration actually reached the path;
+    // otherwise the steepest-descent step, never a half-rotated, off-path point.
+    Ok(if on_path { s } else { sd })
 }
 
 /// The normalized mass-weighted transition direction from the normalized Cartesian

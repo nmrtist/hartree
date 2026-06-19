@@ -55,11 +55,6 @@ impl HfSurface {
                 "RHF requires a closed shell; use Reference::Uhf or Reference::Rohf".into(),
             );
         }
-        let scf_options = ScfOptions {
-            energy_tol: 1e-11,
-            error_tol: 1e-9,
-            ..ScfOptions::default()
-        };
         Ok(Self {
             elements: molecule.atoms.iter().map(|a| a.element).collect(),
             charge: molecule.charge,
@@ -68,7 +63,11 @@ impl HfSurface {
             reference,
             n_alpha,
             n_beta,
-            scf_options,
+            scf_options: ScfOptions {
+                energy_tol: 1e-11,
+                error_tol: 1e-9,
+                ..ScfOptions::default()
+            },
             functional: None,
             dispersion: None,
             solvent_eps: None,
@@ -87,11 +86,7 @@ impl HfSurface {
         grid_level: usize,
     ) -> Result<Self, String> {
         let mut surface = Self::new(molecule, basis, reference)?;
-        surface.scf_options = ScfOptions {
-            energy_tol: 1e-9,
-            error_tol: 1e-6,
-            ..ScfOptions::default()
-        };
+        surface.set_scf_convergence(1e-9, 1e-6);
         surface.functional = Some((functional, grid_level));
         Ok(surface)
     }
@@ -125,6 +120,12 @@ impl HfSurface {
     /// geometries; does not change the converged density.
     pub fn set_scf_level_shift(&mut self, shift: f64) {
         self.scf_options.level_shift = shift;
+    }
+
+    /// SCF convergence thresholds (energy change, DIIS error norm); a small-gap TS
+    /// may need a looser pair to converge off the error floor.
+    pub fn set_scf_convergence(&mut self, energy_tol: f64, error_tol: f64) {
+        (self.scf_options.energy_tol, self.scf_options.error_tol) = (energy_tol, error_tol);
     }
 
     pub fn last_scf(&self) -> Option<&ScfResult> {

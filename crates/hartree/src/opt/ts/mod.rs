@@ -51,6 +51,7 @@ pub mod guess;
 
 mod climb;
 mod dimer;
+mod dimer_rotate;
 mod irc;
 mod neb;
 mod numerics;
@@ -145,6 +146,16 @@ pub struct TsResult {
     /// `None` unless [`TsOptions::confirm_irc`] was set and the trace ran. See
     /// [`IrcEndpoints`].
     pub irc: Option<IrcEndpoints>,
+    /// A short, human-readable note on *why* the search stopped without a verified
+    /// saddle — e.g. that it exhausted `max_iter`, that the climbing step shrank to
+    /// the trust floor, or that the Hessian spectrum was near-degenerate at the
+    /// stopping point. `None` for a [`Converged`](TsStatus::Converged) run and
+    /// whenever no distinguishing cause is available; the field is purely
+    /// diagnostic and never affects [`status`](TsResult::status) or
+    /// [`converged`](TsResult::converged). `#[serde(default)]` so records written
+    /// before this field existed still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
 }
 
 impl TsResult {

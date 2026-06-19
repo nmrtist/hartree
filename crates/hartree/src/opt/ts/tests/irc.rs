@@ -259,6 +259,109 @@ fn soft_mode_irc_descends_into_the_basin_not_the_seed() {
     );
 }
 
+fn flat(x: &[[f64; 3]]) -> Vec<f64> {
+    x.iter().flat_map(|a| a.iter().copied()).collect()
+}
+fn dotp(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+fn unitv(v: &[f64]) -> Vec<f64> {
+    let n = dotp(v, v).sqrt();
+    if n > 0.0 {
+        v.iter().map(|x| x / n).collect()
+    } else {
+        v.to_vec()
+    }
+}
+
+/// A surface whose (unit-mass, trans/rot-clean) gradient is everywhere tangent to the
+/// Gonzalez–Schlegel hypersphere — perpendicular to the radius from the pivot. The
+/// constrained micro-iteration can therefore never null its perpendicular component, so
+/// it runs its whole budget without converging: a deterministic *silent stall*. The
+/// gradient is the in-plane 90° rotation of the outward radius `n` (`ghat → t`,
+/// `t → −ghat`), which is `⟂ n` at every point on the sphere.
+///
+/// `gs2_step` re-projects trans/rot at the *displaced* probe geometry (not `x0`), which
+/// leaks a few percent of this gradient out of the `{ghat, t}` plane; that is harmless
+/// here because the tangential component stays `‖g⊥‖ ≈ 1`, orders of magnitude above
+/// `GS2_TOL`, so the stall premise holds with wide margin.
+struct TangentialStall {
+    x0: Vec<[f64; 3]>,
+    ghat: Vec<f64>, // mass-weighted reaction direction (unit, internal)
+    t: Vec<f64>,    // a transverse unit direction (internal, ⟂ ghat)
+    r: f64,         // hypersphere radius = step/2
+}
+impl Surface for TangentialStall {
+    fn energy(&mut self, _x: &[[f64; 3]]) -> Result<f64, OptError> {
+        Ok(0.0)
+    }
+    fn analytic_gradient(&mut self, x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
+        // s = displacement from the saddle (unit masses ⇒ mass-weighted == Cartesian).
+        let s: Vec<f64> = flat(x)
+            .iter()
+            .zip(flat(&self.x0))
+            .map(|(a, b)| a - b)
+            .collect();
+        // Outward radius of the sphere centred at the pivot (−r·ghat).
+        let from_pivot: Vec<f64> = s
+            .iter()
+            .zip(&self.ghat)
+            .map(|(si, gi)| si + self.r * gi)
+            .collect();
+        let n = unitv(&from_pivot);
+        let a = dotp(&n, &self.ghat);
+        let b = dotp(&n, &self.t);
+        let g: Vec<f64> = (0..self.ghat.len())
+            .map(|i| a * self.t[i] - b * self.ghat[i])
+            .collect();
+        Some(Ok((0..x.len())
+            .map(|k| [g[3 * k], g[3 * k + 1], g[3 * k + 2]])
+            .collect()))
+    }
+}
+
+/// A Gonzalez–Schlegel micro-iteration that cannot converge (its perpendicular gradient
+/// is unkillable) must not silently emit the last half-rotated, on-sphere point: it
+/// falls back to the steepest-descent step — exactly `−step·ĝ`, a descent direction of
+/// the requested length with no transverse leak.
+#[test]
+fn gs2_step_falls_back_to_steepest_descent_on_a_stall() {
+    use crate::opt::ts::irc::gs2_step;
+    let x0 = h3_positions();
+    let basis = internal_basis(&x0);
+    let ghat = basis[0].clone();
+    let t = basis[1].clone();
+    let masses = vec![1.0; x0.len()];
+    let step = 0.1;
+    let mut surf = TangentialStall {
+        x0: x0.clone(),
+        ghat: ghat.clone(),
+        t: t.clone(),
+        r: 0.5 * step,
+    };
+    let opts = TsOptions::default();
+    // g_mw = ghat (unit) ⇒ the search direction is ghat and the steepest-descent
+    // fallback is exactly −step·ghat.
+    let s = gs2_step(&mut surf, &x0, &ghat, &masses, step, &opts).unwrap();
+
+    // The returned step is the steepest-descent step: −step along ghat with no
+    // transverse (t) component — i.e. NOT a rotated on-sphere point (which carries a
+    // large t component).
+    assert!(
+        (dotp(&s, &ghat) + step).abs() < 1e-9,
+        "ghat component {} != -step {}",
+        dotp(&s, &ghat),
+        -step
+    );
+    assert!(
+        dotp(&s, &t).abs() < 1e-9,
+        "unexpected transverse component {}",
+        dotp(&s, &t)
+    );
+    // ...and it is a genuine descent step.
+    assert!(dotp(&s, &ghat) < 0.0, "step is not a descent direction");
+}
+
 /// A converged endpoint records the steps it took (a nonzero, bounded count) — the
 /// per-endpoint diagnostics the result now carries.
 #[test]

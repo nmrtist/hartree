@@ -44,6 +44,10 @@ pub(super) struct ClimbResult {
     /// geometry, which the verification may reuse instead of a fresh finite-difference
     /// build (see [`VerifyHessian`](super::VerifyHessian)).
     pub(super) hessian: Vec<f64>,
+    /// For a [`ClimbStop::NotConverged`] climb, a short note on the cause (max_iter
+    /// exhausted, the step shrank to the trust floor, or a degenerate spectrum). `None`
+    /// for the other outcomes.
+    pub(super) reason: Option<String>,
 }
 
 /// One accepted P-RFO step, threaded out of the backtracking loop in one piece:
@@ -110,6 +114,7 @@ pub(super) fn run_climb<S: Surface>(
 
     let mut converged_geom = false;
     let mut stopped_early = false;
+    let mut not_converged_reason: Option<String> = None;
 
     for local_iter in 1..=options.max_iter {
         *iter_counter += 1;
@@ -153,6 +158,10 @@ pub(super) fn run_climb<S: Surface>(
             break;
         }
         if local_iter == options.max_iter {
+            not_converged_reason = Some(format!(
+                "reached max_iter ({}) with max projected force {:.2e} a.u.",
+                options.max_iter, conv_force
+            ));
             break;
         }
 
@@ -170,6 +179,8 @@ pub(super) fn run_climb<S: Surface>(
         };
         let mut non_null = non_null_modes(&spec);
         if non_null.is_empty() {
+            not_converged_reason =
+                Some("near-degenerate Hessian spectrum at the stopping point".to_string());
             break;
         }
         let mut followed = select_followed(
@@ -189,6 +200,8 @@ pub(super) fn run_climb<S: Surface>(
                 spec = mw_projected_hessian(&x, masses, &hess).map_err(TsError::Numerical)?;
                 non_null = non_null_modes(&spec);
                 if non_null.is_empty() {
+                    not_converged_reason =
+                        Some("near-degenerate Hessian spectrum at the stopping point".to_string());
                     break;
                 }
                 followed = select_followed(
@@ -270,6 +283,10 @@ pub(super) fn run_climb<S: Surface>(
         let Some(step) = accepted else {
             // The SCF would not converge from this point even after backtracking;
             // stop with the best geometry so far rather than aborting the search.
+            not_converged_reason = Some(
+                "step reduced to the trust floor without a usable SCF (backtracking exhausted)"
+                    .to_string(),
+            );
             break;
         };
 
@@ -322,11 +339,17 @@ pub(super) fn run_climb<S: Surface>(
     } else {
         (ClimbStop::NotConverged, best_x, best_energy)
     };
+    // A reason is meaningful only for a non-converged climb; clear it otherwise.
+    let reason = match stop {
+        ClimbStop::NotConverged => not_converged_reason,
+        _ => None,
+    };
     Ok(ClimbResult {
         stop,
         x: out_x,
         energy: out_energy,
         hessian: hess,
+        reason,
     })
 }
 

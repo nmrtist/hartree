@@ -68,6 +68,7 @@ pub(super) fn run_prfo<S: Surface>(
                     climb.energy,
                     iter_counter,
                     history,
+                    None,
                 ));
             }
             ClimbStop::NotConverged => {
@@ -77,6 +78,7 @@ pub(super) fn run_prfo<S: Surface>(
                     climb.energy,
                     iter_counter,
                     history,
+                    climb.reason,
                 ));
             }
             ClimbStop::ConvergedGeom => (climb.x, climb.energy),
@@ -109,6 +111,7 @@ pub(super) fn run_prfo<S: Surface>(
                 history,
                 verification: Some(verification),
                 irc,
+                diagnostic: None,
             });
         }
 
@@ -125,6 +128,7 @@ pub(super) fn run_prfo<S: Surface>(
         // the surface cache at it (not the last verification displacement) so a
         // caller's `last_scf()` matches the returned geometry.
         let _ = surface.energy(&x)?;
+        let n_neg = verification.negative_eigenvalues.len();
         return Ok(TsResult {
             positions: x,
             energy,
@@ -133,6 +137,7 @@ pub(super) fn run_prfo<S: Surface>(
             history,
             verification: Some(verification),
             irc: None,
+            diagnostic: Some(wrong_mode_reason(n_neg)),
         });
     }
     unreachable!("the recovery loop returns on every branch");
@@ -140,13 +145,15 @@ pub(super) fn run_prfo<S: Surface>(
 
 /// A soft (non-verified) outcome carried on `Ok`: best-so-far geometry, no
 /// verification or IRC. Shared by the [`StoppedEarly`](TsStatus::StoppedEarly) and
-/// [`NotConverged`](TsStatus::NotConverged) exits.
+/// [`NotConverged`](TsStatus::NotConverged) exits. `diagnostic` carries the cause
+/// of a non-converged stop (from the climb), and is `None` for an early stop.
 fn soft_result(
     status: TsStatus,
     positions: Vec<[f64; 3]>,
     energy: f64,
     iterations: usize,
     history: Vec<OptStep>,
+    diagnostic: Option<String>,
 ) -> TsResult {
     TsResult {
         positions,
@@ -156,6 +163,18 @@ fn soft_result(
         history,
         verification: None,
         irc: None,
+        diagnostic,
+    }
+}
+
+/// A short note describing why a geometrically converged point is not a first-order
+/// saddle: zero negative modes means a minimum, two or more a higher-order saddle.
+pub(super) fn wrong_mode_reason(n_negative: usize) -> String {
+    match n_negative {
+        0 => "converged to a minimum (no imaginary modes), not a first-order saddle".to_string(),
+        n => format!(
+            "converged to a higher-order saddle ({n} imaginary modes), not a first-order saddle"
+        ),
     }
 }
 
@@ -163,7 +182,8 @@ fn soft_result(
 /// frame the Hessian spectrum lives in: a displacement mass-weights by √m (the
 /// inverse of a gradient) and is then normalized. An all-zero seed carries no
 /// direction (`None`); a seed of the wrong length cannot be a reaction coordinate.
-fn mass_weighted_seed(
+/// Shared with [`super::dimer`], which seeds its initial axis the same way.
+pub(super) fn mass_weighted_seed(
     options: &TsOptions,
     masses: &[f64],
     natom: usize,

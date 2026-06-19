@@ -14,8 +14,10 @@
 //! check confirms one negative mode and the [`super::irc`] tracer (reused, not
 //! duplicated) optionally confirms the basins the saddle joins.
 
-use std::f64::consts::PI;
-
+use super::dimer_rotate::{
+    AXIS_DEGEN_EPS, endpoint_curvature, initial_axis, normalize, project_internal, require_finite,
+    rotate_to_min_mode, seed_axis,
+};
 use super::numerics::{
     add_step, disp_norms, dot, force_norms, gradient, gram_schmidt, mass_weight_grad, masses_of,
     norm, positions_of, projected_force_norms, trans_rot_vectors, unmass_weight_step,
@@ -24,8 +26,6 @@ use super::{Flow, Progress, TsError, TsOptions, TsResult, TsStatus, verify_with_
 use crate::core::Molecule;
 use crate::opt::{OptError, OptStep, Surface};
 
-/// Maximum dimer rotations per outer (translation) step.
-const MAX_ROT: usize = 4;
 /// Floor on |curvature| in the parallel-step denominator, so a near-flat mode
 /// does not blow the step up.
 const C_MIN: f64 = 1e-3;
@@ -34,61 +34,6 @@ const C_MIN: f64 = 1e-3;
 /// curvature-scaled, so stiff transverse modes rely on the trust radius to bound
 /// the step.
 const ALPHA: f64 = 1.0;
-
-/// Below this projected-axis norm the carried dimer axis is treated as degenerate
-/// and reseeded.
-const AXIS_DEGEN_EPS: f64 = 1e-8;
-/// Perpendicular gradient-difference norm below which the axis is taken to be
-/// aligned with the lowest-curvature mode (rotation converged).
-const GPERP_TOL: f64 = 1e-6;
-/// Rotational-force magnitude below which a further rotation is not worthwhile.
-const FROT_TOL: f64 = 1e-3;
-/// Rotation angle (radians) below which the trial rotation is treated as a no-op.
-const ROT_ANGLE_TOL: f64 = 1e-3;
-
-/// Project a flat mass-weighted vector onto the internal subspace: subtract its
-/// components along each (orthonormal) translation/rotation basis vector.
-fn project_internal(v: &[f64], basis: &[Vec<f64>]) -> Vec<f64> {
-    let mut out = v.to_vec();
-    for b in basis {
-        let c = dot(v, b);
-        for (o, &bi) in out.iter_mut().zip(b) {
-            *o -= c * bi;
-        }
-    }
-    out
-}
-
-/// Normalize in place; returns the original norm.
-fn normalize(v: &mut [f64]) -> f64 {
-    let n = norm(v);
-    if n > 0.0 {
-        for x in v.iter_mut() {
-            *x /= n;
-        }
-    }
-    n
-}
-
-/// The mass-weighted, internal-subspace-projected gradient at the dimer endpoint
-/// `x + Δ·N` (in mass-weighted space): displace the Cartesian midpoint by
-/// un-mass-weighting `Δ N`, evaluate the gradient, mass-weight and project it.
-/// The projection uses the trans/rot `basis` built at the midpoint `x` (the
-/// endpoint frame differs by O(Δ)).
-fn endpoint_grad<S: Surface>(
-    surface: &mut S,
-    x: &[[f64; 3]],
-    axis: &[f64],
-    delta: f64,
-    masses: &[f64],
-    basis: &[Vec<f64>],
-    fd_step: f64,
-) -> Result<Vec<f64>, TsError> {
-    let scaled: Vec<f64> = axis.iter().map(|a| delta * a).collect();
-    let endpoint = add_step(x, &unmass_weight_step(&scaled, masses));
-    let g_cart = gradient(surface, &endpoint, fd_step)?;
-    Ok(project_internal(&mass_weight_grad(&g_cart, masses), basis))
-}
 
 pub(super) fn run_dimer<S: Surface>(
     molecule: &Molecule,
@@ -110,6 +55,12 @@ pub(super) fn run_dimer<S: Surface>(
              Cartesian DOF, {n_tr} translation/rotation modes)"
         )));
     }
+
+    // The reaction-coordinate seed (if any) is validated up front — a length
+    // mismatch is a bad guess before any surface evaluation — then used to
+    // initialize the dimer axis (see the axis selection below). Mass-weighted the
+    // same way P-RFO seeds its climb.
+    let seed_mw = super::prfo::mass_weighted_seed(options, &masses, natom)?;
 
     let mut energy = surface.energy(&x)?;
     let mut trust = options
@@ -133,12 +84,14 @@ pub(super) fn run_dimer<S: Surface>(
     let mut iterations = 0usize;
     let mut converged_geom = false;
     let mut stopped_early = false;
+    let mut not_converged_reason: Option<String> = None;
 
     for iter in 1..=options.max_iter {
         iterations = iter;
         let basis = gram_schmidt(&trans_rot_vectors(&x, &masses));
 
         let g0_cart = gradient(surface, &x, options.fd_step)?;
+        require_finite(&g0_cart, "dimer midpoint gradient")?;
         let (max_force, rms_force) = force_norms(&g0_cart);
         // Judge convergence (and best-so-far) on the trans/rot-projected force, the
         // frame the rotation/translation runs in; keep the raw force in the record.
@@ -177,6 +130,10 @@ pub(super) fn run_dimer<S: Surface>(
             break;
         }
         if iter == options.max_iter {
+            not_converged_reason = Some(format!(
+                "reached max_iter ({}) with max projected force {:.2e} a.u.",
+                options.max_iter, conv_force
+            ));
             break;
         }
 
@@ -197,10 +154,15 @@ pub(super) fn run_dimer<S: Surface>(
             }
         }
 
-        // Axis: initialize on the first iteration (along the projected gradient,
-        // falling back to a canonical internal direction); reuse + reproject later.
+        // Axis: initialize on the first iteration. When a reaction-coordinate seed
+        // is supplied (e.g. the tangent carried over from a two-endpoint/NEB
+        // handoff), build the first axis from it — projected into the internal
+        // subspace and normalized — so the dimer climbs the reaction coordinate
+        // from the outset; otherwise follow the projected gradient, falling back to
+        // a canonical internal direction. Reuse + reproject the axis later.
         let mut n_axis = match &axis {
-            None => initial_axis(&g0, &basis, ndof),
+            None => seed_axis(seed_mw.as_deref(), &basis)
+                .unwrap_or_else(|| initial_axis(&g0, &basis, ndof)),
             Some(prev) => {
                 let mut a = project_internal(prev, &basis);
                 if normalize(&mut a) < AXIS_DEGEN_EPS {
@@ -211,82 +173,19 @@ pub(super) fn run_dimer<S: Surface>(
             }
         };
 
-        // ROTATION inner loop: align `n_axis` with the lowest-curvature mode.
-        let mut aligned_curvature: Option<f64> = None;
-        for _ in 0..MAX_ROT {
-            let g1 = endpoint_grad(
-                surface,
-                &x,
-                &n_axis,
-                delta,
-                &masses,
-                &basis,
-                options.fd_step,
-            )?;
-            let d: Vec<f64> = g1.iter().zip(&g0).map(|(a, b)| a - b).collect();
-            let gpar = dot(&d, &n_axis);
-            let curvature = gpar / delta;
-            let gperp: Vec<f64> = d
-                .iter()
-                .zip(&n_axis)
-                .map(|(di, ni)| di - gpar * ni)
-                .collect();
-            let gperp_norm = norm(&gperp);
-            if gperp_norm < GPERP_TOL {
-                aligned_curvature = Some(curvature);
-                break;
-            }
-            let theta: Vec<f64> = gperp.iter().map(|g| g / gperp_norm).collect();
-
-            let frot_norm = 2.0 * gperp_norm;
-            if frot_norm < FROT_TOL {
-                aligned_curvature = Some(curvature);
-                break;
-            }
-            let b1 = dot(&d, &theta) / delta;
-
-            // Trial rotation by π/4 to estimate the curvature's Fourier model.
-            let phi1 = PI / 4.0;
-            let mut nt = rotate(&n_axis, &theta, phi1.cos(), phi1.sin());
-            nt = project_internal(&nt, &basis);
-            normalize(&mut nt);
-            let c1 = endpoint_curvature(
-                surface,
-                &x,
-                &nt,
-                &g0,
-                delta,
-                &masses,
-                &basis,
-                options.fd_step,
-            )?;
-
-            let a1 = (curvature - c1 + b1 * (2.0 * phi1).sin()) / (1.0 - (2.0 * phi1).cos());
-            let phi_e = 0.5 * b1.atan2(a1);
-            // Select the MINIMUM-curvature branch, then wrap into (-π/2, π/2].
-            let mut phi_min = if a1 * (2.0 * phi_e).cos() + b1 * (2.0 * phi_e).sin() < 0.0 {
-                phi_e
-            } else {
-                phi_e + PI / 2.0
-            };
-            if phi_min > PI / 2.0 {
-                phi_min -= PI;
-            } else if phi_min <= -PI / 2.0 {
-                phi_min += PI;
-            }
-
-            n_axis = rotate(&n_axis, &theta, phi_min.cos(), phi_min.sin());
-            n_axis = project_internal(&n_axis, &basis);
-            normalize(&mut n_axis);
-
-            // Early break if the rotation barely moves the axis.
-            if phi_min.abs() < ROT_ANGLE_TOL {
-                break;
-            }
-        }
-        // Curvature at the converged axis (used by the translation step below).
-        // Reuse the value from the rotation loop when the axis did not move on its
-        // final pass; otherwise finite-difference it afresh.
+        // ROTATION: align `n_axis` with the lowest-curvature mode, then take the
+        // curvature there (reusing the rotation loop's value when it converged
+        // early, else finite-differencing it afresh) for the translation below.
+        let aligned_curvature = rotate_to_min_mode(
+            surface,
+            &x,
+            &mut n_axis,
+            &g0,
+            delta,
+            &masses,
+            &basis,
+            options.fd_step,
+        )?;
         let curvature = match aligned_curvature {
             Some(c) => c,
             None => endpoint_curvature(
@@ -372,6 +271,10 @@ pub(super) fn run_dimer<S: Surface>(
         let Some((x_new, energy_new, step_norm)) = committed else {
             // SCF would not converge from this midpoint even after backtracking;
             // stop with the best geometry so far rather than aborting the search.
+            not_converged_reason = Some(
+                "step reduced to the trust floor without a usable SCF (backtracking exhausted)"
+                    .to_string(),
+            );
             break;
         };
 
@@ -394,6 +297,7 @@ pub(super) fn run_dimer<S: Surface>(
             history,
             verification: None,
             irc: None,
+            diagnostic: None,
         });
     }
     if !converged_geom {
@@ -405,6 +309,7 @@ pub(super) fn run_dimer<S: Surface>(
             history,
             verification: None,
             irc: None,
+            diagnostic: not_converged_reason,
         });
     }
 
@@ -434,6 +339,13 @@ pub(super) fn run_dimer<S: Surface>(
     // Leave the surface cache at the returned saddle (as P-RFO does).
     let _ = surface.energy(&x)?;
 
+    let diagnostic = if status == TsStatus::WrongImaginaryModeCount {
+        Some(super::prfo::wrong_mode_reason(
+            verification.negative_eigenvalues.len(),
+        ))
+    } else {
+        None
+    };
     Ok(TsResult {
         positions: x,
         energy,
@@ -442,51 +354,6 @@ pub(super) fn run_dimer<S: Surface>(
         history,
         verification: Some(verification),
         irc,
+        diagnostic,
     })
-}
-
-/// Curvature `C ≈ NᵀHN` from one endpoint gradient: `(g1 - g0)·N / Δ`.
-#[allow(clippy::too_many_arguments)]
-fn endpoint_curvature<S: Surface>(
-    surface: &mut S,
-    x: &[[f64; 3]],
-    axis: &[f64],
-    g0: &[f64],
-    delta: f64,
-    masses: &[f64],
-    basis: &[Vec<f64>],
-    fd_step: f64,
-) -> Result<f64, TsError> {
-    let g1 = endpoint_grad(surface, x, axis, delta, masses, basis, fd_step)?;
-    let d: Vec<f64> = g1.iter().zip(g0).map(|(a, b)| a - b).collect();
-    Ok(dot(&d, axis) / delta)
-}
-
-/// `cos·N + sin·Θ` (unnormalized rotation of `N` toward `Θ`).
-fn rotate(n: &[f64], theta: &[f64], cos: f64, sin: f64) -> Vec<f64> {
-    n.iter()
-        .zip(theta)
-        .map(|(ni, ti)| cos * ni + sin * ti)
-        .collect()
-}
-
-/// First-iteration dimer axis: the projected gradient direction; if it is
-/// (near-)zero, the first canonical internal-subspace unit vector.
-fn initial_axis(g0: &[f64], basis: &[Vec<f64>], ndof: usize) -> Vec<f64> {
-    let mut n = project_internal(g0, basis);
-    if normalize(&mut n) >= AXIS_DEGEN_EPS {
-        return n;
-    }
-    for i in 0..ndof {
-        let mut e = vec![0.0f64; ndof];
-        e[i] = 1.0;
-        let mut p = project_internal(&e, basis);
-        if normalize(&mut p) > 1e-6 {
-            return p;
-        }
-    }
-    // Unreachable for a molecule with an internal DOF (guarded at setup).
-    let mut e = vec![0.0f64; ndof];
-    e[0] = 1.0;
-    e
 }

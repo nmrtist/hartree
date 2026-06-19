@@ -11,7 +11,9 @@ use crate::dft::{
 use crate::disp::Dispersion;
 use crate::integrals::{ConventionalProvider, DfProvider, DirectProvider, IntegralProvider};
 use crate::linalg::{mat_from_row_major, mat_to_row_major};
-use crate::opt::ts::guess::{GuessOptions, ScanOptions, build_ts_guess, build_ts_guess_scanned};
+use crate::opt::ts::guess::{
+    GuessOptions, MappingConfidence, ScanOptions, build_ts_guess, build_ts_guess_scanned,
+};
 use crate::opt::ts::{
     NebOptions, NebTsError, Progress, TsError, TsOptions, TsResult, find_transition_state,
     find_transition_state_from_endpoints,
@@ -398,6 +400,10 @@ pub struct JobResult {
     pub scf: ScfResult,
     pub optimized_geometry: Option<OptResult>,
     pub transition_state: Option<TsResult>,
+    /// Reactant→product atom-mapping diagnostic for a two-endpoint transition-state
+    /// search, when one ran (otherwise `None`). A low confidence flags symmetric or
+    /// equivalent atoms the mapping could not uniquely resolve, which a caller can warn on.
+    pub mapping_confidence: Option<MappingConfidence>,
     pub post_hf: Option<PostHfResult>,
     pub properties: Option<PropertiesResult>,
     pub frequencies: Option<FrequencyData>,
@@ -760,6 +766,7 @@ impl Job {
             scf,
             optimized_geometry: None,
             transition_state: None,
+            mapping_confidence: None,
             post_hf: None,
             properties: None,
             frequencies: None,
@@ -1355,6 +1362,7 @@ impl Job {
                 scf,
                 optimized_geometry: Some(opt),
                 transition_state: None,
+                mapping_confidence: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1470,11 +1478,14 @@ impl Job {
             // Single-guess (start from `mol`) or two-endpoint (build a guess between
             // `mol` and the product, then refine). The two-endpoint guess shares the
             // reactant's composition, so the same `surface` drives it.
-            let ts = match &opts.ts_guess {
-                None => find_transition_state(mol, &mut surface, &ts_opts, None)
-                    .map_err(|e| ts_error_message(&e))?,
+            let (ts, mapping_confidence) = match &opts.ts_guess {
+                None => (
+                    find_transition_state(mol, &mut surface, &ts_opts, None)
+                        .map_err(|e| ts_error_message(&e))?,
+                    None,
+                ),
                 Some(g) if g.use_neb => {
-                    find_transition_state_from_endpoints(
+                    let neb_ts = find_transition_state_from_endpoints(
                         mol,
                         &g.product,
                         &mut surface,
@@ -1482,8 +1493,9 @@ impl Job {
                         &ts_opts,
                         None,
                     )
-                    .map_err(|e| neb_ts_error_message(&e))?
-                    .transition_state
+                    .map_err(|e| neb_ts_error_message(&e))?;
+                    let confidence = neb_ts.neb.mapping_confidence.clone();
+                    (neb_ts.transition_state, confidence)
                 }
                 Some(g) => {
                     // Build a guess between the endpoints and seed the saddle search with
@@ -1512,8 +1524,10 @@ impl Job {
                     if seeded.reaction_mode_seed.is_none() {
                         seeded.reaction_mode_seed = guess.reaction_mode_seed();
                     }
-                    find_transition_state(&guess.molecule, &mut surface, &seeded, None)
-                        .map_err(|e| ts_error_message(&e))?
+                    let confidence = Some(guess.mapping_confidence.clone());
+                    let ts = find_transition_state(&guess.molecule, &mut surface, &seeded, None)
+                        .map_err(|e| ts_error_message(&e))?;
+                    (ts, confidence)
                 }
             };
             let scf = surface
@@ -1545,6 +1559,7 @@ impl Job {
                 scf,
                 optimized_geometry: None,
                 transition_state: Some(ts),
+                mapping_confidence,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1580,6 +1595,7 @@ impl Job {
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
+                mapping_confidence: None,
                 post_hf,
                 properties: None,
                 frequencies: None,
@@ -1605,6 +1621,7 @@ impl Job {
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
+                mapping_confidence: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1632,6 +1649,7 @@ impl Job {
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
+                mapping_confidence: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -1804,6 +1822,7 @@ impl Job {
             scf,
             optimized_geometry: None,
             transition_state: None,
+            mapping_confidence: None,
             post_hf,
             properties,
             frequencies,
@@ -1955,6 +1974,7 @@ impl Job {
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
+                mapping_confidence: None,
                 post_hf: None,
                 properties: None,
                 frequencies: None,
@@ -2050,6 +2070,7 @@ impl Job {
             scf,
             optimized_geometry: None,
             transition_state: None,
+            mapping_confidence: None,
             post_hf: None,
             properties,
             frequencies: None,
@@ -2497,10 +2518,13 @@ pub fn optimize_geometry_dft(
 
 /// Apply the SCF settings a saddle search needs: transition-state geometries have
 /// small HOMO–LUMO gaps, so the SCF gets extra iterations and a level shift to
-/// converge.
+/// converge. The error threshold is held a little looser than the surface default
+/// because a small-gap commutator can floor just short of the tightest tolerance;
+/// the resulting gradients are still well within what the search needs.
 fn prepare_ts_surface(surface: &mut HfSurface) {
     surface.set_scf_max_iter(400);
     surface.set_scf_level_shift(0.3);
+    surface.set_scf_convergence(1e-10, 5e-8);
 }
 
 /// Locate a first-order saddle point on a Hartree–Fock (or wavefunction-SCF)

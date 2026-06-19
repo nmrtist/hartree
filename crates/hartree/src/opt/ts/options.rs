@@ -145,12 +145,13 @@ pub struct TsOptions {
     /// **mass-weighted, translation/rotation-projected** Cartesian Hessian
     /// (atomic units) — the same spectrum [`crate::props::frequencies`] builds,
     /// but with a deliberately *coarser* cut than that module's 1 cm⁻¹ imaginary
-    /// threshold. The default `1e-4` a.u. is ≈ 51 cm⁻¹ (via `√λ·FREQ_CONV_CM1`);
+    /// threshold. The default `1e-5` a.u. is ≈ 16 cm⁻¹ (via `√λ·FREQ_CONV_CM1`);
     /// the looser cut absorbs finite-difference-Hessian noise so a stiff saddle
-    /// is not spuriously demoted to a higher-order one. The trade-off: an
-    /// *ultrasoft* saddle (imaginary mode below ≈51 cm⁻¹) is reported as
-    /// wrong-mode-count even though a frequency job would call it imaginary — lower
-    /// `negative_mode_tol` to chase a floppy TS (at the cost of noise sensitivity).
+    /// is not spuriously demoted to a higher-order one, while still recognizing a
+    /// genuinely soft imaginary mode. The trade-off: an *ultrasoft* saddle
+    /// (imaginary mode below ≈16 cm⁻¹) is reported as wrong-mode-count even though a
+    /// frequency job would call it imaginary — lower `negative_mode_tol` to chase a
+    /// floppy TS (at the cost of noise sensitivity).
     /// Modes within `±tol` of zero are the soft trans/rot residue and are not
     /// counted, so a clean first-order saddle has exactly one mode past this
     /// threshold. Drives the
@@ -292,7 +293,7 @@ impl Default for TsOptions {
             follow_mode: 0,
             recalc_hessian: 0,
             dimer_delta: 1e-2,
-            negative_mode_tol: 1e-4,
+            negative_mode_tol: 1e-5,
             confirm_irc: false,
             max_step_retries: default_max_step_retries(),
             irc_method: IrcMethod::Dvv,

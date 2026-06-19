@@ -10,6 +10,7 @@ use crate::core::{Atom, Element, Molecule};
 use crate::opt::{OptError, Surface};
 
 mod convergence;
+mod diagnostics;
 mod dimer;
 mod hessian_init;
 mod irc;
