@@ -806,31 +806,14 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "integral"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8398bb7b23d4345b9746e91225e2e040231b1bc84a28e24e7fcd75bd1e8bc07a"
+checksum = "88749432f15a8abe1f4815aadb35f1436476a39d2df869a102bf84353a9e51c0"
 dependencies = [
- "integral-core",
- "integral-math",
  "latx",
  "rayon",
  "rustfft",
 ]
-
-[[package]]
-name = "integral-core"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b826a25e42182302c93162d1191e5e37cf2ce1c323e3847b0d0153781f43a4c"
-dependencies = [
- "integral-math",
-]
-
-[[package]]
-name = "integral-math"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39ee962b9e9fa7c653364afe97abc33120c741e000e47175d4dd0c06d7468699"
 
 [[package]]
 name = "interpol"
