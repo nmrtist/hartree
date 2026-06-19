@@ -52,6 +52,7 @@ impl BasisSet {
         let json = match lower.as_str() {
             "sto-3g" => bundled!("sto-3g"),
             "6-31g" => bundled!("6-31g"),
+            "6-31g(d)" | "6-31g*" => bundled!("6-31g(d)"),
             "6-311g" => bundled!("6-311g"),
             "6-311g(d,p)" => bundled!("6-311g(d,p)"),
             "6-311+g(d,p)" => bundled!("6-311+g(d,p)"),
@@ -331,9 +332,10 @@ mod tests {
         Molecule::from_xyz("2\nH2\nH 0 0 0\nH 0 0 0.74\n").unwrap()
     }
 
-    const BUNDLED_SETS: [&str; 21] = [
+    const BUNDLED_SETS: [&str; 22] = [
         "sto-3g",
         "6-31g",
+        "6-31g(d)",
         "6-311g",
         "6-311g(d,p)",
         "6-311+g(d,p)",
@@ -386,6 +388,10 @@ mod tests {
     fn spherical_convention_is_per_family() {
         assert!(!BasisSet::load("sto-3g").unwrap().spherical);
         assert!(!BasisSet::load("6-31g").unwrap().spherical);
+        // The polarized 6-31 set is spherical (5d), unlike its unpolarized parent; the
+        // `*` alias resolves to the same spherical set.
+        assert!(BasisSet::load("6-31g(d)").unwrap().spherical);
+        assert!(BasisSet::load("6-31g*").unwrap().spherical);
         assert!(BasisSet::load("6-311g").unwrap().spherical);
         assert!(BasisSet::load("6-311g(d,p)").unwrap().spherical);
         assert!(BasisSet::load("6-311+g(d,p)").unwrap().spherical);
@@ -738,6 +744,54 @@ mod tests {
             .build(&water())
             .unwrap();
         assert_eq!(ao.n_ao(), 28);
+    }
+
+    #[test]
+    fn pople_631gd_structure() {
+        let set = BasisSet::load("6-31g(d)").unwrap();
+        assert!(
+            set.spherical,
+            "6-31g(d) must be spherical (5d, not 6d Cartesian)"
+        );
+        assert!(!set.version.is_empty());
+
+        // Carbon: 6-31G split valence (3 s, 2 p) plus one d polarization shell.
+        let c = set.shells_for(6).unwrap();
+        let count = |l: u32| c.iter().filter(|s| s.l == l).count();
+        assert_eq!(count(0), 3, "carbon s shells");
+        assert_eq!(count(1), 2, "carbon p shells");
+        assert_eq!(count(2), 1, "carbon d shells");
+        // Hydrogen carries no polarization in 6-31G(d): just the split 1s.
+        let h = set.shells_for(1).unwrap();
+        assert_eq!(
+            h.iter().filter(|s| s.l == 0).count(),
+            2,
+            "hydrogen s shells"
+        );
+        assert_eq!(
+            h.iter().filter(|s| s.l > 0).count(),
+            0,
+            "hydrogen has no polarization"
+        );
+
+        // AO counts with spherical d (5 per d shell): C atom = 3·1 + 2·3 + 1·5 = 14;
+        // water (O + 2H) = 14 + 2·2 = 18. The `*` alias resolves identically.
+        let c_atom = Molecule::from_xyz("1\nC\nC 0 0 0\n").unwrap();
+        assert_eq!(
+            set.build(&c_atom).unwrap().n_ao(),
+            14,
+            "carbon-atom AO count"
+        );
+        assert_eq!(set.build(&water()).unwrap().n_ao(), 18, "water AO count");
+        assert_eq!(
+            BasisSet::load("6-31g*")
+                .unwrap()
+                .build(&water())
+                .unwrap()
+                .n_ao(),
+            18,
+            "6-31g* alias AO count"
+        );
     }
 
     #[test]

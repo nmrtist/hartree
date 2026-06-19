@@ -131,9 +131,16 @@ fn parse_floats(values: &[String]) -> Result<Vec<f64>> {
 
 fn default_spherical(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    let cartesian = n.starts_with("sto")
-        || n.starts_with("3-21")
-        || n.starts_with("4-31")
-        || (n.starts_with("6-31") && !n.starts_with("6-311"));
+    // The minimal and plain split-valence Pople sets keep the traditional Cartesian
+    // convention (it is harmless — they carry no d shell). Their *polarized* variants
+    // (a `(d`/`*` marker) use the spherical-harmonic convention (5 d functions, not the
+    // 6 Cartesian) the validation references assume, so their energies match; the 6-311
+    // family is already spherical.
+    let polarized = n.contains("(d") || n.contains('*');
+    let cartesian = !polarized
+        && (n.starts_with("sto")
+            || n.starts_with("3-21")
+            || n.starts_with("4-31")
+            || (n.starts_with("6-31") && !n.starts_with("6-311")));
     !cartesian
 }
