@@ -94,32 +94,40 @@ fn atom_map_falls_back_to_total_injective_hungarian() {
 
 #[test]
 fn map_monomorphism_succeeds_without_bond_breaking() {
-    // Reactant = a single methyl, embedded as a subgraph of a product methyl (with one
-    // extra spectator atom) preserving every reactant bond. atom_map returns it with
-    // full confidence (an exact embedding is topologically determined).
+    // Reactant = a single methyl-like fragment whose three hydrogens sit at clearly
+    // distinct positions (different distances and directions from the carbon), embedded as
+    // a subgraph of a product carrying the same geometry plus one spectator atom. The
+    // embedding preserves every reactant bond; with the hydrogens geometrically
+    // distinguishable, the connectivity-equivalent permutations are cleanly separated, so
+    // atom_map returns the identity correspondence with full confidence.
     let z_r = vec![6, 1, 1, 1];
     let adj_r = vec![vec![1, 2, 3], vec![0], vec![0], vec![0]];
     let pos_r = vec![
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
-        [-0.5, 0.9, 0.0],
-        [-0.5, -0.9, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 3.0],
     ];
     let z_p = vec![6, 1, 1, 1, 6];
     let adj_p = vec![vec![1, 2, 3], vec![0], vec![0], vec![0], vec![]];
     let pos_p = vec![
         [0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0],
-        [-0.5, 0.9, 0.0],
-        [-0.5, -0.9, 0.0],
+        [0.0, 2.0, 0.0],
+        [0.0, 0.0, 3.0],
         [9.0, 0.0, 0.0],
     ];
 
     let (map, conf) = atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
     assert_eq!(map.len(), 4);
     assert_eq!(
+        map,
+        vec![0, 1, 2, 3],
+        "geometry picks the identity correspondence"
+    );
+    assert_eq!(
         conf.confidence, 1.0,
-        "an exact embedding is fully confident"
+        "a geometrically unambiguous embedding is fully confident"
     );
     assert!(conf.ambiguous.is_empty());
 
@@ -246,4 +254,125 @@ fn diagnose_flags_interchangeable_atoms() {
     let clear = diagnose(&z, &sig, &distinct, &z, &sig, &distinct, &map);
     assert_eq!(clear.confidence, 1.0);
     assert!(clear.ambiguous.is_empty());
+}
+
+#[test]
+fn diagnose_flags_a_three_fold_cycle_a_pairwise_check_misses() {
+    // Three connectivity-equivalent atoms whose product partners can be rotated among
+    // themselves at no cost (a directed 3-cycle in the free-reassignment graph) yet for
+    // which no single pairwise swap is free. The old pairwise-only diagnostic, checking
+    // only 2-swaps, would report every atom unambiguous; the cycle-aware diagnostic must
+    // flag all three.
+    let z = vec![1, 1, 1];
+    let sig: Vec<Vec<u64>> = vec![vec![1], vec![1], vec![1]];
+    let map = vec![0, 1, 2];
+
+    // Reactant atoms at the midpoints of a triangle whose vertices are the product atoms.
+    // Each reactant atom is equidistant from its own product slot and the next one round
+    // the ring, but far from the third — so reassignment is free only cyclically.
+    let s = 1.0;
+    let h = 3f64.sqrt() / 2.0;
+    let p = vec![[0.0, 0.0, 0.0], [2.0 * s, 0.0, 0.0], [s, 2.0 * h * s, 0.0]];
+    let r = vec![
+        [s, 0.0, 0.0],         // midpoint of p0–p1
+        [1.5 * s, h * s, 0.0], // midpoint of p1–p2
+        [0.5 * s, h * s, 0.0], // midpoint of p2–p0
+    ];
+
+    // Confirm directly that no single pairwise swap is free (the old check finds nothing),
+    // so a positive result below is contributed entirely by the higher-order cycle.
+    let aligned = align_by_map(&r, &p, &map);
+    let cost = build_cost(&z, &sig, &z, &sig, Some((&aligned, &p)));
+    for i in 0..3 {
+        for k in (i + 1)..3 {
+            let current = cost[i][map[i]] + cost[k][map[k]];
+            let swapped = cost[i][map[k]] + cost[k][map[i]];
+            assert!(
+                swapped - current >= AMBIGUITY_TOL,
+                "pair ({i},{k}) is a free pairwise swap; fixture does not isolate the 3-cycle"
+            );
+        }
+    }
+
+    let conf = diagnose(&z, &sig, &r, &z, &sig, &p, &map);
+    assert!(
+        !conf.ambiguous.is_empty(),
+        "the cycle-aware diagnostic must flag the 3-fold ambiguity (confidence {})",
+        conf.confidence
+    );
+    assert!(
+        conf.confidence < 1.0,
+        "a 3-fold cyclic ambiguity must lower the confidence below 1.0"
+    );
+}
+
+#[test]
+fn atom_map_geometry_picks_among_symmetric_embeddings() {
+    // A bond-preserving reaction (a monomorphism exists, so the connectivity-only fast path
+    // applies) with two connectivity-equivalent hydrogens on a central carbon plus an
+    // asymmetric oxygen pinning the frame. The product preserves every bond but lists the
+    // two equivalent hydrogens in swapped index order. A blind connectivity match could
+    // pick the identity (geometrically wrong) embedding; the geometry-aware path must map
+    // each reactant hydrogen to the product hydrogen at its position.
+    let z_r = vec![6, 1, 1, 8];
+    let adj_r = vec![vec![1, 2, 3], vec![0], vec![0], vec![0]];
+    let pos_r = vec![
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0], // H1 on +x
+        [0.0, 1.0, 0.0], // H2 on +y
+        [0.0, 0.0, 2.0], // O pins the frame
+    ];
+    // Same connectivity (no bond breaks), but the two hydrogens are listed swapped: product
+    // index 1 sits where reactant H2 is (+y), index 2 where reactant H1 is (+x).
+    let z_p = vec![6, 1, 1, 8];
+    let adj_p = vec![vec![1, 2, 3], vec![0], vec![0], vec![0]];
+    let pos_p = vec![
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0], // product H at +y
+        [1.0, 0.0, 0.0], // product H at +x
+        [0.0, 0.0, 2.0],
+    ];
+
+    // The fast path is taken: a bond-preserving embedding exists.
+    assert!(map_monomorphism(&z_r, &adj_r, &z_p, &adj_p).is_some());
+
+    let (map, conf) = atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
+    // Geometry sends reactant H1 (+x) to product index 2 (+x) and H2 (+y) to index 1 (+y);
+    // the carbon and oxygen map to themselves.
+    assert_eq!(
+        map,
+        vec![0, 2, 1, 3],
+        "geometry did not pick the position-matched embedding"
+    );
+    assert!(
+        conf.confidence > 0.9,
+        "a geometrically clear choice should be confident (got {})",
+        conf.confidence
+    );
+}
+
+#[test]
+fn atom_map_unambiguous_distinct_atoms_stay_confident() {
+    // A bond-preserving reaction with no equivalent atoms: every atom has a distinct
+    // connectivity environment, so the embedding is unique and fully confident, and the
+    // map is the identity correspondence.
+    let z_r = vec![8, 6, 1, 7];
+    let adj_r = vec![vec![1], vec![0, 2, 3], vec![1], vec![1]];
+    let pos_r = vec![
+        [0.0, 0.0, 0.0],
+        [1.5, 0.0, 0.0],
+        [2.0, 1.0, 0.0],
+        [2.0, -1.0, 0.0],
+    ];
+    let z_p = z_r.clone();
+    let adj_p = adj_r.clone();
+    let pos_p = pos_r.clone();
+
+    let (map, conf) = atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
+    assert_eq!(map, vec![0, 1, 2, 3], "unique embedding is the identity");
+    assert_eq!(
+        conf.confidence, 1.0,
+        "a unique embedding is fully confident"
+    );
+    assert!(conf.ambiguous.is_empty());
 }

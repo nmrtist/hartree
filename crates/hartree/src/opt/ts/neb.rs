@@ -31,7 +31,7 @@ mod optimizer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::guess::{self, GuessOptions};
+use super::guess::{self, GuessOptions, MappingConfidence};
 use super::{Progress, TsError, TsOptions, TsResult, find_transition_state};
 use crate::core::Molecule;
 use crate::opt::{OptError, OptStep, Surface};
@@ -204,6 +204,12 @@ pub struct NebResult {
     pub peak_tangent: Vec<[f64; 3]>,
     /// Outcome classification; see [`NebStatus`].
     pub status: NebStatus,
+    /// Confidence/ambiguity diagnostic for the reactant→product atom correspondence, set
+    /// only when [`NebOptions::map_atoms`] permuted the product onto the reactant (the
+    /// route that needs the mapping). `None` when the endpoints were used as given. A low
+    /// confidence flags symmetric/equivalent atoms the mapping could not uniquely resolve.
+    #[serde(default)]
+    pub mapping_confidence: Option<MappingConfidence>,
     /// Number of relaxation iterations taken.
     pub iterations: usize,
     /// Per-iteration convergence trace (reusing the minimizer's [`OptStep`]); the
@@ -260,10 +266,13 @@ pub fn find_minimum_energy_path<S: Surface>(
     // identical-ordering check below then passes by construction. Without it, the product
     // is used as given and the check enforces the ordering.
     let mapped_product;
+    let mut mapping_confidence = None;
     let product: &Molecule = if options.map_atoms {
-        mapped_product =
+        let (reordered, confidence) =
             guess::reorder_product_onto_reactant(reactant, product, options.bond_factor)
                 .map_err(|e| NebError::BadEndpoints(e.to_string()))?;
+        mapped_product = reordered;
+        mapping_confidence = Some(confidence);
         &mapped_product
     } else {
         product
@@ -316,6 +325,7 @@ pub fn find_minimum_energy_path<S: Surface>(
         peak_geometry,
         peak_tangent: relaxed.peak_tangent,
         status: relaxed.status,
+        mapping_confidence,
         iterations: relaxed.iterations,
         history: relaxed.history,
     })

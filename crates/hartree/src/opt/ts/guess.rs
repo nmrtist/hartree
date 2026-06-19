@@ -260,8 +260,9 @@ fn assemble(
 /// Reorder `product`'s atoms into `reactant`'s order by mapping atoms across the
 /// reaction (the same [`mapping::atom_map`] the guess builder uses), returning the
 /// reordered product molecule (product atoms and positions permuted so atom `r` matches
-/// reactant atom `r`). Lets a chain-of-states driver accept two endpoints whose atoms are
-/// not already in a common order.
+/// reactant atom `r`) together with the mapping's [`MappingConfidence`] diagnostic. Lets a
+/// chain-of-states driver accept two endpoints whose atoms are not already in a common
+/// order, and surface how uniquely that reordering was determined.
 ///
 /// # Errors
 /// [`GuessError`] if the two molecules disagree on atom count or element composition.
@@ -269,7 +270,7 @@ pub(in crate::opt::ts) fn reorder_product_onto_reactant(
     reactant: &Molecule,
     product: &Molecule,
     bond_factor: f64,
-) -> Result<Molecule, GuessError> {
+) -> Result<(Molecule, MappingConfidence), GuessError> {
     let n = reactant.len();
     if n != product.len() {
         return Err(GuessError::AtomCountMismatch {
@@ -284,9 +285,10 @@ pub(in crate::opt::ts) fn reorder_product_onto_reactant(
     let pos_p: Vec<[f64; 3]> = product.atoms.iter().map(|a| a.position).collect();
     let adj_r = adjacency(reactant, bond_factor);
     let adj_p = adjacency(product, bond_factor);
-    let (map, _confidence) = mapping::atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
+    let (map, confidence) = mapping::atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
     let atoms = (0..n).map(|r| product.atoms[map[r]]).collect();
-    Ok(Molecule::new(atoms, product.charge, product.multiplicity))
+    let reordered = Molecule::new(atoms, product.charge, product.multiplicity);
+    Ok((reordered, confidence))
 }
 
 /// Place `positions` onto a copy of `template`'s atoms (same elements/charge/multiplicity,

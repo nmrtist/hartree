@@ -225,7 +225,7 @@ fn reorder_product_maps_atoms_by_element_then_geometry() {
         1,
     );
 
-    let reordered = reorder_product_onto_reactant(&reactant, &product, 1.3).unwrap();
+    let (reordered, _confidence) = reorder_product_onto_reactant(&reactant, &product, 1.3).unwrap();
     assert_eq!(reordered.atoms[0].element.z(), 6, "carbon should lead");
     assert_eq!(reordered.atoms[1].element.z(), 1);
     assert!(

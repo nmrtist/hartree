@@ -3,6 +3,14 @@
 //! bonds); when a bond breaks and no embedding exists, falls back to a minimum-cost
 //! (Hungarian) assignment over a connectivity-signature-plus-geometry cost.
 //!
+//! A connectivity-only embedding is not unique for a molecule with equivalent atoms (the
+//! three hydrogens of a methyl, atoms related by a symmetry operation): several
+//! edge-preserving maps exist, differing only in how they permute the interchangeable atoms.
+//! So the monomorphism path enumerates the embeddings (bounded) and, after a rigid Kabsch
+//! fit, picks the one minimizing the aligned atom-position discrepancy. The reported
+//! confidence reflects how cleanly geometry separates that choice from the next-best,
+//! dropping toward zero when the candidates are near-degenerate (interchangeable atoms).
+//!
 //! The Hungarian fallback bootstraps in two passes: a signatures-only assignment gives a
 //! coarse correspondence used to Kabsch-align the reactant onto the product, then a
 //! second assignment over `signature + aligned-distance` cost refines it. Element
@@ -21,8 +29,13 @@
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use super::hungarian;
 use crate::ext::kabsch::optimal_rotation;
+
+mod cycles;
+mod symmetry;
 
 const SIGNATURE_SHELLS: usize = 3;
 
@@ -44,16 +57,30 @@ const SIGNATURE_WEIGHT: f64 = 10.0;
 /// total cost is within this of the chosen assignment marks both atoms ambiguous.
 const AMBIGUITY_TOL: f64 = 1.0e-6;
 
+/// Upper bound on the number of edge-preserving embeddings enumerated when an exact
+/// monomorphism exists. A highly symmetric molecule admits many automorphic embeddings;
+/// the geometric tie-break only needs enough of them to separate the equivalent atoms, so
+/// the search stops once this many have been collected (keeping the cost away from `N!`).
+const MAX_MONOMORPHISMS: usize = 4096;
+
+/// Confidence floor for the geometry-chosen embedding: a positive best-to-second separation
+/// maps to a confidence in `[FLOOR, 1]` growing with the separation, while a vanishing
+/// separation reports `0` (the equivalent atoms are genuinely interchangeable).
+const GEOMETRIC_CONFIDENCE_FLOOR: f64 = 0.5;
+
+/// Squared-distance separation between the best and second-best embedding above which the
+/// geometric choice is treated as fully unambiguous (confidence `1.0`).
+const GEOMETRIC_SEPARATION_FULL: f64 = 1.0e-2;
+
 /// Confidence/ambiguity diagnostic for a reactant→product atom map.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MappingConfidence {
     /// Fraction of atoms with no equal-cost alternative assignment, in `[0, 1]`: `1.0`
     /// means every atom's correspondence is uniquely determined (by element, then
     /// connectivity, then geometry); lower values mean some atoms are interchangeable.
-    /// A monomorphism (exact edge-preserving embedding) reports `1.0`.
     pub confidence: f64,
-    /// Reactant atoms involved in a near-zero-cost feasible 2-swap — those whose mapped
-    /// product partner could be exchanged with another atom's at no cost increase (e.g.
+    /// Reactant atoms whose mapped product partner could be exchanged at no cost increase —
+    /// a free pairwise swap or a longer cyclic reassignment of a symmetric orbit (e.g.
     /// symmetric hydrogens geometry does not separate). Empty for an unambiguous map.
     pub ambiguous: Vec<usize>,
 }
@@ -70,17 +97,12 @@ pub(super) fn atom_map(
     adj_p: &[Vec<usize>],
     pos_p: &[[f64; 3]],
 ) -> (Vec<usize>, MappingConfidence) {
-    if let Some(map) = map_monomorphism(z_r, adj_r, z_p, adj_p) {
-        // An exact edge-preserving embedding is topologically determined; report full
-        // confidence rather than a geometric swap diagnostic (which would second-guess a
-        // correct embedding on automorphic fragments).
-        return (
-            map,
-            MappingConfidence {
-                confidence: 1.0,
-                ambiguous: Vec::new(),
-            },
-        );
+    let embeddings = enumerate_monomorphisms(z_r, adj_r, z_p, adj_p);
+    if !embeddings.is_empty() {
+        // An exact embedding exists, but it is not unique when the molecule has equivalent
+        // atoms: choose the candidate whose Kabsch-aligned positions best match the
+        // reactant, and report a confidence reflecting the geometric margin to the next.
+        return choose_by_geometry(pos_r, pos_p, embeddings);
     }
     let sig_r = signatures(adj_r, z_r);
     let sig_p = signatures(adj_p, z_p);
@@ -184,9 +206,14 @@ fn align_by_map(pos_r: &[[f64; 3]], pos_p: &[[f64; 3]], map: &[usize]) -> Vec<[f
         .collect()
 }
 
-/// The confidence/ambiguity diagnostic for `map`: builds the final `signature + geometry`
-/// cost (aligned under `map`) and flags every atom that has a feasible, no-cost-increase
-/// 2-swap of its assignment.
+/// The confidence/ambiguity diagnostic for `map`. Two complementary tests flag an atom
+/// whose correspondence is not uniquely determined: (1) a directed "free reassignment"
+/// graph over the fixed alignment, where an atom on a cycle (SCC of size > 1) can be
+/// cyclically reassigned at no cost — catching atoms left near-coincident by the alignment;
+/// and (2) a per-group symmetry test that, within a set of equivalent atoms, marks a
+/// symmetric orbit whose cyclic rotation re-aligns as well as the current map. The second
+/// flags a 3-fold (or higher) orbit a pairwise-only check misses: a single swap of such an
+/// orbit is an improper move the rigid fit cannot match, but the full rotation is proper.
 fn diagnose(
     z_r: &[u32],
     sig_r: &[Vec<u64>],
@@ -206,20 +233,27 @@ fn diagnose(
     let aligned = align_by_map(pos_r, pos_p, map);
     let cost = build_cost(z_r, sig_r, z_p, sig_p, Some((&aligned, pos_p)));
 
-    let mut ambiguous = vec![false; n];
+    // Test 1: directed free-reassignment graph (see the doc comment).
+    let mut adj = vec![Vec::new(); n];
     for i in 0..n {
-        for k in (i + 1)..n {
-            let (ji, jk) = (map[i], map[k]);
-            let current = cost[i][ji] + cost[k][jk];
-            let swapped = cost[i][jk] + cost[k][ji];
-            // A feasible (same-element, finite) swap that does not raise the total cost
-            // means atoms i and k are interchangeable under this map.
-            if swapped < ELEMENT_PENALTY && swapped - current < AMBIGUITY_TOL {
-                ambiguous[i] = true;
-                ambiguous[k] = true;
+        let own = cost[i][map[i]];
+        for k in 0..n {
+            if k == i {
+                continue;
+            }
+            let alt = cost[i][map[k]];
+            if alt < ELEMENT_PENALTY && alt - own < AMBIGUITY_TOL {
+                adj[i].push(k);
             }
         }
     }
+    let mut ambiguous = cycles::atoms_on_cycles(&adj);
+
+    // Test 2: cost-neutral cyclic rotation within each connectivity-equivalent group, scored
+    // by a rigid re-alignment of the whole candidate map.
+    let residual = |candidate: &[usize]| alignment_residual(pos_r, pos_p, candidate);
+    symmetry::flag_symmetric_groups(z_r, sig_r, pos_r, map, residual, &mut ambiguous);
+
     let amb: Vec<usize> = (0..n).filter(|&i| ambiguous[i]).collect();
     MappingConfidence {
         confidence: (n - amb.len()) as f64 / n as f64,
@@ -255,25 +289,44 @@ fn matvec(r: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
-/// An injective, element-respecting, edge-preserving map from the reactant graph
-/// into the product graph, or `None` if no such embedding exists (a bond breaks).
-/// Backtracking with element/degree/neighbour pruning, in a connected visitation
-/// order so each atom (after the first of its fragment) has a mapped neighbour.
+/// A single injective, element-respecting, edge-preserving map from the reactant graph
+/// into the product graph, or `None` if no such embedding exists (a bond breaks). A thin
+/// wrapper over [`enumerate_monomorphisms`] returning its first embedding.
+#[cfg(test)]
 fn map_monomorphism(
     z_r: &[u32],
     adj_r: &[Vec<usize>],
     z_p: &[u32],
     adj_p: &[Vec<usize>],
 ) -> Option<Vec<usize>> {
-    let n = z_r.len();
+    enumerate_monomorphisms(z_r, adj_r, z_p, adj_p)
+        .into_iter()
+        .next()
+}
+
+/// Every injective, element-respecting, edge-preserving embedding of the reactant graph
+/// into the product graph (empty if none exists — a bond breaks), up to
+/// [`MAX_MONOMORPHISMS`]. Backtracking with element/degree/neighbour pruning, in a
+/// connected visitation order so each atom (after the first of its fragment) has a mapped
+/// neighbour. Distinct connectivity environments admit only one image, so the branching
+/// that produces multiple embeddings happens only among equivalent atoms — exactly the
+/// permutations a geometric tie-break must consider.
+fn enumerate_monomorphisms(
+    z_r: &[u32],
+    adj_r: &[Vec<usize>],
+    z_p: &[u32],
+    adj_p: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
     let order = connected_order(adj_r);
-    let mut map = vec![usize::MAX; n];
-    let mut used = vec![false; n];
-    if mono_backtrack(0, &order, z_r, adj_r, z_p, adj_p, &mut map, &mut used) {
-        Some(map)
-    } else {
-        None
-    }
+    let mut map = vec![usize::MAX; z_r.len()];
+    // `used` is indexed by product atom, so it must span the product (which may be larger
+    // than the reactant when the reactant embeds as a subgraph with spectator atoms).
+    let mut used = vec![false; z_p.len()];
+    let mut out = Vec::new();
+    mono_backtrack(
+        0, &order, z_r, adj_r, z_p, adj_p, &mut map, &mut used, &mut out,
+    );
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -286,9 +339,14 @@ fn mono_backtrack(
     adj_p: &[Vec<usize>],
     map: &mut [usize],
     used: &mut [bool],
-) -> bool {
+    out: &mut Vec<Vec<usize>>,
+) {
+    if out.len() >= MAX_MONOMORPHISMS {
+        return;
+    }
     if pos == order.len() {
-        return true;
+        out.push(map.to_vec());
+        return;
     }
     let i = order[pos];
     for j in 0..z_p.len() {
@@ -303,13 +361,73 @@ fn mono_backtrack(
         }
         map[i] = j;
         used[j] = true;
-        if mono_backtrack(pos + 1, order, z_r, adj_r, z_p, adj_p, map, used) {
-            return true;
-        }
+        mono_backtrack(pos + 1, order, z_r, adj_r, z_p, adj_p, map, used, out);
         map[i] = usize::MAX;
         used[j] = false;
+        if out.len() >= MAX_MONOMORPHISMS {
+            return;
+        }
     }
-    false
+}
+
+/// Pick the embedding whose Kabsch-aligned reactant best matches the product, and report a
+/// confidence from the geometric margin to the next-best candidate. With a single embedding
+/// the choice is unique and fully confident; with several, the residual after alignment
+/// breaks the tie and a small best-to-second margin lowers the confidence toward zero (the
+/// permuted atoms are geometrically interchangeable).
+fn choose_by_geometry(
+    pos_r: &[[f64; 3]],
+    pos_p: &[[f64; 3]],
+    embeddings: Vec<Vec<usize>>,
+) -> (Vec<usize>, MappingConfidence) {
+    let mut scored: Vec<(f64, Vec<usize>)> = embeddings
+        .into_iter()
+        .map(|m| (alignment_residual(pos_r, pos_p, &m), m))
+        .collect();
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best = scored[0].1.clone();
+    let confidence = if scored.len() < 2 {
+        1.0
+    } else {
+        let separation = (scored[1].0 - scored[0].0).max(0.0);
+        if separation <= AMBIGUITY_TOL {
+            0.0
+        } else {
+            let frac = (separation / GEOMETRIC_SEPARATION_FULL).min(1.0);
+            GEOMETRIC_CONFIDENCE_FLOOR + (1.0 - GEOMETRIC_CONFIDENCE_FLOOR) * frac
+        }
+    };
+    // Flag the atoms whose image differs between the best and a near-degenerate runner-up:
+    // those are the interchangeable ones geometry could not cleanly separate.
+    let ambiguous = if confidence >= 1.0 {
+        Vec::new()
+    } else {
+        let runner = &scored[1].1;
+        (0..best.len()).filter(|&i| best[i] != runner[i]).collect()
+    };
+    (
+        best,
+        MappingConfidence {
+            confidence,
+            ambiguous,
+        },
+    )
+}
+
+/// Mean squared per-atom discrepancy after rigidly Kabsch-aligning the reactant onto the
+/// product permuted by `map` — the geometric score of one candidate embedding.
+fn alignment_residual(pos_r: &[[f64; 3]], pos_p: &[[f64; 3]], map: &[usize]) -> f64 {
+    let n = pos_r.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let aligned = align_by_map(pos_r, pos_p, map);
+    let mut sum = 0.0;
+    for i in 0..n {
+        sum += dist2(aligned[i], pos_p[map[i]]);
+    }
+    sum / n as f64
 }
 
 /// Breadth-first order over all components, each started from its highest-degree atom.
