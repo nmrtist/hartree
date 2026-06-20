@@ -126,6 +126,23 @@ pub struct JobOptions {
     /// Knobs for the transition-state search (algorithm, trust radii, IRC, ...);
     /// only consulted when `transition_state` is set. See [`TsOptions`].
     pub ts_options: TsOptions,
+    /// Cap the rayon worker count for this job. When `Some(k)` with `k >= 1`,
+    /// [`Job::run`] runs the whole job (the pre-flight memory estimate and the
+    /// solve) inside a scoped `k`-thread pool, so the library's internal data
+    /// parallelism is bounded without touching the process-global pool — letting
+    /// a host run several jobs with independent core budgets. `None` (and
+    /// `Some(0)`) inherit rayon's default global pool. The count is passed
+    /// straight to rayon: a very large `k` will attempt to spawn that many OS
+    /// threads, so callers are responsible for choosing a sensible value.
+    pub n_threads: Option<usize>,
+    /// Soft peak-memory budget in bytes. When `Some(limit)`, [`Job::run`] first
+    /// computes [`crate::estimate_memory`]; if the selected backend's estimate
+    /// exceeds `limit` it either auto-switches to the integral-direct backend
+    /// (when that is a valid, lower-memory substitute) or refuses with an
+    /// actionable error — *before* the SCF allocates. `None` disables the check.
+    /// An auto-switch is reported, not silent: it is recorded in
+    /// [`JobResult::backend_downgrade`] and added as a method warning.
+    pub mem_budget_bytes: Option<u64>,
 }
 
 impl Default for JobOptions {
@@ -157,6 +174,8 @@ impl Default for JobOptions {
             cosx: false,
             x2c: false,
             ts_options: TsOptions::default(),
+            n_threads: None,
+            mem_budget_bytes: None,
         }
     }
 }
@@ -292,6 +311,21 @@ pub struct RiDiagnostics {
     pub naux: usize,
 }
 
+/// A report that [`Job::run`] automatically switched the integral backend to fit
+/// `mem_budget_bytes`. The downgraded job still ran to completion — this records
+/// what changed so a caller can surface it; it never blocks the run.
+#[derive(Debug, Clone)]
+pub struct BackendDowngrade {
+    /// The backend the job's options would have selected.
+    pub from: crate::EstimateBackend,
+    /// The lower-memory backend actually used to fit the budget.
+    pub to: crate::EstimateBackend,
+    /// Estimated peak bytes for `from` — the figure that exceeded the budget.
+    pub estimated_bytes: u64,
+    /// The configured `mem_budget_bytes` the estimate exceeded.
+    pub budget_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct JobResult {
     pub scf: ScfResult,
@@ -312,6 +346,10 @@ pub struct JobResult {
     pub smd: Option<SmdData>,
     pub gbsa: Option<GbsaData>,
     pub method_warnings: Vec<String>,
+    /// Set when [`Job::run`] automatically changed the integral backend to fit
+    /// `mem_budget_bytes`. The job still ran (a report, not a block); `None`
+    /// means no budget-driven downgrade happened. See [`BackendDowngrade`].
+    pub backend_downgrade: Option<BackendDowngrade>,
 }
 
 impl JobResult {
@@ -338,6 +376,7 @@ impl JobResult {
     }
 }
 
+#[derive(Clone)]
 pub struct Job {
     pub molecule: Molecule,
     pub basis: String,
@@ -346,7 +385,124 @@ pub struct Job {
 }
 
 impl Job {
+    /// Run the job to completion, honoring the optional resource controls in
+    /// [`JobOptions`]. A thread cap (`n_threads`) installs a scoped rayon pool
+    /// around the whole job; inside it a memory budget (`mem_budget_bytes`) is
+    /// resolved — it may transparently switch to the integral-direct backend or
+    /// refuse the job. With neither set this is a thin pass-through to the solver.
     pub fn run(&self) -> Result<JobResult, String> {
+        // Install the optional scoped pool around BOTH the pre-flight estimate
+        // and the solve, so the thread cap bounds all of this job's parallelism.
+        match self.options.n_threads {
+            Some(threads) if threads >= 1 => rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .map_err(|e| format!("could not build a {threads}-thread pool: {e}"))?
+                .install(|| self.run_planned()),
+            _ => self.run_planned(),
+        }
+    }
+
+    /// Resolve the memory budget (possibly downgrading the backend or refusing),
+    /// then run the solver core. Runs inside the scoped pool set up by [`Self::run`].
+    fn run_planned(&self) -> Result<JobResult, String> {
+        let (planned, downgrade) = self.plan_for_budget()?;
+        let mut result = planned.run_core()?;
+        if let Some(report) = downgrade {
+            // Report the automatic backend change two ways without blocking the
+            // run (it already completed): a human-readable method warning that
+            // summaries render, and a structured field a caller can branch on.
+            result.method_warnings.push(format!(
+                "estimated {} for the {} backend exceeded the {} mem_budget_bytes; \
+                 automatically switched to the {} backend to fit the budget",
+                crate::estimate::human_bytes(report.estimated_bytes),
+                report.from,
+                crate::estimate::human_bytes(report.budget_bytes),
+                report.to,
+            ));
+            result.backend_downgrade = Some(report);
+        }
+        Ok(result)
+    }
+
+    /// Resolve a memory-budget-aware execution plan: the job unchanged when no
+    /// budget is set or the estimate fits; an owned integral-direct clone when
+    /// downgrading is a valid way to fit; or an error when it cannot be made to
+    /// fit. Runs before any heavy allocation so an over-budget job is refused
+    /// rather than left to OOM.
+    fn plan_for_budget(
+        &self,
+    ) -> Result<(std::borrow::Cow<'_, Self>, Option<BackendDowngrade>), String> {
+        let Some(budget) = self.options.mem_budget_bytes else {
+            return Ok((std::borrow::Cow::Borrowed(self), None));
+        };
+        let estimate = crate::estimate_memory(self)?;
+        if estimate.peak_bytes <= budget {
+            return Ok((std::borrow::Cow::Borrowed(self), None));
+        }
+        if self.direct_downgrade_eligible() {
+            let mut downgraded = self.clone();
+            downgraded.options.direct = true;
+            // Clear the budget on the clone so its own run does not re-plan.
+            downgraded.options.mem_budget_bytes = None;
+            if let Ok(direct) = crate::estimate_memory(&downgraded)
+                && direct.peak_bytes <= budget
+            {
+                let report = BackendDowngrade {
+                    from: estimate.backend,
+                    to: direct.backend,
+                    estimated_bytes: estimate.peak_bytes,
+                    budget_bytes: budget,
+                };
+                return Ok((std::borrow::Cow::Owned(downgraded), Some(report)));
+            }
+        }
+        Err(format!(
+            "estimated peak memory {} exceeds the {} budget for the {} backend; reduce the \
+             basis set, or select a lower-memory backend (--direct for SCF-level energies, \
+             --ri for density-fitted Coulomb)",
+            crate::estimate::human_bytes(estimate.peak_bytes),
+            crate::estimate::human_bytes(budget),
+            estimate.backend,
+        ))
+    }
+
+    /// Whether a job currently bound for the conventional in-core backend could
+    /// instead run on the integral-direct backend with an equivalent result.
+    /// Mirrors the integral-direct capability gates in `run_inner`; when in
+    /// doubt it returns `false`, so the budget path refuses rather than silently
+    /// running an unsupported combination.
+    fn direct_downgrade_eligible(&self) -> bool {
+        let o = &self.options;
+        // Only the conventional path downgrades; --ri/--direct already chose.
+        if o.ri || o.direct {
+            return false;
+        }
+        // The integral-direct backend supports SCF-level single points only.
+        if o.optimize_geometry
+            || o.transition_state
+            || o.compute_properties
+            || o.compute_frequencies
+            || o.fod
+            || o.cosx
+            || o.cosmo_file.is_some()
+        {
+            return false;
+        }
+        if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+            return false;
+        }
+        // Double hybrids, range-separated (CAM), and VV10 functionals all need a
+        // backend that stores its integrals.
+        if let Method::Dft(spec) = &self.method
+            && (spec.double_hybrid().is_some() || spec.cam().is_some() || spec.vv10().is_some())
+        {
+            return false;
+        }
+        true
+    }
+
+    fn run_core(&self) -> Result<JobResult, String> {
         let mut result = self.run_inner()?;
         result.method_warnings = crate::guardrails::assess_job(self);
         if let Some(name) = &self.options.smd
@@ -533,6 +689,7 @@ impl Job {
 
         Ok(JobResult {
             method_warnings: Vec::new(),
+            backend_downgrade: None,
             scf,
             optimized_geometry: None,
             transition_state: None,
@@ -1041,17 +1198,7 @@ impl Job {
             }
         }
 
-        let n_elec = mol.n_electrons() - ecp_core;
-        if n_elec < 0 {
-            return Err("charge exceeds nuclear charge (negative electron count)".into());
-        }
-        let n_elec = n_elec as usize;
-        let two_s = (mol.multiplicity.saturating_sub(1)) as usize;
-        if two_s > n_elec {
-            return Err("multiplicity is too high for the electron count".into());
-        }
-        let n_alpha = (n_elec + two_s) / 2;
-        let n_beta = (n_elec - two_s) / 2;
+        let (n_alpha, n_beta) = alpha_beta_electrons(mol, ecp_core)?;
 
         let reference = method_reference(&self.method, mol.multiplicity);
         if reference == Reference::Rhf && n_alpha != n_beta {
@@ -1130,6 +1277,7 @@ impl Job {
                 .map(|p| crate::disp::srb_energy(final_mol.as_ref().unwrap(), &p));
             return Ok(JobResult {
                 method_warnings: Vec::new(),
+                backend_downgrade: None,
                 scf,
                 optimized_geometry: Some(opt),
                 transition_state: None,
@@ -1272,6 +1420,7 @@ impl Job {
                 .map(|p| crate::disp::srb_energy(final_mol.as_ref().unwrap(), &p));
             return Ok(JobResult {
                 method_warnings: Vec::new(),
+                backend_downgrade: None,
                 scf,
                 optimized_geometry: None,
                 transition_state: Some(ts),
@@ -1306,6 +1455,7 @@ impl Job {
             };
             return Ok(JobResult {
                 method_warnings: Vec::new(),
+                backend_downgrade: None,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -1330,6 +1480,7 @@ impl Job {
             let scf = self.run_direct(mol, n_alpha, n_beta, reference, smearing)?;
             return Ok(JobResult {
                 method_warnings: Vec::new(),
+                backend_downgrade: None,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -1356,6 +1507,7 @@ impl Job {
         if !scf.converged {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
+                backend_downgrade: None,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -1527,6 +1679,7 @@ impl Job {
 
         Ok(JobResult {
             method_warnings: Vec::new(),
+            backend_downgrade: None,
             scf,
             optimized_geometry: None,
             transition_state: None,
@@ -1677,6 +1830,7 @@ impl Job {
         if !scf.converged {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
+                backend_downgrade: None,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -1771,6 +1925,7 @@ impl Job {
 
         Ok(JobResult {
             method_warnings: Vec::new(),
+            backend_downgrade: None,
             scf,
             optimized_geometry: None,
             transition_state: None,
@@ -2146,6 +2301,26 @@ fn resolve_gbsa_solvent(name: &str) -> Result<&'static crate::solv::GbsaParams, 
             crate::solv::gbsa_solvent_names().join(", ")
         )
     })
+}
+
+/// Resolve the α/β electron counts from the molecule and ECP core size,
+/// applying the same charge/multiplicity validation `run_inner` requires.
+/// Shared with [`crate::estimate_memory`] so both derive occupancies the same
+/// way.
+pub(crate) fn alpha_beta_electrons(
+    mol: &Molecule,
+    ecp_core: i64,
+) -> Result<(usize, usize), String> {
+    let n_elec = mol.n_electrons() - ecp_core;
+    if n_elec < 0 {
+        return Err("charge exceeds nuclear charge (negative electron count)".into());
+    }
+    let n_elec = n_elec as usize;
+    let two_s = (mol.multiplicity.saturating_sub(1)) as usize;
+    if two_s > n_elec {
+        return Err("multiplicity is too high for the electron count".into());
+    }
+    Ok(((n_elec + two_s) / 2, (n_elec - two_s) / 2))
 }
 
 fn method_reference(method: &Method, multiplicity: u32) -> Reference {

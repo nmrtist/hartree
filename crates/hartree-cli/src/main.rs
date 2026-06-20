@@ -692,6 +692,11 @@ fn run() -> Result<bool, String> {
             cosx,
             x2c,
             ts_options,
+            // The CLI runs one job per process, so it leaves rayon on its global
+            // pool and sets no in-process memory budget; both knobs exist for
+            // library/embedding callers that drive several jobs in one process.
+            n_threads: None,
+            mem_budget_bytes: None,
         },
     };
 

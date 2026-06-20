@@ -32,6 +32,7 @@ pub mod periodic;
 // High-level orchestration
 pub mod composite;
 pub mod cp;
+mod estimate;
 pub mod guardrails;
 mod job;
 pub mod multilevel;
@@ -40,10 +41,11 @@ mod surface;
 pub mod w1;
 
 pub use cp::{CpFragments, CpResult, counterpoise};
+pub use estimate::{EstimateBackend, MemoryEstimate, MemoryTerm, estimate_memory};
 pub use job::{
-    CosxDiagnostics, DftDiagnostics, FrequencyData, GbsaData, Job, JobOptions, JobResult, Method,
-    PostHfResult, PropertiesResult, RiDiagnostics, SmdData, ecp_summary, optimize_geometry,
-    optimize_geometry_dft, transition_state, transition_state_dft,
+    BackendDowngrade, CosxDiagnostics, DftDiagnostics, FrequencyData, GbsaData, Job, JobOptions,
+    JobResult, Method, PostHfResult, PropertiesResult, RiDiagnostics, SmdData, ecp_summary,
+    optimize_geometry, optimize_geometry_dft, transition_state, transition_state_dft,
 };
 pub use periodic_job::{PeriodicFunctional, PeriodicJob, PeriodicJobResult, run_periodic};
 pub use surface::HfSurface;
