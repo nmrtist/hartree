@@ -1,5 +1,6 @@
 //! Geometry optimization: redundant internal coordinates, BFGS/RFO, and finite-difference drivers.
 
+pub mod constrained;
 pub mod fd;
 pub mod internals;
 pub mod ts;
@@ -116,7 +117,7 @@ pub struct OptResult {
     pub history: Vec<OptStep>,
 }
 
-const MAX_TRUST_RETRIES: usize = 8;
+pub(crate) const MAX_TRUST_RETRIES: usize = 8;
 
 pub fn optimize<S: Surface>(
     molecule: &Molecule,
@@ -221,7 +222,7 @@ pub fn optimize<S: Surface>(
     })
 }
 
-fn eval_gradient<S: Surface>(
+pub(crate) fn eval_gradient<S: Surface>(
     surface: &mut S,
     x: &[[f64; 3]],
     options: &OptOptions,
@@ -232,7 +233,7 @@ fn eval_gradient<S: Surface>(
     }
 }
 
-fn init_hessian(defs: &[Internal]) -> Vec<f64> {
+pub(crate) fn init_hessian(defs: &[Internal]) -> Vec<f64> {
     let nq = defs.len();
     let mut h = vec![0.0; nq * nq];
     for (i, d) in defs.iter().enumerate() {
@@ -287,7 +288,7 @@ fn rfo_step(hessian: &[f64], grad: &[f64], nq: usize, trust: f64) -> Result<Vec<
     Ok(dq)
 }
 
-fn predicted_change(grad: &[f64], hessian: &[f64], dq: &[f64], nq: usize) -> f64 {
+pub(crate) fn predicted_change(grad: &[f64], hessian: &[f64], dq: &[f64], nq: usize) -> f64 {
     let mut p = 0.0;
     for i in 0..nq {
         p += grad[i] * dq[i];
@@ -300,7 +301,7 @@ fn predicted_change(grad: &[f64], hessian: &[f64], dq: &[f64], nq: usize) -> f64
     p
 }
 
-fn bfgs_update(hessian: &mut [f64], s: &[f64], y: &[f64], nq: usize) {
+pub(crate) fn bfgs_update(hessian: &mut [f64], s: &[f64], y: &[f64], nq: usize) {
     let sy = dot(s, y);
     if sy <= 1e-10 {
         return;
@@ -324,7 +325,7 @@ fn bfgs_update(hessian: &mut [f64], s: &[f64], y: &[f64], nq: usize) {
     }
 }
 
-fn update_trust(
+pub(crate) fn update_trust(
     trust: f64,
     actual: f64,
     predicted: f64,
@@ -348,7 +349,7 @@ fn update_trust(
     }
 }
 
-fn force_norms(gx: &[[f64; 3]]) -> (f64, f64) {
+pub(crate) fn force_norms(gx: &[[f64; 3]]) -> (f64, f64) {
     let mut max = 0.0_f64;
     let mut sum_sq = 0.0;
     let mut count = 0;
@@ -362,7 +363,7 @@ fn force_norms(gx: &[[f64; 3]]) -> (f64, f64) {
     (max, (sum_sq / count as f64).sqrt())
 }
 
-fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
+pub(crate) fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
     let mut max = 0.0_f64;
     let mut sum_sq = 0.0;
     let mut count = 0;
@@ -377,7 +378,7 @@ fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
     (max, (sum_sq / count as f64).sqrt())
 }
 
-fn flatten(g: &[[f64; 3]]) -> Vec<f64> {
+pub(crate) fn flatten(g: &[[f64; 3]]) -> Vec<f64> {
     let mut out = Vec::with_capacity(g.len() * 3);
     for v in g {
         out.extend_from_slice(v);
@@ -385,11 +386,11 @@ fn flatten(g: &[[f64; 3]]) -> Vec<f64> {
     out
 }
 
-fn dot(a: &[f64], b: &[f64]) -> f64 {
+pub(crate) fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-fn norm(a: &[f64]) -> f64 {
+pub(crate) fn norm(a: &[f64]) -> f64 {
     dot(a, a).sqrt()
 }
 
