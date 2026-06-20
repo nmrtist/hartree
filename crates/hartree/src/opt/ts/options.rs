@@ -37,6 +37,51 @@ pub enum TsAlgorithm {
     // driver rather than a variant consumed by `find_transition_state`.
 }
 
+/// Which Hessian the post-convergence verification uses to count negative modes —
+/// **P-RFO only** (the dimer carries no Hessian and always finite-differences one).
+///
+/// [`Strict`](VerifyHessian::Strict) (the default) always finite-differences a fresh
+/// Hessian at the converged geometry — the most accurate, at ≈6N extra gradients.
+/// [`Maintained`](VerifyHessian::Maintained) reuses the quasi-Newton (Bofill) Hessian
+/// P-RFO already carries into convergence, spending no extra gradients but trusting an
+/// approximate Hessian (so the reported spectrum/frequencies are approximate too).
+/// [`Auto`](VerifyHessian::Auto) reuses the maintained Hessian when its spectrum is
+/// unambiguous and falls back to a fresh one only when a mode sits near the
+/// negative-mode threshold — the cheap choice that stays safe. `#[non_exhaustive]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum VerifyHessian {
+    /// Always finite-difference a fresh verification Hessian (byte-identical to the
+    /// historical behaviour).
+    #[default]
+    Strict,
+    /// Always reuse the maintained (Bofill) Hessian; never finite-difference.
+    Maintained,
+    /// Reuse the maintained Hessian when its spectrum is clearly classified; fall back
+    /// to a fresh finite-difference Hessian only when a mode is near the threshold.
+    Auto,
+}
+
+/// How the saddle search builds the **initial** climbing Hessian — **P-RFO only**
+/// (the dimer is Hessian-free).
+///
+/// [`Auto`](HessianInit::Auto) (the default) uses the surface's
+/// [`seed_hessian`](crate::opt::Surface::seed_hessian) when it provides one — a cheap
+/// model or learned Hessian to start from — and otherwise finite-differences it.
+/// [`Fd`](HessianInit::Fd) always finite-differences, ignoring any seed. Either way
+/// the Hessian is only a starting point: P-RFO refines it by quasi-Newton updates and
+/// the post-convergence verification is independent (see [`VerifyHessian`]).
+/// `#[non_exhaustive]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum HessianInit {
+    /// Use the surface's seed Hessian if it offers one, else finite-difference.
+    #[default]
+    Auto,
+    /// Always finite-difference the initial Hessian, ignoring any seed.
+    Fd,
+}
+
 /// Options for a transition-state search.
 ///
 /// The shared knobs (`max_iter`, the trust radii, the force/displacement
@@ -177,6 +222,21 @@ pub struct TsOptions {
     /// behaviour); the default is `2`. With no seed it has no effect.
     #[serde(default = "default_max_recover")]
     pub max_recover: usize,
+
+    /// P-RFO only: which Hessian the post-convergence verification uses (see
+    /// [`VerifyHessian`]). The default [`Strict`](VerifyHessian::Strict) reproduces the
+    /// historical fresh finite-difference verification; [`Auto`](VerifyHessian::Auto)
+    /// skips that ≈6N-gradient Hessian on a cleanly-classified success. The dimer
+    /// method ignores it (it never forms a maintained Hessian).
+    #[serde(default)]
+    pub verify_hessian: VerifyHessian,
+
+    /// P-RFO only: how the initial climbing Hessian is built (see [`HessianInit`]).
+    /// The default [`Auto`](HessianInit::Auto) finite-differences it unless the
+    /// surface offers a [`seed_hessian`](crate::opt::Surface::seed_hessian); existing
+    /// surfaces (which offer none) are unaffected. The dimer ignores it.
+    #[serde(default)]
+    pub hessian_init: HessianInit,
 }
 
 /// Default step-retry budget (see [`TsOptions::max_step_retries`]); also the serde
@@ -241,6 +301,8 @@ impl Default for TsOptions {
             irc_gtol: default_irc_gtol(),
             reaction_mode_seed: None,
             max_recover: default_max_recover(),
+            verify_hessian: VerifyHessian::Strict,
+            hessian_init: HessianInit::Auto,
         }
     }
 }

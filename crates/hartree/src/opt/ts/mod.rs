@@ -52,7 +52,7 @@ mod step;
 
 pub use irc::{IrcEndpoints, IrcMethod};
 pub use numerics::SaddleVerification;
-pub use options::{TsAlgorithm, TsOptions};
+pub use options::{HessianInit, TsAlgorithm, TsOptions, VerifyHessian};
 // The analytic-surface tests favour explicit index loops over the atom/Cartesian
 // grid and `TsOptions::default()` + field mutation (the documented way to build
 // the `#[non_exhaustive]` options); both read clearer here than the lint's
@@ -241,10 +241,59 @@ pub fn verify_saddle<S: Surface>(
     positions: &[[f64; 3]],
     options: &TsOptions,
 ) -> Result<SaddleVerification, TsError> {
+    Ok(verify_with_hessian(molecule, surface, positions, options)?.0)
+}
+
+/// Like [`verify_saddle`], but also returns the finite-difference Cartesian Hessian
+/// it built. The drivers reuse that Hessian for a Hessian-corrector IRC trace at the
+/// same geometry instead of recomputing it (the spectrum in the returned
+/// [`SaddleVerification`] already came from it), turning two saddle Hessians into one.
+pub(crate) fn verify_with_hessian<S: Surface>(
+    molecule: &Molecule,
+    surface: &mut S,
+    positions: &[[f64; 3]],
+    options: &TsOptions,
+) -> Result<(SaddleVerification, Vec<f64>), TsError> {
     let hessian = numerics::fd_hessian(surface, positions, options.fd_step)?;
-    let molecule = numerics::with_positions(molecule, positions);
-    numerics::saddle_from_hessian(&molecule, &hessian, options.negative_mode_tol)
-        .map_err(TsError::Numerical)
+    let mol = numerics::with_positions(molecule, positions);
+    let verification = numerics::saddle_from_hessian(&mol, &hessian, options.negative_mode_tol)
+        .map_err(TsError::Numerical)?;
+    Ok((verification, hessian))
+}
+
+/// The P-RFO post-convergence verification, honoring
+/// [`TsOptions::verify_hessian`](TsOptions::verify_hessian): under
+/// [`Strict`](VerifyHessian::Strict) it finite-differences a fresh Hessian (this is
+/// [`verify_with_hessian`]); under [`Maintained`](VerifyHessian::Maintained) it
+/// classifies from the `maintained` quasi-Newton Hessian P-RFO carried into
+/// convergence; under [`Auto`](VerifyHessian::Auto) it classifies from `maintained`
+/// but falls back to a fresh Hessian when the spectrum is ambiguous near the
+/// negative-mode threshold. Returns the verification and the Hessian it was drawn
+/// from (which the driver reuses for a Hessian-corrector IRC and for recovery).
+pub(super) fn verify_classified<S: Surface>(
+    molecule: &Molecule,
+    surface: &mut S,
+    positions: &[[f64; 3]],
+    maintained: &[f64],
+    options: &TsOptions,
+) -> Result<(SaddleVerification, Vec<f64>), TsError> {
+    let from_maintained = || -> Result<SaddleVerification, TsError> {
+        let mol = numerics::with_positions(molecule, positions);
+        numerics::saddle_from_hessian(&mol, maintained, options.negative_mode_tol)
+            .map_err(TsError::Numerical)
+    };
+    match options.verify_hessian {
+        VerifyHessian::Strict => verify_with_hessian(molecule, surface, positions, options),
+        VerifyHessian::Maintained => Ok((from_maintained()?, maintained.to_vec())),
+        VerifyHessian::Auto => {
+            let verification = from_maintained()?;
+            if numerics::spectrum_ambiguous(&verification.eigenvalues, options.negative_mode_tol) {
+                verify_with_hessian(molecule, surface, positions, options)
+            } else {
+                Ok((verification, maintained.to_vec()))
+            }
+        }
+    }
 }
 
 /// Search for a first-order saddle point on `surface`, starting from `molecule`.

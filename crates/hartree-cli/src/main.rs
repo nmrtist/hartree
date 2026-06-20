@@ -2239,6 +2239,11 @@ fn print_usage() {
          \x20   --ts-follow <int>       P-RFO mode to follow uphill, 0 = softest [default: 0]\n\
          \x20   --ts-recalc-hessian <int>  recompute the FD Hessian every N accepted steps;\n\
          \x20                           0 = compute once, then Bofill update [default: 0]\n\
+         \x20   --ts-verify-hessian <strict|maintained|auto>  Hessian the post-convergence\n\
+         \x20                           verification uses (P-RFO) [default: strict]; strict\n\
+         \x20                           finite-differences a fresh one, maintained reuses the\n\
+         \x20                           Bofill Hessian, auto reuses it unless a mode is near the\n\
+         \x20                           threshold\n\
          \x20   --ts-fd-step <bohr>     finite-difference step for gradients/Hessian [default:\n\
          \x20                           5e-3]\n\
          \x20   --ts-neg-tol <a.u.>     eigenvalue cutoff for a negative (reaction) mode\n\

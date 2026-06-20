@@ -24,8 +24,8 @@ use super::numerics::{
     add_step, dot, fd_hessian, flatten, gradient, gram_schmidt, mass_weight_grad, matvec, norm,
     projected_force_norms, trans_rot_vectors, unmass_weight_step,
 };
-use super::{TsError, TsOptions};
-use crate::opt::Surface;
+use super::{SaddleVerification, TsError, TsOptions};
+use crate::opt::{OptError, Surface};
 
 /// Pseudo-time step of the [`Dvv`](IrcMethod::Dvv) integrator (reduced units; the
 /// mass is unity in mass-weighted coordinates).
@@ -120,21 +120,31 @@ pub struct IrcEndpoints {
 ///
 /// `saddle_energy` is the converged saddle energy; a trace must drop below it before
 /// its endpoint is accepted as a minimum (so a flat saddle is not mistaken for a basin).
-pub(super) fn irc_endpoints<S: Surface>(
+///
+/// `cached_hessian`, when supplied, is the Cartesian Hessian already computed at
+/// `saddle` (by the post-convergence verification); the [`EulerPc`](IrcMethod::EulerPc)
+/// integrator reuses it instead of finite-differencing a second one. The other
+/// integrators never form a Hessian and ignore it.
+fn irc_endpoints<S: Surface>(
     surface: &mut S,
     saddle: &[[f64; 3]],
     reaction_mode: &[[f64; 3]],
     masses: &[f64],
     saddle_energy: f64,
     options: &TsOptions,
+    cached_hessian: Option<&[f64]>,
 ) -> Result<IrcEndpoints, TsError> {
     let dir = mw_transition_dir(reaction_mode, masses);
     let neg: Vec<f64> = dir.iter().map(|c| -c).collect();
 
-    // The Hessian-corrector method reuses one cached Hessian across both endpoints;
-    // the others never form one.
+    // The Hessian-corrector method reuses one Hessian across both endpoints: the
+    // verification's cached Hessian at the saddle when available, else a fresh one.
+    // The other integrators never form one.
     let hess = if matches!(options.irc_method, IrcMethod::EulerPc) {
-        Some(fd_hessian(surface, saddle, options.fd_step)?)
+        match cached_hessian {
+            Some(h) => Some(h.to_vec()),
+            None => Some(fd_hessian(surface, saddle, options.fd_step)?),
+        }
     } else {
         None
     };
@@ -152,6 +162,43 @@ pub(super) fn irc_endpoints<S: Surface>(
         reverse_converged: rev.converged,
         reverse_steps: rev.steps,
     })
+}
+
+/// The post-convergence IRC confirmation shared by both drivers: when
+/// [`confirm_irc`](TsOptions::confirm_irc) is set and `verification` carries a
+/// reaction mode (a first-order saddle), trace the path off `saddle` and return the
+/// endpoints, reusing the verification's `hessian` for a Hessian-corrector run.
+/// Returns `None` when confirmation is off, there is no reaction mode, or the
+/// (purely confirmatory) trace hits a recoverable SCF failure — the last case must
+/// not turn a converged saddle into a hard error.
+pub(super) fn confirm_irc_endpoints<S: Surface>(
+    surface: &mut S,
+    saddle: &[[f64; 3]],
+    verification: &SaddleVerification,
+    masses: &[f64],
+    saddle_energy: f64,
+    options: &TsOptions,
+    hessian: &[f64],
+) -> Result<Option<IrcEndpoints>, TsError> {
+    if !options.confirm_irc {
+        return Ok(None);
+    }
+    let Some(mode) = &verification.reaction_mode else {
+        return Ok(None);
+    };
+    match irc_endpoints(
+        surface,
+        saddle,
+        mode,
+        masses,
+        saddle_energy,
+        options,
+        Some(hessian),
+    ) {
+        Ok(endpoints) => Ok(Some(endpoints)),
+        Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. })) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// One traced reaction-path endpoint: where the integration stopped, its energy,

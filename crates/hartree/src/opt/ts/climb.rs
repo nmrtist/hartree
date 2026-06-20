@@ -14,7 +14,7 @@ use super::numerics::{
     projected_force_norms, unmass_weight_step,
 };
 use super::step::{bofill_update, is_pathological, prfo_step, select_followed, update_trust_ts};
-use super::{Flow, Progress, TsError, TsOptions};
+use super::{Flow, HessianInit, Progress, TsError, TsOptions};
 use crate::opt::{OptError, OptStep, Surface};
 
 /// Overlap with the previously followed eigenvector below which mode tracking is
@@ -39,6 +39,11 @@ pub(super) struct ClimbResult {
     /// The converged geometry for [`ClimbStop::ConvergedGeom`]; otherwise best-so-far.
     pub(super) x: Vec<[f64; 3]>,
     pub(super) energy: f64,
+    /// The maintained (Bofill) Cartesian Hessian at exit. For
+    /// [`ClimbStop::ConvergedGeom`] it is the quasi-Newton Hessian at the converged
+    /// geometry, which the verification may reuse instead of a fresh finite-difference
+    /// build (see [`VerifyHessian`](super::VerifyHessian)).
+    pub(super) hessian: Vec<f64>,
 }
 
 /// One accepted P-RFO step, threaded out of the backtracking loop in one piece:
@@ -89,7 +94,7 @@ pub(super) fn run_climb<S: Surface>(
             "surface returned a non-finite energy or gradient at the initial geometry".to_string(),
         ));
     }
-    let mut hess = fd_hessian(surface, &x, options.fd_step)?;
+    let mut hess = initial_hessian(surface, &x, options)?;
 
     let mut trust = options
         .trust_radius
@@ -321,7 +326,36 @@ pub(super) fn run_climb<S: Surface>(
         stop,
         x: out_x,
         energy: out_energy,
+        hessian: hess,
     })
+}
+
+/// The initial climbing Hessian, per [`HessianInit`]: under
+/// [`Auto`](HessianInit::Auto) the surface's [`seed_hessian`](Surface::seed_hessian)
+/// when it offers one, otherwise a fresh finite-difference Hessian; under
+/// [`Fd`](HessianInit::Fd) always finite difference. A seed of the wrong length is a
+/// surface-contract violation and surfaces as [`TsError::Numerical`] rather than a
+/// silent fall-back, so a broken model Hessian is not mistaken for a usable one.
+fn initial_hessian<S: Surface>(
+    surface: &mut S,
+    x: &[[f64; 3]],
+    options: &TsOptions,
+) -> Result<Vec<f64>, TsError> {
+    if matches!(options.hessian_init, HessianInit::Auto) {
+        if let Some(result) = surface.seed_hessian(x) {
+            let seed = result?;
+            let ndof = 3 * x.len();
+            if seed.len() != ndof * ndof {
+                return Err(TsError::Numerical(format!(
+                    "seed_hessian returned {} entries, expected {ndof}×{ndof} = {}",
+                    seed.len(),
+                    ndof * ndof
+                )));
+            }
+            return Ok(seed);
+        }
+    }
+    Ok(fd_hessian(surface, x, options.fd_step)?)
 }
 
 /// Whether every component of a Cartesian gradient is finite. A non-finite

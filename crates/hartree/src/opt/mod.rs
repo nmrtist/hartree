@@ -5,7 +5,7 @@ pub mod internals;
 pub mod ts;
 
 use crate::core::Molecule;
-use crate::linalg::{mat_from_row_major, mat_to_row_major, symmetric_eigh};
+use crate::linalg::{mat_from_row_major, mat_to_row_major, symmetric_eigh_checked};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -26,6 +26,11 @@ pub enum OptError {
     /// reached (the cap, when the cap was exhausted).
     #[error("SCF did not converge in {iterations} iterations")]
     ScfNotConverged { iterations: usize },
+    /// A numerical kernel (e.g. the RFO eigensolver) hit non-finite or
+    /// ill-conditioned data. Surfaced as `Err` — rather than a panic — so a caller
+    /// can recover (retry, rebuild the matrix) instead of the process aborting.
+    #[error("numerical failure: {0}")]
+    Numerical(String),
 }
 
 pub trait Surface {
@@ -44,6 +49,19 @@ pub trait Surface {
         _positions: &[[f64; 3]],
         _fd_step: f64,
     ) -> Option<Result<Vec<f64>, OptError>> {
+        None
+    }
+
+    /// Optional model/approximate Cartesian Hessian (row-major, `ndof×ndof`) to
+    /// *seed* a saddle search's initial climbing Hessian — e.g. from a cheap force
+    /// field or a learned surrogate. `None` (the default) makes the driver build the
+    /// initial Hessian by finite difference. Unlike [`fd_hessian`](Self::fd_hessian)
+    /// (a fast path for the *exact* finite-difference Hessian), a seed need not be
+    /// accurate: P-RFO refines it by quasi-Newton (Bofill) updates and the
+    /// post-convergence verification is independent of it, so it only has to point
+    /// the climb in roughly the right curvature directions. The optimizer consults
+    /// it according to the caller's `hessian_init` policy.
+    fn seed_hessian(&mut self, _positions: &[[f64; 3]]) -> Option<Result<Vec<f64>, OptError>> {
         None
     }
 }
@@ -157,7 +175,7 @@ pub fn optimize<S: Surface>(
         let mut retries = 0;
         loop {
             retries += 1;
-            let dq = rfo_step(&hessian, &gq, nq, trust);
+            let dq = rfo_step(&hessian, &gq, nq, trust)?;
             let predicted = predicted_change(&gq, &hessian, &dq, nq);
             let x_new = internals::back_transform(&defs, &x, &dq);
             let energy_new = surface.energy(&x_new)?;
@@ -224,9 +242,9 @@ fn init_hessian(defs: &[Internal]) -> Vec<f64> {
     h
 }
 
-fn rfo_step(hessian: &[f64], grad: &[f64], nq: usize, trust: f64) -> Vec<f64> {
+fn rfo_step(hessian: &[f64], grad: &[f64], nq: usize, trust: f64) -> Result<Vec<f64>, OptError> {
     if nq == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let m = nq + 1;
     let mut aug = vec![0.0; m * m];
@@ -237,7 +255,7 @@ fn rfo_step(hessian: &[f64], grad: &[f64], nq: usize, trust: f64) -> Vec<f64> {
         aug[i * m + nq] = grad[i];
         aug[nq * m + i] = grad[i];
     }
-    let eig = symmetric_eigh(&mat_from_row_major(m, &aug));
+    let eig = symmetric_eigh_checked(&mat_from_row_major(m, &aug)).map_err(OptError::Numerical)?;
     let vectors = mat_to_row_major(&eig.vectors); // column 0 = lowest-eigenvalue vector
     let last = vectors[nq * m]; // row nq, column 0
 
@@ -259,7 +277,7 @@ fn rfo_step(hessian: &[f64], grad: &[f64], nq: usize, trust: f64) -> Vec<f64> {
             *v *= scale;
         }
     }
-    dq
+    Ok(dq)
 }
 
 fn predicted_change(grad: &[f64], hessian: &[f64], dq: &[f64], nq: usize) -> f64 {
@@ -363,144 +381,4 @@ fn norm(a: &[f64]) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::{Atom, Element};
-
-    fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
-        let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-    }
-
-    fn ang(i: [f64; 3], k: [f64; 3], j: [f64; 3]) -> f64 {
-        let u = [i[0] - k[0], i[1] - k[1], i[2] - k[2]];
-        let v = [j[0] - k[0], j[1] - k[1], j[2] - k[2]];
-        let nu = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-        let nv = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        ((u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (nu * nv))
-            .clamp(-1.0, 1.0)
-            .acos()
-    }
-
-    struct HarmonicDiatomic {
-        k: f64,
-        r0: f64,
-    }
-    impl Surface for HarmonicDiatomic {
-        fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
-            let r = dist(x[0], x[1]);
-            Ok(0.5 * self.k * (r - self.r0).powi(2))
-        }
-        fn analytic_gradient(&mut self, x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
-            let r = dist(x[0], x[1]);
-            let e = [
-                (x[0][0] - x[1][0]) / r,
-                (x[0][1] - x[1][1]) / r,
-                (x[0][2] - x[1][2]) / r,
-            ];
-            let f = self.k * (r - self.r0);
-            Some(Ok(vec![
-                [f * e[0], f * e[1], f * e[2]],
-                [-f * e[0], -f * e[1], -f * e[2]],
-            ]))
-        }
-    }
-
-    struct HarmonicWater {
-        kb: f64,
-        b0: f64,
-        ka: f64,
-        a0: f64,
-    }
-    impl Surface for HarmonicWater {
-        fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
-            let r01 = dist(x[0], x[1]);
-            let r02 = dist(x[0], x[2]);
-            let th = ang(x[1], x[0], x[2]);
-            Ok(
-                0.5 * self.kb * ((r01 - self.b0).powi(2) + (r02 - self.b0).powi(2))
-                    + 0.5 * self.ka * (th - self.a0).powi(2),
-            )
-        }
-        fn analytic_gradient(
-            &mut self,
-            _x: &[[f64; 3]],
-        ) -> Option<Result<Vec<[f64; 3]>, OptError>> {
-            None
-        }
-    }
-
-    #[test]
-    fn diatomic_harmonic_analytic() {
-        let mol = Molecule::new(
-            vec![
-                Atom::new(Element::from_z(1).unwrap(), [0.0, 0.0, 0.0]),
-                Atom::new(Element::from_z(1).unwrap(), [0.0, 0.0, 1.10]),
-            ],
-            0,
-            1,
-        );
-        let mut surf = HarmonicDiatomic { k: 0.5, r0: 1.40 };
-        let result = optimize(&mol, &mut surf, &OptOptions::default()).unwrap();
-        assert!(result.converged, "diatomic did not converge");
-        let r = dist(result.positions[0], result.positions[1]);
-        assert!((r - 1.40).abs() < 1e-5, "optimized r = {r}, want 1.40");
-    }
-
-    #[test]
-    fn triatomic_harmonic_fd() {
-        let mol = Molecule::new(
-            vec![
-                Atom::new(Element::from_z(8).unwrap(), [0.0, 0.0, 0.0]),
-                Atom::new(Element::from_z(1).unwrap(), [1.70, 0.0, 0.0]),
-                Atom::new(Element::from_z(1).unwrap(), [-0.45, 1.70, 0.0]),
-            ],
-            0,
-            1,
-        );
-        let mut surf = HarmonicWater {
-            kb: 0.5,
-            b0: 1.81,
-            ka: 0.2,
-            a0: 1.823, // ~104.5°
-        };
-        let result = optimize(&mol, &mut surf, &OptOptions::default()).unwrap();
-        assert!(
-            result.converged,
-            "triatomic did not converge in {} steps",
-            result.iterations
-        );
-        let r01 = dist(result.positions[0], result.positions[1]);
-        let r02 = dist(result.positions[0], result.positions[2]);
-        let th = ang(
-            result.positions[1],
-            result.positions[0],
-            result.positions[2],
-        );
-        assert!((r01 - 1.81).abs() < 1e-4, "r01 = {r01}");
-        assert!((r02 - 1.81).abs() < 1e-4, "r02 = {r02}");
-        assert!((th - 1.823).abs() < 1e-4, "theta = {th}");
-    }
-
-    /// A SCF non-convergence on the real `HfSurface` propagates out of `optimize`
-    /// as the typed `OptError::ScfNotConverged` (via the first `surface.energy`
-    /// call), not a prose `Evaluation` string. Water/sto-3g cannot converge in one
-    /// SCF iteration, so `set_scf_max_iter(1)` forces the failure.
-    #[test]
-    fn scf_non_convergence_propagates_through_optimize() {
-        use crate::scf::Reference;
-        use crate::surface::HfSurface;
-
-        let mol =
-            Molecule::from_xyz("3\nwater\nO 0 0 0.117\nH 0 0.757 -0.470\nH 0 -0.757 -0.470\n")
-                .unwrap();
-        let mut surface = HfSurface::new(&mol, "sto-3g", Reference::Rhf).unwrap();
-        surface.set_scf_max_iter(1);
-
-        let err = optimize(&mol, &mut surface, &OptOptions::default()).unwrap_err();
-        assert!(
-            matches!(err, OptError::ScfNotConverged { iterations: 1 }),
-            "expected ScfNotConverged {{ iterations: 1 }}, got {err:?}"
-        );
-    }
-}
+mod tests;

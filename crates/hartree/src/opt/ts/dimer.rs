@@ -20,7 +20,7 @@ use super::numerics::{
     add_step, disp_norms, dot, force_norms, gradient, gram_schmidt, mass_weight_grad, masses_of,
     norm, positions_of, projected_force_norms, trans_rot_vectors, unmass_weight_step,
 };
-use super::{Flow, Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
+use super::{Flow, Progress, TsError, TsOptions, TsResult, TsStatus, verify_with_hessian};
 use crate::core::Molecule;
 use crate::opt::{OptError, OptStep, Surface};
 
@@ -408,27 +408,25 @@ pub(super) fn run_dimer<S: Surface>(
         });
     }
 
-    let verification = verify_saddle(molecule, surface, &x, options)?;
+    // Keep the verification Hessian so a Hessian-corrector IRC reuses it (the dimer
+    // is Hessian-free, so this verify is its only saddle Hessian).
+    let (verification, hessian) = verify_with_hessian(molecule, surface, &x, options)?;
     let status = if verification.is_first_order_saddle() {
         TsStatus::Converged
     } else {
         TsStatus::WrongImaginaryModeCount
     };
 
-    let irc = if status == TsStatus::Converged && options.confirm_irc {
-        match &verification.reaction_mode {
-            Some(mode) => {
-                match super::irc::irc_endpoints(surface, &x, mode, &masses, energy, options) {
-                    Ok(endpoints) => Some(endpoints),
-                    // A recoverable SCF failure during the (purely confirmatory) IRC
-                    // trace must not discard the converged saddle: report the saddle
-                    // without endpoints rather than turning success into a hard error.
-                    Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. })) => None,
-                    Err(e) => return Err(e),
-                }
-            }
-            None => None,
-        }
+    let irc = if status == TsStatus::Converged {
+        super::irc::confirm_irc_endpoints(
+            surface,
+            &x,
+            &verification,
+            &masses,
+            energy,
+            options,
+            &hessian,
+        )?
     } else {
         None
     };

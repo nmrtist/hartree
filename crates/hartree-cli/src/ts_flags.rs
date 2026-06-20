@@ -6,7 +6,7 @@
 //! struct) from one flag/value pair, and [`parse_ts_algo`] decodes `--ts-algo`.
 //! Error strings mirror the existing CLI style ("--flag must be ...").
 
-use hartree::opt::ts::{IrcMethod, TsAlgorithm, TsOptions};
+use hartree::opt::ts::{IrcMethod, TsAlgorithm, TsOptions, VerifyHessian};
 
 /// The value-taking `--ts-*` flags, so the argv loop in `main.rs` can recognise
 /// them in one membership test before routing through [`apply_ts_option`].
@@ -22,6 +22,7 @@ pub const TS_VALUE_FLAGS: &[&str] = &[
     "--ts-irc-method",
     "--ts-irc-step",
     "--ts-irc-max-steps",
+    "--ts-verify-hessian",
 ];
 
 /// Parse the `--ts-algo` value. Accepts "prfo" and "dimer" (case-insensitive).
@@ -46,6 +47,19 @@ pub fn parse_irc_method(s: &str) -> Result<IrcMethod, String> {
     }
 }
 
+/// Parse the `--ts-verify-hessian` value. Accepts "strict", "maintained", and "auto"
+/// (case-insensitive).
+pub fn parse_verify_hessian(s: &str) -> Result<VerifyHessian, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "strict" => Ok(VerifyHessian::Strict),
+        "maintained" => Ok(VerifyHessian::Maintained),
+        "auto" => Ok(VerifyHessian::Auto),
+        _ => Err(format!(
+            "--ts-verify-hessian must be one of strict, maintained, auto (got {s:?})"
+        )),
+    }
+}
+
 /// Apply one value-taking `--ts-*` flag to `opts`, validating the value. Returns
 /// an error string (mirroring the existing CLI error style) on bad input.
 pub fn apply_ts_option(opts: &mut TsOptions, flag: &str, value: &str) -> Result<(), String> {
@@ -60,6 +74,7 @@ pub fn apply_ts_option(opts: &mut TsOptions, flag: &str, value: &str) -> Result<
         "--ts-irc-method" => opts.irc_method = parse_irc_method(value)?,
         "--ts-irc-step" => opts.irc_step = parse_pos_f64(flag, value, "√amu·bohr")?, // > 0
         "--ts-irc-max-steps" => opts.irc_max_steps = parse_usize(flag, value)?,      // >= 1
+        "--ts-verify-hessian" => opts.verify_hessian = parse_verify_hessian(value)?,
         other => return Err(format!("internal error: unhandled ts flag {other}")),
     }
     Ok(())
@@ -167,6 +182,26 @@ mod tests {
 
         apply_ts_option(&mut o, "--ts-irc-max-steps", "250").unwrap();
         assert_eq!(o.irc_max_steps, 250);
+
+        apply_ts_option(&mut o, "--ts-verify-hessian", "auto").unwrap();
+        assert_eq!(o.verify_hessian, VerifyHessian::Auto);
+    }
+
+    #[test]
+    fn parse_verify_hessian_accepts_known_values() {
+        assert_eq!(
+            parse_verify_hessian("strict").unwrap(),
+            VerifyHessian::Strict
+        );
+        assert_eq!(
+            parse_verify_hessian("maintained").unwrap(),
+            VerifyHessian::Maintained
+        );
+        assert_eq!(parse_verify_hessian("auto").unwrap(), VerifyHessian::Auto);
+        // Case-insensitive.
+        assert_eq!(parse_verify_hessian("Auto").unwrap(), VerifyHessian::Auto);
+        assert!(parse_verify_hessian("bogus").is_err());
+        assert!(parse_verify_hessian("").is_err());
     }
 
     #[test]
@@ -217,6 +252,7 @@ mod tests {
             let value = match flag {
                 "--ts-algo" => "prfo",
                 "--ts-irc-method" => "dvv",
+                "--ts-verify-hessian" => "strict",
                 _ => "1",
             };
             apply_ts_option(&mut o, flag, value)

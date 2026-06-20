@@ -12,12 +12,12 @@
 
 use super::climb::{ClimbStop, run_climb};
 use super::numerics::{
-    add_step, column, fd_hessian, gram_schmidt, masses_of, mw_projected_hessian, norm, overlap,
-    positions_of, trans_rot_vectors, unmass_weight_step,
+    add_step, column, gram_schmidt, masses_of, mw_projected_hessian, norm, overlap, positions_of,
+    trans_rot_vectors, unmass_weight_step,
 };
-use super::{Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
+use super::{Progress, TsError, TsOptions, TsResult, TsStatus, verify_classified};
 use crate::core::Molecule;
-use crate::opt::{OptError, OptStep, Surface};
+use crate::opt::{OptStep, Surface};
 
 pub(super) fn run_prfo<S: Surface>(
     molecule: &Molecule,
@@ -82,29 +82,22 @@ pub(super) fn run_prfo<S: Surface>(
             ClimbStop::ConvergedGeom => (climb.x, climb.energy),
         };
 
-        // Verify with a fresh finite-difference Hessian, not the maintained one.
-        let verification = verify_saddle(molecule, surface, &x, options)?;
+        // Verify the converged point, honoring `verify_hessian`: a fresh
+        // finite-difference Hessian (Strict), the maintained Bofill one (Maintained),
+        // or the maintained one unless its spectrum is ambiguous (Auto). The Hessian
+        // it drew from is kept so a Hessian-corrector IRC and recovery reuse it.
+        let (verification, hessian) =
+            verify_classified(molecule, surface, &x, &climb.hessian, options)?;
         if verification.is_first_order_saddle() {
-            let irc = if options.confirm_irc {
-                match &verification.reaction_mode {
-                    Some(mode) => {
-                        match super::irc::irc_endpoints(surface, &x, mode, &masses, energy, options)
-                        {
-                            Ok(endpoints) => Some(endpoints),
-                            // A recoverable SCF failure during the (purely confirmatory)
-                            // IRC trace must not discard the converged saddle: report it
-                            // without endpoints rather than turning success into an error.
-                            Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged {
-                                ..
-                            })) => None,
-                            Err(e) => return Err(e),
-                        }
-                    }
-                    None => None,
-                }
-            } else {
-                None
-            };
+            let irc = super::irc::confirm_irc_endpoints(
+                surface,
+                &x,
+                &verification,
+                &masses,
+                energy,
+                options,
+                &hessian,
+            )?;
             // Leave the surface cache at the returned saddle, not the last verification
             // / IRC displacement, so a caller's `last_scf()` is the saddle wavefunction.
             let _ = surface.energy(&x)?;
@@ -124,7 +117,7 @@ pub(super) fn run_prfo<S: Surface>(
         // spurious negative modes, climbing the seed) and try again.
         if attempt < options.max_recover {
             if let Some(seed) = seed_mw.as_deref() {
-                x_start = recovery_perturbation(surface, &x, &masses, options, seed)?;
+                x_start = recovery_perturbation(&x, &masses, options, seed, &hessian)?;
                 continue;
             }
         }
@@ -208,17 +201,18 @@ fn mass_weighted_seed(
 /// directions into minima while climbing the intended reaction coordinate. (For a
 /// minimum, with no negative modes, the seed alone is the whole displacement.) The
 /// combined direction is scaled to the trust radius in the mass-weighted frame, then
-/// un-mass-weighted into the Cartesian displacement applied to `x_wrong`.
-fn recovery_perturbation<S: Surface>(
-    surface: &mut S,
+/// un-mass-weighted into the Cartesian displacement applied to `x_wrong`. `hessian`
+/// is the Cartesian Hessian already computed at `x_wrong` by the verification, reused
+/// here so recovery costs no extra Hessian.
+fn recovery_perturbation(
     x_wrong: &[[f64; 3]],
     masses: &[f64],
     options: &TsOptions,
     seed_mw: &[f64],
+    hessian: &[f64],
 ) -> Result<Vec<[f64; 3]>, TsError> {
     let ndof = 3 * x_wrong.len();
-    let hess = fd_hessian(surface, x_wrong, options.fd_step)?;
-    let spec = mw_projected_hessian(x_wrong, masses, &hess).map_err(TsError::Numerical)?;
+    let spec = mw_projected_hessian(x_wrong, masses, hessian).map_err(TsError::Numerical)?;
 
     let negatives: Vec<usize> = (0..ndof)
         .filter(|&k| spec.eigenvalues[k] < -options.negative_mode_tol)
@@ -228,7 +222,7 @@ fn recovery_perturbation<S: Surface>(
     let reaction = negatives.iter().copied().max_by(|&a, &b| {
         overlap(&spec, ndof, a, seed_mw)
             .partial_cmp(&overlap(&spec, ndof, b, seed_mw))
-            .unwrap()
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let mut dir = vec![0.0f64; ndof];

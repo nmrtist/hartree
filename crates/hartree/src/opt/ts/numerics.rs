@@ -36,12 +36,37 @@ pub struct SaddleVerification {
     /// `Some` under the same first-order-saddle condition as
     /// [`reaction_mode`](Self::reaction_mode); `None` otherwise.
     pub imaginary_frequency_cm1: Option<f64>,
+    /// The **full** mass-weighted, translation/rotation-projected eigenvalue spectrum
+    /// (atomic units, ascending) — every mode, not just the negative ones. It comes
+    /// free from the eigendecomposition the verification already runs, so a converged
+    /// TS search carries its complete harmonic spectrum (hence its vibrational
+    /// frequencies, via [`frequencies_cm1`](Self::frequencies_cm1)) without a second
+    /// Hessian. The leading ≈5–6 near-zero entries are the projected-out
+    /// translation/rotation residue. `#[serde(default)]`: an empty vector for records
+    /// serialized before this field existed.
+    #[serde(default)]
+    pub eigenvalues: Vec<f64>,
 }
 
 impl SaddleVerification {
     /// `true` iff there is exactly one negative mode (a first-order saddle).
     pub fn is_first_order_saddle(&self) -> bool {
         self.negative_eigenvalues.len() == 1
+    }
+
+    /// The harmonic frequencies in cm⁻¹ of the physical modes, derived from
+    /// [`eigenvalues`](Self::eigenvalues) at no extra cost — the same
+    /// `±√|λ|·FREQ_CONV_CM1` convention as [`crate::props::frequencies`] (negative
+    /// for an imaginary mode). The near-zero translation/rotation modes are dropped,
+    /// so this is the `3N−6` (or `3N−5`) vibrational spectrum a frequency job would
+    /// report at the same geometry. Empty for a record deserialized before the full
+    /// spectrum was stored (see [`eigenvalues`](Self::eigenvalues)).
+    pub fn frequencies_cm1(&self) -> Vec<f64> {
+        self.eigenvalues
+            .iter()
+            .filter(|&&l| l.abs() > NULL_EPS)
+            .map(|&l| l.signum() * l.abs().sqrt() * FREQ_CONV_CM1)
+            .collect()
     }
 }
 
@@ -84,7 +109,12 @@ pub(super) fn force_norms(gx: &[[f64; 3]]) -> (f64, f64) {
             count += 1;
         }
     }
-    (max, (sum_sq / count as f64).sqrt())
+    let rms = if count == 0 {
+        0.0
+    } else {
+        (sum_sq / count as f64).sqrt()
+    };
+    (max, rms)
 }
 
 pub(super) fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
@@ -99,7 +129,12 @@ pub(super) fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
             count += 1;
         }
     }
-    (max, (sum_sq / count as f64).sqrt())
+    let rms = if count == 0 {
+        0.0
+    } else {
+        (sum_sq / count as f64).sqrt()
+    };
+    (max, rms)
 }
 
 /// Remove the rigid-body (translation/rotation) component of a Cartesian gradient
@@ -381,6 +416,20 @@ pub(super) fn overlap(spec: &MwSpectrum, ndof: usize, k: usize, reference: &[f64
         .abs()
 }
 
+/// Whether an (approximate, maintained) Hessian's spectrum has a physical mode close
+/// enough to the negative-mode threshold that the approximation could misclassify it —
+/// the cue for the [`Auto`](super::VerifyHessian::Auto) verification to recompute a
+/// fresh finite-difference Hessian instead. A mode is suspect when its eigenvalue lies
+/// in `(-2·tol, +tol)`: straddling the `−tol` cut, or small-positive enough that
+/// Hessian error could push it past the cut. The trans/rot null modes (`|λ| ≤ NULL_EPS`)
+/// are exempt — they are never counted. With no mode in that band the negative count is
+/// robust to the maintained Hessian's error, so it can be trusted without a fresh build.
+pub(super) fn spectrum_ambiguous(eigenvalues: &[f64], tol: f64) -> bool {
+    eigenvalues
+        .iter()
+        .any(|&l| l.abs() > NULL_EPS && l > -2.0 * tol && l < tol)
+}
+
 pub(super) fn saddle_from_hessian(
     molecule: &Molecule,
     hessian: &[f64],
@@ -430,5 +479,6 @@ pub(super) fn saddle_from_hessian(
         negative_eigenvalues,
         reaction_mode,
         imaginary_frequency_cm1,
+        eigenvalues: spec.eigenvalues,
     })
 }

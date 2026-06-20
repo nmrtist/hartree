@@ -11,12 +11,15 @@ use crate::opt::{OptError, Surface};
 
 mod convergence;
 mod dimer;
+mod hessian_init;
 mod irc;
 mod linear;
 mod recovery;
+mod restricted_step;
 mod robustness;
 mod saddle;
 mod seed;
+mod verify_hessian;
 
 /// A bent, non-collinear arrangement of three identical atoms (Bohr). Equal
 /// masses make mass-weighting a uniform scale, so the mass-weighted Hessian
