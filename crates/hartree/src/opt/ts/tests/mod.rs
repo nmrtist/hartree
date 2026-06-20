@@ -14,6 +14,7 @@ mod dimer;
 mod hessian_init;
 mod irc;
 mod linear;
+mod neb;
 mod recovery;
 mod restricted_step;
 mod robustness;

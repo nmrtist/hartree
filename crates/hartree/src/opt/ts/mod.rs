@@ -39,18 +39,30 @@
 //! pair (IDPP interpolation with subgraph atom mapping). This file is the public
 //! contract — types, the two entry points, and their docs; the numerics live in
 //! [`numerics`], [`prfo`], and the IRC path tracer in [`irc`].
+//!
+//! For the *double-ended* case — two known minima, no good single guess — the
+//! separate climbing-image NEB driver
+//! [`find_minimum_energy_path`](self::find_minimum_energy_path) (in `neb`) relaxes a
+//! whole band of images onto the minimum-energy path and rides a climbing image up
+//! to the saddle, yielding a transition-state guess plus its reaction-coordinate
+//! tangent to hand back to [`find_transition_state`] for a tight finish.
 
 pub mod guess;
 
 mod climb;
 mod dimer;
 mod irc;
+mod neb;
 mod numerics;
 mod options;
 mod prfo;
 mod step;
 
 pub use irc::{IrcEndpoints, IrcMethod};
+pub use neb::{
+    NebError, NebOptions, NebResult, NebStatus, NebTsError, NebTsResult, find_minimum_energy_path,
+    find_transition_state_from_endpoints,
+};
 pub use numerics::SaddleVerification;
 pub use options::{HessianInit, TsAlgorithm, TsOptions, VerifyHessian};
 // The analytic-surface tests favour explicit index loops over the atom/Cartesian

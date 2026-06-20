@@ -10,6 +10,7 @@
 //! as the reaction coordinate.
 
 mod assembly;
+pub(in crate::opt::ts) mod band;
 mod idpp;
 mod mapping;
 
