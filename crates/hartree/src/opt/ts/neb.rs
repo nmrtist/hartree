@@ -66,7 +66,7 @@ pub enum NebError {
     #[error(transparent)]
     SurfaceEvaluation(#[from] OptError),
     /// The two endpoints are unusable as a band's ends: different atom counts, a
-    /// different atom ordering (this driver requires identical ordering),
+    /// different atom ordering (without [`NebOptions::map_atoms`], which permits it),
     /// too few atoms, or `n_images == 0`. Carries a human-readable reason.
     #[error("bad NEB endpoints: {0}")]
     BadEndpoints(String),
@@ -118,6 +118,17 @@ pub struct NebOptions {
     /// endpoint would change its energy; leave `false` too when the endpoints already
     /// share a frame.
     pub align: bool,
+    /// Reorder the product's atoms onto the reactant's by atom mapping before building
+    /// the band, lifting the requirement that the two endpoints already list their atoms
+    /// in the same order. With it `false` (the default) the driver keeps the strict
+    /// identical-ordering check; with it `true` the product is permuted to match the
+    /// reactant (via the same connectivity-plus-geometry mapping the guess builder uses,
+    /// using [`bond_factor`](Self::bond_factor) for the connectivity). The endpoints must
+    /// still share an element multiset.
+    pub map_atoms: bool,
+    /// Covalent-radius multiplier for the bond cutoff used when
+    /// [`map_atoms`](Self::map_atoms) builds endpoint connectivity. Unused otherwise.
+    pub bond_factor: f64,
     /// FIRE initial time step (Bitzek *et al.*, Phys. Rev. Lett. 97, 170201 (2006)).
     pub fire_dt: f64,
     /// FIRE maximum time step.
@@ -150,6 +161,8 @@ impl Default for NebOptions {
             gtol: 1.0e-3,
             fd_step: 5.0e-3,
             align: false,
+            map_atoms: false,
+            bond_factor: 1.3,
             // FIRE defaults follow the original paper / ASE, in atomic units.
             fire_dt: 0.1,
             fire_dt_max: 1.0,
@@ -208,10 +221,10 @@ impl NebResult {
 
 /// Find the minimum-energy path between two minima with a climbing-image NEB.
 ///
-/// `reactant` and `product` are the two endpoint minima; they must hold the same
-/// atoms in the same order (this driver does not reorder atoms — build the
-/// endpoints in a common ordering, or pre-map them). `surface` evaluates energies and
-/// gradients for that shared composition (built exactly as for
+/// `reactant` and `product` are the two endpoint minima. By default they must hold the
+/// same atoms in the same order; set [`NebOptions::map_atoms`] to permute the product
+/// onto the reactant first (then they need only share an element multiset). `surface`
+/// evaluates energies and gradients for that shared composition (built exactly as for
 /// [`find_transition_state`]); it is queried at one image at a time. The optional
 /// `progress` observer is called once per iteration and may request an early stop.
 ///
@@ -243,12 +256,24 @@ pub fn find_minimum_energy_path<S: Surface>(
             product.len()
         )));
     }
+    // With `map_atoms`, permute the product onto the reactant's atom order first; the
+    // identical-ordering check below then passes by construction. Without it, the product
+    // is used as given and the check enforces the ordering.
+    let mapped_product;
+    let product: &Molecule = if options.map_atoms {
+        mapped_product =
+            guess::reorder_product_onto_reactant(reactant, product, options.bond_factor)
+                .map_err(|e| NebError::BadEndpoints(e.to_string()))?;
+        &mapped_product
+    } else {
+        product
+    };
     for i in 0..n {
         let (zr, zp) = (reactant.atoms[i].element.z(), product.atoms[i].element.z());
         if zr != zp {
             return Err(NebError::BadEndpoints(format!(
                 "atom {i} differs between endpoints (reactant Z={zr}, product Z={zp}); \
-                 this driver requires identical atom ordering"
+                 this driver requires identical atom ordering (or set map_atoms)"
             )));
         }
     }

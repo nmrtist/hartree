@@ -210,6 +210,43 @@ fn reaction_mode_seed_points_along_forming_bond() {
 }
 
 #[test]
+fn reorder_product_maps_atoms_by_element_then_geometry() {
+    // Reactant order [C, H]; the product is given in the swapped order [H, C]. Reordering
+    // must put it back into [C, H] order — the element gate alone forces C→C and H→H —
+    // carrying each product atom's position with it.
+    let reactant = Molecule::new(
+        vec![atom(6, [0.0, 0.0, 0.0]), atom(1, [2.0, 0.0, 0.0])],
+        0,
+        1,
+    );
+    let product = Molecule::new(
+        vec![atom(1, [2.1, 0.0, 0.0]), atom(6, [0.1, 0.0, 0.0])],
+        0,
+        1,
+    );
+
+    let reordered = reorder_product_onto_reactant(&reactant, &product, 1.3).unwrap();
+    assert_eq!(reordered.atoms[0].element.z(), 6, "carbon should lead");
+    assert_eq!(reordered.atoms[1].element.z(), 1);
+    assert!(
+        (reordered.atoms[0].position[0] - 0.1).abs() < 1e-12,
+        "C position follows"
+    );
+    assert!(
+        (reordered.atoms[1].position[0] - 2.1).abs() < 1e-12,
+        "H position follows"
+    );
+
+    // A composition mismatch is rejected rather than silently mismapped.
+    let wrong = Molecule::new(
+        vec![atom(8, [0.0, 0.0, 0.0]), atom(1, [2.0, 0.0, 0.0])],
+        0,
+        1,
+    );
+    assert!(reorder_product_onto_reactant(&reactant, &wrong, 1.3).is_err());
+}
+
+#[test]
 fn reaction_mode_seed_none_without_reaction_bonds() {
     let reactant = methyl([0.0, 0.0, 0.0]);
     let mut product = methyl([0.0, 0.0, 0.0]);

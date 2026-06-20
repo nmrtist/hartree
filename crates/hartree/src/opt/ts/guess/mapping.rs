@@ -1,21 +1,258 @@
 //! Reactant→product atom mapping. Tries an exact subgraph monomorphism (every
 //! reactant bond preserved — correct for additions/cycloadditions, which break no
-//! bonds), then falls back to a connectivity-signature heuristic.
+//! bonds); when a bond breaks and no embedding exists, falls back to a minimum-cost
+//! (Hungarian) assignment over a connectivity-signature-plus-geometry cost.
+//!
+//! The Hungarian fallback bootstraps in two passes: a signatures-only assignment gives a
+//! coarse correspondence used to Kabsch-align the reactant onto the product, then a
+//! second assignment over `signature + aligned-distance` cost refines it. Element
+//! mismatches are forbidden (a large finite penalty), and the geometry term is normalized
+//! so its *total* over an assignment stays below one signature shell — geometry therefore
+//! only breaks ties between connectivity-equivalent atoms and can never overturn a
+//! connectivity-better correspondence (see [`build_cost`]). A confidence/ambiguity
+//! diagnostic flags atoms that have an equal-cost alternative assignment (e.g. genuinely
+//! symmetric fragments geometry cannot disambiguate).
+//!
+//! The Kabsch step is a single *global* rigid fit. For a multi-fragment reactant whose
+//! fragments sit in arbitrary relative frames (they are assembled into a common frame only
+//! *after* mapping), that global fit cannot co-align the fragments, so the geometric
+//! tie-break is best-effort there; connectivity signatures still determine the
+//! correspondence, and the diagnostic reports the residual ambiguity.
 
 use std::collections::VecDeque;
 
+use super::hungarian;
+use crate::ext::kabsch::optimal_rotation;
+
 const SIGNATURE_SHELLS: usize = 3;
 
+/// Cost of pairing atoms of different elements: forbidden, but finite (the Hungarian
+/// solver does arithmetic on costs, so `f64::INFINITY` is unusable). Far larger than any
+/// realistic sum of signature + normalized-geometry costs, so a feasible same-element
+/// matching — guaranteed to exist when the element multisets agree, as the caller checks
+/// — never selects one.
+const ELEMENT_PENALTY: f64 = 1.0e6;
+
+/// Weight of one differing signature shell. The geometry term is normalized (in
+/// [`build_cost`]) so the *total* geometric contribution of any assignment is below `1`,
+/// strictly less than this; hence a single differing signature shell outranks every
+/// accumulated geometric difference, and geometry only ever breaks ties between
+/// assignments of equal total connectivity-signature cost.
+const SIGNATURE_WEIGHT: f64 = 10.0;
+
+/// Largest "no distinguishable alternative" cost gap: an off-assignment 2-swap whose
+/// total cost is within this of the chosen assignment marks both atoms ambiguous.
+const AMBIGUITY_TOL: f64 = 1.0e-6;
+
+/// Confidence/ambiguity diagnostic for a reactant→product atom map.
+#[derive(Debug, Clone)]
+pub struct MappingConfidence {
+    /// Fraction of atoms with no equal-cost alternative assignment, in `[0, 1]`: `1.0`
+    /// means every atom's correspondence is uniquely determined (by element, then
+    /// connectivity, then geometry); lower values mean some atoms are interchangeable.
+    /// A monomorphism (exact edge-preserving embedding) reports `1.0`.
+    pub confidence: f64,
+    /// Reactant atoms involved in a near-zero-cost feasible 2-swap — those whose mapped
+    /// product partner could be exchanged with another atom's at no cost increase (e.g.
+    /// symmetric hydrogens geometry does not separate). Empty for an unambiguous map.
+    pub ambiguous: Vec<usize>,
+}
+
+/// Map reactant atoms onto product atoms, returning the map (`map[r]` is the product
+/// atom for reactant atom `r`) and a [`MappingConfidence`] diagnostic. Prefers an exact
+/// subgraph monomorphism; falls back to the geometry-refined Hungarian assignment when a
+/// bond breaks.
 pub(super) fn atom_map(
     z_r: &[u32],
     adj_r: &[Vec<usize>],
+    pos_r: &[[f64; 3]],
     z_p: &[u32],
     adj_p: &[Vec<usize>],
-) -> Vec<usize> {
-    if let Some(m) = map_monomorphism(z_r, adj_r, z_p, adj_p) {
-        return m;
+    pos_p: &[[f64; 3]],
+) -> (Vec<usize>, MappingConfidence) {
+    if let Some(map) = map_monomorphism(z_r, adj_r, z_p, adj_p) {
+        // An exact edge-preserving embedding is topologically determined; report full
+        // confidence rather than a geometric swap diagnostic (which would second-guess a
+        // correct embedding on automorphic fragments).
+        return (
+            map,
+            MappingConfidence {
+                confidence: 1.0,
+                ambiguous: Vec::new(),
+            },
+        );
     }
-    atom_map_heuristic(z_r, adj_r, z_p, adj_p)
+    let sig_r = signatures(adj_r, z_r);
+    let sig_p = signatures(adj_p, z_p);
+    let map = hungarian_map(z_r, &sig_r, pos_r, z_p, &sig_p, pos_p);
+    let confidence = diagnose(z_r, &sig_r, pos_r, z_p, &sig_p, pos_p, &map);
+    (map, confidence)
+}
+
+/// Geometry-refined Hungarian assignment: a signatures-only pass seeds a Kabsch
+/// alignment, then a `signature + aligned-distance` pass refines the correspondence.
+fn hungarian_map(
+    z_r: &[u32],
+    sig_r: &[Vec<u64>],
+    pos_r: &[[f64; 3]],
+    z_p: &[u32],
+    sig_p: &[Vec<u64>],
+    pos_p: &[[f64; 3]],
+) -> Vec<usize> {
+    // Bootstrap: a connectivity-only assignment (no geometry).
+    let cost0 = build_cost(z_r, sig_r, z_p, sig_p, None);
+    let map0 = hungarian::solve(&cost0);
+
+    // Refine: align the reactant onto the product under the bootstrap map, then re-solve
+    // with the aligned-distance tie-break folded in.
+    let aligned = align_by_map(pos_r, pos_p, &map0);
+    let cost1 = build_cost(z_r, sig_r, z_p, sig_p, Some((&aligned, pos_p)));
+    hungarian::solve(&cost1)
+}
+
+/// The `(aligned-reactant, product)` positions supplying the geometric tie-break term in
+/// [`build_cost`]; `None` selects a signatures-only cost.
+type Geometry<'a> = (&'a [[f64; 3]], &'a [[f64; 3]]);
+
+/// The `n×n` assignment cost. Cross-element pairs cost [`ELEMENT_PENALTY`]; same-element
+/// pairs cost `SIGNATURE_WEIGHT · (differing shells)` plus, when `geometry` is supplied, a
+/// squared aligned-distance tie-break.
+///
+/// The geometry term is normalized by `(max same-element d² + 1) · n` so each cell is in
+/// `[0, 1/n)` and the **whole** geometry sum an assignment can carry is `< 1` — strictly
+/// less than one [`SIGNATURE_WEIGHT`]. The Hungarian solver minimizes the *total* cost, so
+/// this per-`n` normalization (not a per-cell one) is what guarantees a single differing
+/// signature shell outranks *any* accumulated geometric difference across all `n` atoms:
+/// geometry can only ever break ties between assignments of equal total signature cost,
+/// never overturn a connectivity-better correspondence.
+fn build_cost(
+    z_r: &[u32],
+    sig_r: &[Vec<u64>],
+    z_p: &[u32],
+    sig_p: &[Vec<u64>],
+    geometry: Option<Geometry>,
+) -> Vec<Vec<f64>> {
+    let n = z_r.len();
+    // Normalizer for the geometry term: the largest same-element squared distance, plus
+    // one (so a single cell is < 1), times n (so the SUM over a matching is < 1). The
+    // total geometry contribution is therefore strictly below one SIGNATURE_WEIGHT.
+    let norm = geometry
+        .map(|(ar, pp)| {
+            let mut max_d2 = 0.0f64;
+            for i in 0..n {
+                for j in 0..n {
+                    if z_r[i] == z_p[j] {
+                        max_d2 = max_d2.max(dist2(ar[i], pp[j]));
+                    }
+                }
+            }
+            (max_d2 + 1.0) * n.max(1) as f64
+        })
+        .unwrap_or(1.0);
+
+    let mut cost = vec![vec![0.0f64; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            cost[i][j] = if z_r[i] != z_p[j] {
+                ELEMENT_PENALTY
+            } else {
+                let sig = SIGNATURE_WEIGHT * signature_cost(&sig_r[i], &sig_p[j]) as f64;
+                let geo = geometry.map_or(0.0, |(ar, pp)| dist2(ar[i], pp[j]) / norm);
+                sig + geo
+            };
+        }
+    }
+    cost
+}
+
+/// Rigidly Kabsch-align the reactant positions onto the product positions permuted by
+/// `map` (`target[i] = pos_p[map[i]]`), returning the aligned reactant in the product
+/// frame. Used only to score a geometric tie-break, so a rough fit suffices.
+fn align_by_map(pos_r: &[[f64; 3]], pos_p: &[[f64; 3]], map: &[usize]) -> Vec<[f64; 3]> {
+    let n = pos_r.len();
+    let target: Vec<[f64; 3]> = (0..n).map(|i| pos_p[map[i]]).collect();
+    let cr = centroid(pos_r);
+    let ct = centroid(&target);
+    let pc: Vec<[f64; 3]> = pos_r.iter().map(|a| sub(*a, cr)).collect();
+    let tc: Vec<[f64; 3]> = target.iter().map(|a| sub(*a, ct)).collect();
+    let rot = optimal_rotation(&pc, &tc);
+    pc.iter()
+        .map(|a| {
+            let r = matvec(&rot, *a);
+            [r[0] + ct[0], r[1] + ct[1], r[2] + ct[2]]
+        })
+        .collect()
+}
+
+/// The confidence/ambiguity diagnostic for `map`: builds the final `signature + geometry`
+/// cost (aligned under `map`) and flags every atom that has a feasible, no-cost-increase
+/// 2-swap of its assignment.
+fn diagnose(
+    z_r: &[u32],
+    sig_r: &[Vec<u64>],
+    pos_r: &[[f64; 3]],
+    z_p: &[u32],
+    sig_p: &[Vec<u64>],
+    pos_p: &[[f64; 3]],
+    map: &[usize],
+) -> MappingConfidence {
+    let n = map.len();
+    if n == 0 {
+        return MappingConfidence {
+            confidence: 1.0,
+            ambiguous: Vec::new(),
+        };
+    }
+    let aligned = align_by_map(pos_r, pos_p, map);
+    let cost = build_cost(z_r, sig_r, z_p, sig_p, Some((&aligned, pos_p)));
+
+    let mut ambiguous = vec![false; n];
+    for i in 0..n {
+        for k in (i + 1)..n {
+            let (ji, jk) = (map[i], map[k]);
+            let current = cost[i][ji] + cost[k][jk];
+            let swapped = cost[i][jk] + cost[k][ji];
+            // A feasible (same-element, finite) swap that does not raise the total cost
+            // means atoms i and k are interchangeable under this map.
+            if swapped < ELEMENT_PENALTY && swapped - current < AMBIGUITY_TOL {
+                ambiguous[i] = true;
+                ambiguous[k] = true;
+            }
+        }
+    }
+    let amb: Vec<usize> = (0..n).filter(|&i| ambiguous[i]).collect();
+    MappingConfidence {
+        confidence: (n - amb.len()) as f64 / n as f64,
+        ambiguous: amb,
+    }
+}
+
+fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    d[0] * d[0] + d[1] * d[1] + d[2] * d[2]
+}
+
+fn centroid(points: &[[f64; 3]]) -> [f64; 3] {
+    let mut c = [0.0; 3];
+    for p in points {
+        for k in 0..3 {
+            c[k] += p[k];
+        }
+    }
+    let inv = 1.0 / points.len().max(1) as f64;
+    [c[0] * inv, c[1] * inv, c[2] * inv]
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn matvec(r: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    [
+        r[0][0] * v[0] + r[0][1] * v[1] + r[0][2] * v[2],
+        r[1][0] * v[0] + r[1][1] * v[1] + r[1][2] * v[2],
+        r[2][0] * v[0] + r[2][1] * v[1] + r[2][2] * v[2],
+    ]
 }
 
 /// An injective, element-respecting, edge-preserving map from the reactant graph
@@ -101,81 +338,6 @@ fn connected_order(adj: &[Vec<usize>]) -> Vec<usize> {
     order
 }
 
-/// Fallback for bond-breaking reactions: match heavy atoms by connectivity
-/// signature, then attach each hydrogen to a product H on its mapped heavy neighbour.
-fn atom_map_heuristic(
-    z_r: &[u32],
-    adj_r: &[Vec<usize>],
-    z_p: &[u32],
-    adj_p: &[Vec<usize>],
-) -> Vec<usize> {
-    let n = z_r.len();
-    let sig_r = signatures(adj_r, z_r);
-    let sig_p = signatures(adj_p, z_p);
-
-    let mut map = vec![usize::MAX; n];
-    let mut used = vec![false; n];
-
-    let mut pairs: Vec<(usize, usize, usize)> = Vec::new();
-    for i in 0..n {
-        if z_r[i] == 1 {
-            continue;
-        }
-        for j in 0..n {
-            if z_p[j] == z_r[i] {
-                pairs.push((signature_cost(&sig_r[i], &sig_p[j]), i, j));
-            }
-        }
-    }
-    pairs.sort_by_key(|&(c, _, _)| c);
-    for (_, i, j) in pairs {
-        if map[i] == usize::MAX && !used[j] {
-            map[i] = j;
-            used[j] = true;
-        }
-    }
-
-    for hp_center in 0..n {
-        if z_r[hp_center] == 1 {
-            continue;
-        }
-        let img = map[hp_center];
-        if img == usize::MAX {
-            continue;
-        }
-        let r_hydrogens: Vec<usize> = adj_r[hp_center]
-            .iter()
-            .copied()
-            .filter(|&k| z_r[k] == 1 && map[k] == usize::MAX)
-            .collect();
-        let mut p_hydrogens: Vec<usize> = adj_p[img]
-            .iter()
-            .copied()
-            .filter(|&k| z_p[k] == 1 && !used[k])
-            .collect();
-        for r_h in r_hydrogens {
-            if let Some(p_h) = p_hydrogens.pop() {
-                map[r_h] = p_h;
-                used[p_h] = true;
-            }
-        }
-    }
-
-    for i in 0..n {
-        if map[i] != usize::MAX {
-            continue;
-        }
-        let best = (0..n)
-            .filter(|&j| !used[j] && z_p[j] == z_r[i])
-            .min_by_key(|&j| signature_cost(&sig_r[i], &sig_p[j]));
-        if let Some(j) = best {
-            map[i] = j;
-            used[j] = true;
-        }
-    }
-    map
-}
-
 /// Per atom, a Morgan-style label per shell, folding in larger neighbourhoods.
 fn signatures(adj: &[Vec<usize>], z: &[u32]) -> Vec<Vec<u64>> {
     let n = z.len();
@@ -216,92 +378,4 @@ fn signature_cost(a: &[u64], b: &[u64]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Ethane reactant (C0–C1 bonded, each C carrying three H) in one atom order,
-    /// versus a product of two separated methyls (no C–C bond) in a different order.
-    // Returns the two `(z, adj)` graphs; a named type would obscure more than it clarifies.
-    #[allow(clippy::type_complexity)]
-    fn ethane_vs_two_methyls() -> (Vec<u32>, Vec<Vec<usize>>, Vec<u32>, Vec<Vec<usize>>) {
-        let z_r = vec![6, 6, 1, 1, 1, 1, 1, 1];
-        let adj_r = vec![
-            vec![1, 2, 3, 4],
-            vec![0, 5, 6, 7],
-            vec![0],
-            vec![0],
-            vec![0],
-            vec![1],
-            vec![1],
-            vec![1],
-        ];
-        let z_p = vec![6, 1, 1, 1, 6, 1, 1, 1];
-        let adj_p = vec![
-            vec![1, 2, 3],
-            vec![0],
-            vec![0],
-            vec![0],
-            vec![5, 6, 7],
-            vec![4],
-            vec![4],
-            vec![4],
-        ];
-        (z_r, adj_r, z_p, adj_p)
-    }
-
-    #[test]
-    fn map_monomorphism_fails_when_a_bond_breaks() {
-        let (z_r, adj_r, z_p, adj_p) = ethane_vs_two_methyls();
-        // The reactant C–C edge cannot embed into a product with no C–C bond.
-        assert!(map_monomorphism(&z_r, &adj_r, &z_p, &adj_p).is_none());
-    }
-
-    #[test]
-    fn atom_map_falls_back_to_total_injective_heuristic() {
-        let (z_r, adj_r, z_p, adj_p) = ethane_vs_two_methyls();
-        let map = atom_map(&z_r, &adj_r, &z_p, &adj_p);
-        assert_eq!(map.len(), 8);
-
-        let mut seen = [false; 8];
-        for (r, &p) in map.iter().enumerate() {
-            // TOTAL: every reactant atom got a real product slot.
-            assert!(p < 8, "reactant atom {r} left unassigned (map[{r}]={p})");
-            // INJECTIVE: no product atom is reused.
-            assert!(!seen[p], "product atom {p} mapped from two reactant atoms");
-            seen[p] = true;
-            // element-respecting.
-            assert_eq!(z_r[r], z_p[p], "element mismatch at reactant atom {r}");
-        }
-    }
-
-    #[test]
-    fn map_monomorphism_succeeds_without_bond_breaking() {
-        // Reactant = a single methyl, embedded as a subgraph of a product methyl
-        // (with one extra spectator atom) preserving every reactant bond.
-        let z_r = vec![6, 1, 1, 1];
-        let adj_r = vec![vec![1, 2, 3], vec![0], vec![0], vec![0]];
-        // Product: methyl on atoms 0..4 plus a detached spectator C at index 4.
-        let z_p = vec![6, 1, 1, 1, 6];
-        let adj_p = vec![vec![1, 2, 3], vec![0], vec![0], vec![0], vec![]];
-
-        let map = map_monomorphism(&z_r, &adj_r, &z_p, &adj_p).expect("subgraph embeds");
-        assert_eq!(map.len(), 4);
-
-        let mut seen = [false; 5];
-        for (r, &p) in map.iter().enumerate() {
-            assert!(p < 5, "reactant atom {r} unassigned");
-            assert!(!seen[p], "product atom {p} mapped twice");
-            seen[p] = true;
-            assert_eq!(z_r[r], z_p[p], "element mismatch at reactant atom {r}");
-        }
-        // Edge preservation: the reactant C maps to a product atom whose neighbours
-        // include all three mapped H images.
-        let c_img = map[0];
-        for &h in &adj_r[0] {
-            assert!(
-                adj_p[c_img].contains(&map[h]),
-                "reactant bond 0-{h} not preserved under the embedding"
-            );
-        }
-    }
-}
+mod tests;

@@ -317,6 +317,52 @@ fn rejects_bad_endpoints() {
     assert!(matches!(err, NebError::BadEndpoints(_)), "got {err:?}");
 }
 
+/// A surface with a simple constant tilt, so a band relaxes with a well-defined gradient
+/// (no degenerate zero forces) — used to check endpoint handling, not convergence.
+struct Tilt;
+impl Surface for Tilt {
+    fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
+        Ok(x[0][0])
+    }
+    fn analytic_gradient(&mut self, x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
+        let mut g = vec![[0.0; 3]; x.len()];
+        g[0][0] = 1.0;
+        Some(Ok(g))
+    }
+}
+
+#[test]
+fn map_atoms_relaxes_the_identical_ordering_requirement() {
+    use crate::opt::ts::NebError;
+    let c = |x: f64| Atom::new(Element::from_z(6).unwrap(), [x, 0.0, 0.0]);
+    let h = |x: f64| Atom::new(Element::from_z(1).unwrap(), [x, 0.0, 0.0]);
+
+    // Reactant order [C, H]; the product is listed in the opposite order [H, C].
+    let reactant = Molecule::new(vec![c(0.0), h(2.0)], 0, 1);
+    let product = Molecule::new(vec![h(2.2), c(0.1)], 0, 1);
+
+    let mut opts = NebOptions::default();
+    opts.n_images = 3;
+
+    // Without atom mapping the mismatched element order is rejected.
+    let mut surface = Tilt;
+    let err = find_minimum_energy_path(&reactant, &product, &mut surface, &opts, None).unwrap_err();
+    assert!(matches!(err, NebError::BadEndpoints(_)), "got {err:?}");
+
+    // With it, the product is permuted onto the reactant order and the band is built.
+    opts.map_atoms = true;
+    let mut surface = Tilt;
+    let result = find_minimum_energy_path(&reactant, &product, &mut surface, &opts, None)
+        .expect("mapped endpoints accepted");
+    // The product endpoint (last image, fixed) is now in [C, H] order: carbon at index 0
+    // carries the product carbon's position (0.1), not the hydrogen's.
+    let product_image = result.images.last().expect("a product endpoint");
+    assert!(
+        (product_image[0][0] - 0.1).abs() < 1e-9,
+        "carbon not reordered to index 0: {product_image:?}"
+    );
+}
+
 #[test]
 fn options_serde_round_trip_and_defaults() {
     // Full round-trip.

@@ -11,12 +11,15 @@
 
 mod assembly;
 pub(in crate::opt::ts) mod band;
+mod hungarian;
 mod idpp;
 mod mapping;
 mod scan;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use mapping::MappingConfidence;
 
 use crate::core::Molecule;
 use crate::core::units::ANGSTROM_TO_BOHR;
@@ -37,11 +40,13 @@ pub enum BondChange {
 /// A bond that changes across the reaction. Indices are into the guess molecule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReactionBond {
+    /// The two atom indices (into the guess molecule) joined by this bond.
     pub atoms: (usize, usize),
     /// Separation in the assembled reactant endpoint, Bohr.
     pub reactant_distance: f64,
     /// Separation in the product, Bohr.
     pub product_distance: f64,
+    /// Whether the bond forms or breaks across the reaction.
     pub kind: BondChange,
 }
 
@@ -55,6 +60,7 @@ pub struct GuessOptions {
     /// How far (Bohr) to pull fragments apart when assembling the reactant
     /// endpoint. Ignored for a single-fragment reactant.
     pub separation: f64,
+    /// Maximum IDPP relaxation iterations per image.
     pub idpp_max_iter: usize,
     /// IDPP convergence: largest objective-gradient component.
     pub idpp_tol: f64,
@@ -85,6 +91,9 @@ pub struct TsGuess {
     pub molecule: Molecule,
     /// `atom_map[r]` is the product atom corresponding to reactant atom `r`.
     pub atom_map: Vec<usize>,
+    /// Confidence/ambiguity diagnostic for [`atom_map`](Self::atom_map): how uniquely the
+    /// reactant→product correspondence was determined. See [`MappingConfidence`].
+    pub mapping_confidence: MappingConfidence,
     pub reaction_coordinate: Vec<ReactionBond>,
     /// The minimum-energy-path tangent at the guess, one (unit) Cartesian vector per
     /// atom, set only by [`build_ts_guess_scanned`] (the energy-peaked scan). `None` for
@@ -180,6 +189,7 @@ struct Assembly {
     /// product position of the atom mapped to reactant atom `r`).
     prod_in_r: Vec<[f64; 3]>,
     atom_map: Vec<usize>,
+    mapping_confidence: MappingConfidence,
     reaction_coordinate: Vec<ReactionBond>,
 }
 
@@ -223,7 +233,7 @@ fn assemble(
     let adj_r = fragment_adjacency(&reactant, &fragment_id, options.bond_factor);
     let adj_p = adjacency(product, options.bond_factor);
 
-    let map = mapping::atom_map(&z_r, &adj_r, &z_p, &adj_p);
+    let (map, mapping_confidence) = mapping::atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
     let prod_in_r: Vec<[f64; 3]> = (0..n).map(|i| pos_p[map[i]]).collect();
 
     let aligned = assembly::align_fragments(&pos_r, &prod_in_r, &fragment_id);
@@ -242,8 +252,41 @@ fn assemble(
         reactant_endpoint,
         prod_in_r,
         atom_map: map,
+        mapping_confidence,
         reaction_coordinate,
     })
+}
+
+/// Reorder `product`'s atoms into `reactant`'s order by mapping atoms across the
+/// reaction (the same [`mapping::atom_map`] the guess builder uses), returning the
+/// reordered product molecule (product atoms and positions permuted so atom `r` matches
+/// reactant atom `r`). Lets a chain-of-states driver accept two endpoints whose atoms are
+/// not already in a common order.
+///
+/// # Errors
+/// [`GuessError`] if the two molecules disagree on atom count or element composition.
+pub(in crate::opt::ts) fn reorder_product_onto_reactant(
+    reactant: &Molecule,
+    product: &Molecule,
+    bond_factor: f64,
+) -> Result<Molecule, GuessError> {
+    let n = reactant.len();
+    if n != product.len() {
+        return Err(GuessError::AtomCountMismatch {
+            reactant: n,
+            product: product.len(),
+        });
+    }
+    check_composition(reactant, product)?;
+    let z_r: Vec<u32> = reactant.atoms.iter().map(|a| a.element.z()).collect();
+    let z_p: Vec<u32> = product.atoms.iter().map(|a| a.element.z()).collect();
+    let pos_r: Vec<[f64; 3]> = reactant.atoms.iter().map(|a| a.position).collect();
+    let pos_p: Vec<[f64; 3]> = product.atoms.iter().map(|a| a.position).collect();
+    let adj_r = adjacency(reactant, bond_factor);
+    let adj_p = adjacency(product, bond_factor);
+    let (map, _confidence) = mapping::atom_map(&z_r, &adj_r, &pos_r, &z_p, &adj_p, &pos_p);
+    let atoms = (0..n).map(|r| product.atoms[map[r]]).collect();
+    Ok(Molecule::new(atoms, product.charge, product.multiplicity))
 }
 
 /// Place `positions` onto a copy of `template`'s atoms (same elements/charge/multiplicity,
@@ -279,6 +322,7 @@ pub fn build_ts_guess(
     Ok(TsGuess {
         molecule: with_positions(&assembled.reactant, &guess_pos),
         atom_map: assembled.atom_map,
+        mapping_confidence: assembled.mapping_confidence,
         reaction_coordinate: assembled.reaction_coordinate,
         reaction_tangent: None,
     })
@@ -361,6 +405,7 @@ pub fn build_ts_guess_scanned<S: Surface>(
     Ok(TsGuess {
         molecule: with_positions(&assembled.reactant, &peak.geometry),
         atom_map: assembled.atom_map,
+        mapping_confidence: assembled.mapping_confidence,
         reaction_coordinate: assembled.reaction_coordinate,
         reaction_tangent: Some(peak.tangent),
     })
