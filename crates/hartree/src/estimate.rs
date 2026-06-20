@@ -2,7 +2,9 @@
 //!
 //! [`estimate_memory`] derives the dominant dense allocations a job will make —
 //! the in-core ERI tensor, the density-fitted `B` tensor, the post-HF amplitude
-//! blocks, and the DFT grid — **without** running the SCF or allocating any of
+//! blocks, the DFT grid, and — for a transition-state (`--ts`) search — the dense
+//! Hessian and the concurrent SCF working sets of its parallel finite-difference
+//! Hessian build — **without** running the SCF or allocating any of
 //! them. It builds only the cheap pre-SCF objects (the AO/auxiliary basis and,
 //! for DFT, the integration grid) that [`Job::run`] would build anyway, reads
 //! their sizes, and applies the same per-backend scaling the run path uses.
@@ -191,6 +193,13 @@ pub fn estimate_memory(job: &Job) -> Result<MemoryEstimate, String> {
         _ => {}
     }
 
+    // A transition-state search (`--ts`) carries dense terms on top of the single SCF
+    // modeled above — and during its parallel finite-difference Hessian holds several
+    // SCF working sets at once, so the Hessian phase, not the SCF, is usually the peak.
+    if opts.transition_state {
+        add_transition_state_terms(&mut terms, mol);
+    }
+
     terms.sort_by_key(|t| std::cmp::Reverse(t.bytes));
     let peak_bytes = terms
         .iter()
@@ -252,6 +261,49 @@ fn add_ccsd_terms(terms: &mut Vec<MemoryTerm>, n: u128, o: u128, v: u128) {
     ));
 }
 
+/// Transition-state (`--ts`) memory terms, added on top of the single-SCF estimate. A
+/// saddle search maintains a dense Cartesian Hessian and diagonalizes its
+/// mass-weighted, translation/rotation-projected form each step, and builds the
+/// Hessian by finite difference — `2·ndof` displaced SCF+gradient evaluations run
+/// concurrently ([`crate::HfSurface`]'s parallel Hessian), each holding its own
+/// backend working set. `terms` must already hold the per-evaluation SCF (and any
+/// DFT-grid) terms; the concurrent-Hessian cost reuses their sum, captured *before*
+/// the dense Hessian terms are appended so it reflects one gradient evaluation.
+fn add_transition_state_terms(terms: &mut Vec<MemoryTerm>, mol: &Molecule) {
+    let ndof = 3 * mol.atoms.len() as u128;
+
+    // Per-evaluation SCF/DFT working set — everything modeled so far (a saddle search
+    // runs HF/DFT only, so no post-HF terms are present).
+    let scf_working_set = terms
+        .iter()
+        .map(|t| t.bytes)
+        .fold(0u64, u64::saturating_add);
+
+    // Dense Cartesian Hessian carried through the search (the maintained quasi-Newton
+    // Hessian and a freshly finite-differenced one are the same size): 9·natom² doubles.
+    terms.extend(term("ts_hessian", ndof * ndof));
+    // Projected-Hessian eigendecomposition scratch (numerics::mw_projected_hessian +
+    // linalg::symmetric_eigh): the mass-weighted copy, the trans/rot projector, their
+    // product, and the eigenvector matrix — a few ndof² dense matrices.
+    terms.extend(term("ts_eigensolver_scratch", 4 * ndof * ndof));
+
+    // Parallel finite-difference Hessian: up to `2·ndof` displaced evaluations, each
+    // rebuilding the backend working set; the number live at once is bounded by the
+    // rayon thread pool, so model min(2·ndof, threads) concurrent copies — usually the
+    // peak of a `--ts` run.
+    let threads = rayon::current_num_threads().max(1) as u128;
+    let concurrency = (2 * ndof).min(threads);
+    let concurrent = (scf_working_set as u128)
+        .saturating_mul(concurrency)
+        .min(u64::MAX as u128) as u64;
+    if concurrent > 0 {
+        terms.push(MemoryTerm {
+            label: "ts_fd_hessian_concurrency".to_string(),
+            bytes: concurrent,
+        });
+    }
+}
+
 /// Build an auxiliary basis for `mol` and return its function count as `u128`.
 fn aux_naux(name: &str, mol: &Molecule) -> Result<u128, String> {
     Ok(BasisSet::load_aux(name)
@@ -296,118 +348,5 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::JobOptions;
-    use crate::core::{Atom, Element};
-
-    fn water() -> Molecule {
-        let atoms = vec![
-            Atom::new(Element::from_symbol("O").unwrap(), [0.0, 0.0, 0.0]),
-            Atom::new(Element::from_symbol("H").unwrap(), [0.0, 0.757, 0.587]),
-            Atom::new(Element::from_symbol("H").unwrap(), [0.0, -0.757, 0.587]),
-        ];
-        Molecule::new(atoms, 0, 1)
-    }
-
-    fn job(method: Method, opts: JobOptions) -> Job {
-        Job {
-            molecule: water(),
-            basis: "sto-3g".to_string(),
-            method,
-            options: opts,
-        }
-    }
-
-    #[test]
-    fn doubles_saturates() {
-        assert_eq!(doubles(0), 0);
-        assert_eq!(doubles(10), 80);
-        assert_eq!(doubles(u128::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn human_bytes_scales() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.00 KiB");
-        assert_eq!(human_bytes(1024 * 1024), "1.00 MiB");
-    }
-
-    #[test]
-    fn term_drops_zero() {
-        assert!(term("x", 0).is_none());
-        assert_eq!(term("x", 1).unwrap().bytes, 8);
-    }
-
-    #[test]
-    fn conventional_hf_dominated_by_eri() {
-        // Water/STO-3G has 7 AOs: the ERI tensor is 7⁴·8 bytes.
-        let est = estimate_memory(&job(Method::Rhf, JobOptions::default())).unwrap();
-        assert_eq!(est.backend, EstimateBackend::Conventional);
-        let eri = est
-            .breakdown
-            .iter()
-            .find(|t| t.label == "eri_in_core")
-            .unwrap();
-        assert_eq!(eri.bytes, 7u64.pow(4) * 8);
-        // peak_bytes is the sum of the breakdown, and the breakdown is sorted.
-        let sum: u64 = est.breakdown.iter().map(|t| t.bytes).sum();
-        assert_eq!(est.peak_bytes, sum);
-        assert!(est.breakdown.windows(2).all(|w| w[0].bytes >= w[1].bytes));
-    }
-
-    #[test]
-    fn mp2_adds_correlation_terms() {
-        let hf = estimate_memory(&job(Method::Rhf, JobOptions::default())).unwrap();
-        let mp2 = estimate_memory(&job(Method::Mp2, JobOptions::default())).unwrap();
-        assert!(mp2.peak_bytes > hf.peak_bytes);
-        assert!(mp2.breakdown.iter().any(|t| t.label == "mp2_mo_integrals"));
-        assert!(
-            mp2.breakdown
-                .iter()
-                .any(|t| t.label == "mp2_transform_scratch")
-        );
-    }
-
-    #[test]
-    fn direct_backend_has_no_eri() {
-        let opts = JobOptions {
-            direct: true,
-            ..JobOptions::default()
-        };
-        let est = estimate_memory(&job(Method::Rhf, opts)).unwrap();
-        assert_eq!(est.backend, EstimateBackend::Direct);
-        assert!(!est.breakdown.iter().any(|t| t.label == "eri_in_core"));
-        assert!(est.breakdown.iter().any(|t| t.label == "schwarz_table"));
-    }
-
-    #[test]
-    fn ri_backend_reports_fitted_tensor() {
-        let opts = JobOptions {
-            ri: true,
-            ..JobOptions::default()
-        };
-        let est = estimate_memory(&job(Method::Rhf, opts)).unwrap();
-        assert_eq!(est.backend, EstimateBackend::Ri);
-        assert!(est.breakdown.iter().any(|t| t.label == "df_b_tensor"));
-    }
-
-    #[test]
-    fn unknown_basis_errors() {
-        let j = Job {
-            molecule: water(),
-            basis: "not-a-basis".to_string(),
-            method: Method::Rhf,
-            options: JobOptions::default(),
-        };
-        assert!(estimate_memory(&j).is_err());
-    }
-
-    #[test]
-    fn estimate_is_serde_round_trippable() {
-        let est = estimate_memory(&job(Method::Rhf, JobOptions::default())).unwrap();
-        let json = serde_json::to_string(&est).unwrap();
-        let back: MemoryEstimate = serde_json::from_str(&json).unwrap();
-        assert_eq!(est, back);
-    }
-}
+#[path = "estimate_tests.rs"]
+mod tests;
