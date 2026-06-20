@@ -11,6 +11,7 @@
 
 mod assembly;
 pub(in crate::opt::ts) mod band;
+mod coord_scan;
 mod hungarian;
 mod idpp;
 mod mapping;
@@ -19,6 +20,7 @@ mod scan;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use coord_scan::{CoordPeak, CoordScanError, CoordScanOptions, coord_scan_peak};
 pub use mapping::MappingConfidence;
 
 use crate::core::Molecule;

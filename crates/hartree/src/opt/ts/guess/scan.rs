@@ -119,7 +119,7 @@ pub(super) fn scan_peak<S: Surface>(
 /// triple (no distinct maximum to interpolate). For a genuine bracketed maximum
 /// (`y1 ≥ y0, y2`) the unclamped vertex already lies within `±h/2`; the clamp only
 /// guards a near-degenerate denominator.
-fn parabola_vertex(x1: f64, h: f64, y0: f64, y1: f64, y2: f64) -> f64 {
+pub(super) fn parabola_vertex(x1: f64, h: f64, y0: f64, y1: f64, y2: f64) -> f64 {
     let denom = y0 - 2.0 * y1 + y2;
     if denom.abs() < 1e-15 {
         return x1;
@@ -130,7 +130,7 @@ fn parabola_vertex(x1: f64, h: f64, y0: f64, y1: f64, y2: f64) -> f64 {
 
 /// Normalize a per-atom vector field in place; returns `false` (leaving it unchanged) if
 /// its norm is below a small threshold.
-fn normalize(v: &mut [[f64; 3]]) -> bool {
+pub(super) fn normalize(v: &mut [[f64; 3]]) -> bool {
     let norm = v.iter().flatten().map(|c| c * c).sum::<f64>().sqrt();
     if norm < 1e-12 {
         return false;

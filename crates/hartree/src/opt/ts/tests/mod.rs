@@ -13,6 +13,7 @@ mod convergence;
 mod diagnostics;
 mod dimer;
 mod hessian_init;
+mod internal_coords;
 mod irc;
 mod linear;
 mod neb;
@@ -21,6 +22,7 @@ mod restricted_step;
 mod robustness;
 mod saddle;
 mod seed;
+mod stall;
 mod verify_hessian;
 
 /// A bent, non-collinear arrangement of three identical atoms (Bohr). Equal

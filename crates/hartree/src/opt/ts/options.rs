@@ -62,6 +62,34 @@ pub enum VerifyHessian {
     Auto,
 }
 
+/// Which coordinate frame the P-RFO climb takes its steps in — **P-RFO only** (the
+/// dimer method discovers its own translation direction and ignores this).
+///
+/// [`MassWeighted`](Coordinates::MassWeighted) (the default) climbs in mass-weighted
+/// Cartesian coordinates with the rigid-body modes projected out — the same frame the
+/// imaginary-frequency criterion lives in, and the historical behaviour.
+/// [`Internal`](Coordinates::Internal) climbs in redundant internal coordinates
+/// (bonds and valence angles, with disconnected fragments bridged so a
+/// forming/breaking bond is represented). Internal coordinates condition a soft
+/// reaction coordinate — a long symmetric stretch, a floppy angle — that a Cartesian
+/// step sizes poorly, at the cost of an iterative back-transformation per step. The
+/// maintained Hessian, its quasi-Newton update, the convergence test, and the
+/// post-convergence saddle verification are identical either way; only the step
+/// direction and length differ. When the generated internal set cannot span the
+/// molecule's internal space, the search transparently falls back to the mass-weighted
+/// Cartesian frame. `#[non_exhaustive]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Coordinates {
+    /// Mass-weighted Cartesian coordinates, rigid-body modes projected out (the
+    /// historical frame, byte-for-byte unchanged).
+    #[default]
+    MassWeighted,
+    /// Redundant internal coordinates (bonds + valence angles), with a Cartesian
+    /// fallback when the set is incomplete.
+    Internal,
+}
+
 /// How the saddle search builds the **initial** climbing Hessian — **P-RFO only**
 /// (the dimer is Hessian-free).
 ///
@@ -139,6 +167,27 @@ pub struct TsOptions {
     /// Dimer only: half-separation between the two dimer images (atomic units)
     /// used to finite-difference the curvature along the dimer axis.
     pub dimer_delta: f64,
+
+    /// P-RFO only: refresh the maintained (Bofill) Hessian from finite differences
+    /// once the trans/rot-projected force has failed to improve for this many
+    /// consecutive accepted steps — a recovery aid for **soft, floppy surfaces**.
+    ///
+    /// On a rugged low-curvature surface (an intramolecular hydrogen transfer, a
+    /// large-amplitude floppy mode) the quasi-Newton update can settle into spurious
+    /// curvatures inherited from a far-from-saddle initial Hessian and never shed
+    /// them, so the climb plateaus far from convergence and exhausts
+    /// [`max_iter`](Self::max_iter). A single fresh finite-difference Hessian sheds the
+    /// spurious modes and restores descent; this triggers one when the force stalls,
+    /// and re-arms only after the next non-improving streak (so it cannot storm).
+    /// Unlike [`recalc_hessian`](Self::recalc_hessian)'s fixed cadence, this spends the
+    /// extra ≈6N-gradient Hessians *only* when the climb is actually stuck, leaving a
+    /// well-behaved search untouched.
+    ///
+    /// `0` (the default) disables it: the climb is byte-for-byte the historical
+    /// Bofill-maintained search, so the shipped default path is unchanged. A typical
+    /// enabled value is `5`. The dimer method (Hessian-free) ignores it.
+    #[serde(default = "default_stall_refresh")]
+    pub stall_refresh: usize,
 
     /// A mode counts as negative (the reaction coordinate) when its eigenvalue
     /// `λ < -negative_mode_tol`, where `λ` is an eigenvalue of the
@@ -238,12 +287,27 @@ pub struct TsOptions {
     /// surfaces (which offer none) are unaffected. The dimer ignores it.
     #[serde(default)]
     pub hessian_init: HessianInit,
+
+    /// P-RFO only: which coordinate frame the climb steps in (see [`Coordinates`]).
+    /// The default [`MassWeighted`](Coordinates::MassWeighted) reproduces the
+    /// historical mass-weighted Cartesian search exactly;
+    /// [`Internal`](Coordinates::Internal) steps in redundant internal coordinates for
+    /// better conditioning of soft reaction coordinates. The dimer ignores it.
+    #[serde(default)]
+    pub coordinates: Coordinates,
 }
 
 /// Default step-retry budget (see [`TsOptions::max_step_retries`]); also the serde
 /// default so options serialized before the field round-trip unchanged.
 fn default_max_step_retries() -> usize {
     6
+}
+
+/// Default stalled-Hessian refresh window (see [`TsOptions::stall_refresh`]); `0`
+/// disables the aid, reproducing the historical climb. Also the serde default so
+/// options serialized before the field existed round-trip unchanged.
+fn default_stall_refresh() -> usize {
+    0
 }
 
 /// Serde/`Default` values for the IRC controls, so options serialized before these
@@ -293,6 +357,7 @@ impl Default for TsOptions {
             follow_mode: 0,
             recalc_hessian: 0,
             dimer_delta: 1e-2,
+            stall_refresh: default_stall_refresh(),
             negative_mode_tol: 1e-5,
             confirm_irc: false,
             max_step_retries: default_max_step_retries(),
@@ -304,6 +369,7 @@ impl Default for TsOptions {
             max_recover: default_max_recover(),
             verify_hessian: VerifyHessian::Strict,
             hessian_init: HessianInit::Auto,
+            coordinates: Coordinates::default(),
         }
     }
 }

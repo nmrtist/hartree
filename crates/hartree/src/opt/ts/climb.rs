@@ -8,10 +8,10 @@
 //! control flow that calls it. A climb reports only *geometric* outcomes through
 //! [`ClimbStop`] — the saddle verification and IRC live in [`super::prfo`].
 
+use super::frame::Frame;
 use super::numerics::{
-    add_step, column, disp_norms, fd_hessian, flatten, force_norms, gradient, mass_weight_grad,
-    mw_projected_hessian, non_null_modes, norm, overlap, predicted_change_cart,
-    projected_force_norms, unmass_weight_step,
+    add_step, column, disp_norms, fd_hessian, flatten, force_norms, gradient, non_null_modes, norm,
+    overlap, predicted_change_cart, projected_force_norms,
 };
 use super::step::{bofill_update, is_pathological, prfo_step, select_followed, update_trust_ts};
 use super::{Flow, HessianInit, Progress, TsError, TsOptions};
@@ -20,6 +20,14 @@ use crate::opt::{OptError, OptStep, Surface};
 /// Overlap with the previously followed eigenvector below which mode tracking is
 /// taken to have failed (and the Hessian is recomputed).
 const TRACK_TOL: f64 = 0.5;
+
+/// Relative reduction in the best projected force that counts as progress for the
+/// opt-in stall detector ([`TsOptions::stall_refresh`](super::TsOptions::stall_refresh)).
+/// A step must lower the running best by at least this fraction to reset the stall
+/// counter; a smaller win is treated as a plateau. Small enough that a genuinely
+/// converging climb (which reduces the force by tens of percent per step) always
+/// clears it, large enough that finite-difference jitter does not.
+const STALL_REL_TOL: f64 = 1e-3;
 
 /// How a single climb terminated, geometrically. The caller ([`super::prfo`]) maps
 /// this onto a [`TsStatus`](super::TsStatus) after verifying the converged point.
@@ -80,12 +88,16 @@ pub(super) fn run_climb<S: Surface>(
     options: &TsOptions,
     progress: Option<&dyn Progress>,
     masses: &[f64],
+    frame: &dyn Frame,
     x_start: &[[f64; 3]],
-    seed_mw: Option<&[f64]>,
     history: &mut Vec<OptStep>,
     iter_counter: &mut usize,
 ) -> Result<ClimbResult, TsError> {
     let ndof = 3 * x_start.len();
+    // The working dimension the spectrum/step live in: `ndof` for the Cartesian
+    // frame, the internal-coordinate count for the internal frame. Distinct from
+    // `ndof`, which still sizes the Cartesian Hessian the Bofill update maintains.
+    let dim = frame.dim();
     let mut x = x_start.to_vec();
 
     let mut energy = surface.energy(&x)?;
@@ -111,6 +123,12 @@ pub(super) fn run_climb<S: Surface>(
     let mut best_x = x.clone();
     let mut best_energy = energy;
     let mut best_force = f64::INFINITY;
+    // Opt-in soft-surface aid: after `stall_refresh` consecutive non-improving steps
+    // the maintained Hessian is refreshed from finite differences. `0` (the default)
+    // disables it, leaving the historical climb byte-for-byte unchanged. `stall_count`
+    // is the running non-improvement streak, maintained only when the aid is enabled.
+    let stall_refresh = options.stall_refresh;
+    let mut stall_count = 0usize;
 
     let mut converged_geom = false;
     let mut stopped_early = false;
@@ -128,6 +146,18 @@ pub(super) fn run_climb<S: Surface>(
             Some(xp) => disp_norms(&x, xp),
             None => (0.0, 0.0),
         };
+        // A step counts as progress (resetting the stall counter) only if it lowers
+        // the running best force by a relative margin; otherwise the maintained
+        // Hessian is plateauing and the counter advances toward a refresh. Maintained
+        // only when the opt-in aid is enabled, and the strict `<` best-so-far update
+        // below is unchanged either way, so the default path is byte-identical.
+        if stall_refresh > 0 {
+            if conv_force < best_force * (1.0 - STALL_REL_TOL) {
+                stall_count = 0;
+            } else {
+                stall_count += 1;
+            }
+        }
         if conv_force < best_force {
             best_force = conv_force;
             best_x = x.clone();
@@ -165,16 +195,32 @@ pub(super) fn run_climb<S: Surface>(
             break;
         }
 
+        // Opt-in (`stall_refresh > 0`) soft-surface aid: the maintained quasi-Newton
+        // Hessian has stalled — the projected force has failed to improve for
+        // `stall_refresh` consecutive steps. On a soft surface the Bofill update can
+        // settle into spurious curvatures (e.g. a far-from-saddle guess whose first
+        // finite-difference Hessian carries several extra negative modes that the update
+        // never sheds), leaving the climb plateaued far from convergence. Refresh the
+        // Hessian once from finite differences to restore an accurate spectrum, then
+        // reset the counter so the refresh cannot storm. Guarded by `steps_since_hess > 0`
+        // so a just-built Hessian is never rebuilt. Disabled by default
+        // (`stall_refresh == 0`), so the historical climb is byte-for-byte unchanged.
+        if stall_refresh > 0 && stall_count >= stall_refresh && steps_since_hess > 0 {
+            hess = fd_hessian(surface, &x, options.fd_step)?;
+            steps_since_hess = 0;
+            stall_count = 0;
+        }
+
         // Diagonalize the maintained Hessian's projected spectrum, self-healing a
         // numerical failure once: a stale quasi-Newton (Bofill) Hessian can drift to
         // a non-finite or ill-conditioned state the checked eigensolver rejects, so
         // rebuild it from finite differences and retry before giving up.
-        let mut spec = match mw_projected_hessian(&x, masses, &hess) {
+        let mut spec = match frame.spectrum(&x, &hess) {
             Ok(s) => s,
             Err(_) => {
                 hess = fd_hessian(surface, &x, options.fd_step)?;
                 steps_since_hess = 0;
-                mw_projected_hessian(&x, masses, &hess).map_err(TsError::Numerical)?
+                frame.spectrum(&x, &hess).map_err(TsError::Numerical)?
             }
         };
         let mut non_null = non_null_modes(&spec);
@@ -183,21 +229,25 @@ pub(super) fn run_climb<S: Surface>(
                 Some("near-degenerate Hessian spectrum at the stopping point".to_string());
             break;
         }
+        // The reaction-coordinate seed expressed in this frame's coordinates at the
+        // current geometry (constant for the Cartesian frame; geometry-dependent for
+        // the internal frame), used to anchor the first climbed mode.
+        let seed_w = frame.seed(&x);
         let mut followed = select_followed(
             &spec,
             &non_null,
             options.follow_mode,
             &followed_vec,
-            seed_mw,
+            seed_w.as_deref(),
         );
 
         // Mode tracking lost the climbed mode (usually a stale quasi-Newton
         // Hessian): recompute once from finite differences and re-pick.
         if let Some(reference) = &followed_vec {
-            if overlap(&spec, ndof, followed, reference) < TRACK_TOL && steps_since_hess > 0 {
+            if overlap(&spec, dim, followed, reference) < TRACK_TOL && steps_since_hess > 0 {
                 hess = fd_hessian(surface, &x, options.fd_step)?;
                 steps_since_hess = 0;
-                spec = mw_projected_hessian(&x, masses, &hess).map_err(TsError::Numerical)?;
+                spec = frame.spectrum(&x, &hess).map_err(TsError::Numerical)?;
                 non_null = non_null_modes(&spec);
                 if non_null.is_empty() {
                     not_converged_reason =
@@ -209,13 +259,13 @@ pub(super) fn run_climb<S: Surface>(
                     &non_null,
                     options.follow_mode,
                     &followed_vec,
-                    seed_mw,
+                    seed_w.as_deref(),
                 );
             }
         }
-        followed_vec = Some(column(&spec.eigenvectors, ndof, followed));
+        followed_vec = Some(column(&spec.eigenvectors, dim, followed));
 
-        let g_mw = mass_weight_grad(&g, masses);
+        let g_w = frame.gradient(&g, &x);
 
         // Step with backtracking: shrink the trust radius and retry from the same
         // point when a trial step's SCF fails to converge, returns a non-finite
@@ -227,15 +277,15 @@ pub(super) fn run_climb<S: Surface>(
         let mut attempt_trust = trust;
         let mut retries = 0usize;
         let accepted = loop {
-            let mut dxi = prfo_step(&spec, &g_mw, &non_null, followed, attempt_trust);
+            let mut dxi = prfo_step(&spec, &g_w, &non_null, followed, attempt_trust);
             if norm(&dxi) < 1e-10 {
                 // RFO produced no step (e.g. a symmetric guess with no gradient along
                 // the climbed mode): take a trust-sized step along it to break the stall.
                 for (i, slot) in dxi.iter_mut().enumerate() {
-                    *slot = attempt_trust * spec.eigenvectors[i * ndof + followed];
+                    *slot = attempt_trust * spec.eigenvectors[i * dim + followed];
                 }
             }
-            let dx = unmass_weight_step(&dxi, masses);
+            let dx = frame.to_cartesian(&dxi, &x);
             let predicted = predicted_change_cart(&g, &hess, &dx);
             let x_new = add_step(&x, &dx);
 

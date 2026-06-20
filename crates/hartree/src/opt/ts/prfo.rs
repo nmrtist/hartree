@@ -11,13 +11,15 @@
 //! the spurious negative modes) and re-climbs, up to [`TsOptions::max_recover`] times.
 
 use super::climb::{ClimbStop, run_climb};
+use super::frame::{CartesianFrame, Frame};
+use super::internal_frame::InternalFrame;
 use super::numerics::{
     add_step, column, gram_schmidt, masses_of, mw_projected_hessian, norm, overlap, positions_of,
     trans_rot_vectors, unmass_weight_step,
 };
-use super::{Progress, TsError, TsOptions, TsResult, TsStatus, verify_classified};
+use super::{Coordinates, Progress, TsError, TsOptions, TsResult, TsStatus, verify_classified};
 use crate::core::Molecule;
-use crate::opt::{OptStep, Surface};
+use crate::opt::{OptStep, Surface, internals};
 
 pub(super) fn run_prfo<S: Surface>(
     molecule: &Molecule,
@@ -39,6 +41,26 @@ pub(super) fn run_prfo<S: Surface>(
     }
 
     let seed_mw = mass_weighted_seed(options, &masses, natom)?;
+    // The climb steps in the configured coordinate frame. The mass-weighted Cartesian
+    // frame (the saddle criterion's frame) is always available and is the fallback;
+    // the internal frame is used only when requested *and* its generated coordinate
+    // set spans the molecule's internal space (`3N − n_tr`). The reaction-coordinate
+    // seed is carried in each frame's own coordinates. Recovery below always re-seeds
+    // in the mass-weighted Cartesian frame, so it keeps consuming `seed_mw` directly.
+    let cart_frame = CartesianFrame::new(masses.clone(), seed_mw.clone());
+    let internal_frame = match options.coordinates {
+        Coordinates::Internal => InternalFrame::new(
+            &x0,
+            internals::generate(molecule),
+            cartesian_seed(options, natom),
+            ndof - n_tr,
+        ),
+        _ => None,
+    };
+    let frame: &dyn Frame = match &internal_frame {
+        Some(f) => f,
+        None => &cart_frame,
+    };
 
     let mut history: Vec<OptStep> = Vec::new();
     let mut iter_counter = 0usize;
@@ -52,8 +74,8 @@ pub(super) fn run_prfo<S: Surface>(
             options,
             progress,
             &masses,
+            frame,
             &x_start,
-            seed_mw.as_deref(),
             &mut history,
             &mut iter_counter,
         )?;
@@ -211,6 +233,31 @@ pub(super) fn mass_weighted_seed(
         }
         q
     }))
+}
+
+/// The reaction-coordinate seed as a flat, normalized **Cartesian** direction (length
+/// `3·natom`), for the internal frame — which maps it into its own coordinates via the
+/// Wilson B-matrix and so wants the un-mass-weighted geometric direction, unlike
+/// [`mass_weighted_seed`]. `None` when no seed is set, the length is wrong, or it is
+/// all-zero (carrying no direction).
+fn cartesian_seed(options: &TsOptions, natom: usize) -> Option<Vec<f64>> {
+    let seed = options.reaction_mode_seed.as_ref()?;
+    if seed.len() != natom {
+        return None;
+    }
+    let mut q = vec![0.0f64; 3 * natom];
+    for (a, v) in seed.iter().enumerate() {
+        for c in 0..3 {
+            q[3 * a + c] = v[c];
+        }
+    }
+    let nrm = norm(&q);
+    (nrm > 1e-12).then(|| {
+        for v in &mut q {
+            *v /= nrm;
+        }
+        q
+    })
 }
 
 /// Build the geometry to restart a climb from after the search converged to a point

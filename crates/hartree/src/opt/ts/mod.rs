@@ -52,6 +52,8 @@ pub mod guess;
 mod climb;
 mod dimer;
 mod dimer_rotate;
+mod frame;
+mod internal_frame;
 mod irc;
 mod neb;
 mod numerics;
@@ -65,7 +67,7 @@ pub use neb::{
     find_transition_state_from_endpoints,
 };
 pub use numerics::SaddleVerification;
-pub use options::{HessianInit, TsAlgorithm, TsOptions, VerifyHessian};
+pub use options::{Coordinates, HessianInit, TsAlgorithm, TsOptions, VerifyHessian};
 // The analytic-surface tests favour explicit index loops over the atom/Cartesian
 // grid and `TsOptions::default()` + field mutation (the documented way to build
 // the `#[non_exhaustive]` options); both read clearer here than the lint's
