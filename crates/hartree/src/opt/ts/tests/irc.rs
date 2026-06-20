@@ -1,65 +1,106 @@
+//! IRC integration: each integrator traces the reaction path off the converged
+//! saddle into the two distinct basins and reaches the true minima.
+//!
+//! These run on the anharmonic double-well [`Anharmonic`] (a quartic maximum along
+//! the reaction mode, harmonic minima transverse), whose minima are analytic: along
+//! the reaction direction `q1` the energy is `−½a·q1² + ¼b·q1⁴`, with minima at
+//! `q1 = ±√(a/b)` and energy `−a²/(4b)`.
+
 use super::*;
 use crate::core::{Atom, Element, Molecule};
-use crate::opt::ts::{TsOptions, TsStatus, find_transition_state};
+use crate::opt::ts::{IrcMethod, TsOptions, TsStatus, find_transition_state};
 
-#[test]
-fn irc_endpoints_separate_and_descend() {
-    let x0 = h3_positions();
-    let basis = internal_basis(&x0);
-    let h = hessian_from(&basis, &[-0.4, 0.6, 0.9]);
-    let mut start = x0.clone();
-    for a in 0..3 {
-        for c in 0..3 {
-            start[a][c] += 0.05 * basis[0][3 * a + c];
-        }
-    }
-    let mut surf = Quadratic { x0: x0.clone(), h };
-    let mut opts = TsOptions::default();
-    opts.confirm_irc = true;
-    let result = find_transition_state(&h3_molecule(&start), &mut surf, &opts, None).unwrap();
-    assert_eq!(result.status, TsStatus::Converged);
-    let irc = result.irc.expect("IRC requested");
-    let mut sep = 0.0;
-    for (f, r) in irc.forward.iter().zip(&irc.reverse) {
-        for c in 0..3 {
-            sep += (f[c] - r[c]).powi(2);
-        }
-    }
-    assert!(sep.sqrt() > 0.1, "endpoints too close: {}", sep.sqrt());
-    assert!(irc.forward_energy <= result.energy + 1e-9);
-    assert!(irc.reverse_energy <= result.energy + 1e-9);
+const A: f64 = 0.5;
+const B: f64 = 1.0;
+const K2: f64 = 0.7;
+const K3: f64 = 0.9;
+
+/// The analytic minimum energy of the double well, `−a²/(4b)`.
+fn well_min_energy() -> f64 {
+    -A * A / (4.0 * B)
 }
 
-/// A heteronuclear (H, C, O) saddle with an explicit opposite-projection check:
-/// the two IRC endpoints must land on opposite sides of the saddle along the
-/// reaction mode, and both downhill of it.
-#[test]
-fn irc_endpoints_split_reaction_coordinate_heteronuclear() {
-    let x0 = h3_positions();
-    let basis = internal_basis(&x0);
-    let h = hessian_from(&basis, &[-0.4, 0.6, 0.9]);
-    let mut start = x0.clone();
+/// Run a full saddle search on the anharmonic double well (for the given atomic
+/// numbers) then trace the IRC with `method`. Asserts the saddle converged and
+/// returns the result.
+fn double_well_irc(method: IrcMethod, z: &[u32; 3]) -> crate::opt::ts::TsResult {
+    let x_ref = h3_positions();
+    let basis = internal_basis(&x_ref);
+    // A modest displacement off the saddle along the reaction mode and a transverse
+    // mode, small enough that the search converges under the default controls.
+    let mut start = x_ref.clone();
     for a in 0..3 {
         for c in 0..3 {
-            start[a][c] += 0.05 * basis[0][3 * a + c];
+            let i = 3 * a + c;
+            start[a][c] += 0.15 * basis[0][i] + 0.07 * basis[1][i] - 0.04 * basis[2][i];
         }
     }
-    // H, C, O on the bent geometry, started from the tiny displacement.
-    let start_mol = Molecule::new(
-        [1u32, 6, 8]
-            .iter()
+    let mol = Molecule::new(
+        z.iter()
             .zip(&start)
-            .map(|(&z, &p)| Atom::new(Element::from_z(z).unwrap(), p))
+            .map(|(&zi, &p)| Atom::new(Element::from_z(zi).unwrap(), p))
             .collect(),
         0,
-        1,
+        if z.iter().all(|&zi| zi == 1) { 2 } else { 1 },
     );
-    let mut surf = Quadratic { x0: x0.clone(), h };
+    let mut surf = Anharmonic {
+        x_ref,
+        w: basis,
+        a: A,
+        b: B,
+        k2: K2,
+        k3: K3,
+    };
     let mut opts = TsOptions::default();
     opts.confirm_irc = true;
-    let result = find_transition_state(&start_mol, &mut surf, &opts, None).unwrap();
-    assert_eq!(result.status, TsStatus::Converged);
+    opts.irc_method = method;
+    // A fresh Hessian every few steps keeps the curved-surface climb robust.
+    opts.recalc_hessian = 5;
+    let result = find_transition_state(&mol, &mut surf, &opts, None).unwrap();
+    assert_eq!(
+        result.status,
+        TsStatus::Converged,
+        "saddle search status {:?} ({:?})",
+        result.status,
+        method
+    );
+    result
+}
+
+/// Signed projection of an endpoint displacement from the saddle onto the reaction
+/// mode — the two endpoints must land on opposite sides.
+fn projection(end: &[[f64; 3]], saddle: &[[f64; 3]], mode: &[[f64; 3]]) -> f64 {
+    end.iter()
+        .zip(saddle)
+        .zip(mode)
+        .map(|((e, s), m)| (0..3).map(|c| (e[c] - s[c]) * m[c]).sum::<f64>())
+        .sum()
+}
+
+/// Shared assertions: both endpoints converged to the analytic minimum, below the
+/// saddle, and on opposite sides of it along the reaction mode.
+fn assert_reaches_both_minima(result: &crate::opt::ts::TsResult, method: IrcMethod) {
     let irc = result.irc.as_ref().expect("IRC requested");
+    let e_min = well_min_energy();
+
+    assert!(
+        irc.forward_converged && irc.reverse_converged,
+        "{method:?}: an endpoint did not converge (fwd {}, rev {}; steps {}/{})",
+        irc.forward_converged,
+        irc.reverse_converged,
+        irc.forward_steps,
+        irc.reverse_steps
+    );
+    assert!(
+        (irc.forward_energy - e_min).abs() < 2e-3,
+        "{method:?}: forward endpoint energy {:.6} not at the well minimum {e_min:.6}",
+        irc.forward_energy
+    );
+    assert!(
+        (irc.reverse_energy - e_min).abs() < 2e-3,
+        "{method:?}: reverse endpoint energy {:.6} not at the well minimum {e_min:.6}",
+        irc.reverse_energy
+    );
 
     let mode = result
         .verification
@@ -68,32 +109,176 @@ fn irc_endpoints_split_reaction_coordinate_heteronuclear() {
         .reaction_mode
         .as_ref()
         .unwrap();
-    let saddle = &result.positions;
-    let fwd = &irc.forward;
-    let rev = &irc.reverse;
-
-    let project = |end: &[[f64; 3]]| -> f64 {
-        end.iter()
-            .zip(saddle)
-            .zip(mode)
-            .map(|((e, s), m)| (0..3).map(|c| (e[c] - s[c]) * m[c]).sum::<f64>())
-            .sum()
-    };
-    let proj_fwd = project(fwd);
-    let proj_rev = project(rev);
+    let pf = projection(&irc.forward, &result.positions, mode);
+    let pr = projection(&irc.reverse, &result.positions, mode);
     assert!(
-        proj_fwd * proj_rev < 0.0,
-        "endpoints on same side: fwd {proj_fwd}, rev {proj_rev}"
+        pf * pr < 0.0,
+        "{method:?}: endpoints on the same side (fwd {pf}, rev {pr})"
     );
+}
 
-    assert!(irc.forward_energy <= result.energy + 1e-9);
-    assert!(irc.reverse_energy <= result.energy + 1e-9);
+#[test]
+fn dvv_reaches_double_well_minima() {
+    let result = double_well_irc(IrcMethod::Dvv, &[1, 1, 1]);
+    assert_reaches_both_minima(&result, IrcMethod::Dvv);
+}
 
-    let mut sep = 0.0;
-    for (f, r) in fwd.iter().zip(rev) {
+#[test]
+fn gonzalez_schlegel_reaches_double_well_minima() {
+    let result = double_well_irc(IrcMethod::GonzalezSchlegel, &[1, 1, 1]);
+    assert_reaches_both_minima(&result, IrcMethod::GonzalezSchlegel);
+}
+
+#[test]
+fn eulerpc_reaches_double_well_minima() {
+    let result = double_well_irc(IrcMethod::EulerPc, &[1, 1, 1]);
+    assert_reaches_both_minima(&result, IrcMethod::EulerPc);
+}
+
+/// End to end on a distinct-mass system (H, C, O): the saddle search, the
+/// mass-weighted transition direction, and the integrator plumbing all run with
+/// non-uniform masses and still relax into the two analytic minima. (The
+/// mass-weighting *arithmetic* is pinned directly by
+/// [`mw_transition_dir_reweights_a_coordinate_by_sqrt_mass`]; on this separable
+/// surface the endpoint geometries themselves are mass-independent, so this case
+/// exercises the multi-mass code path rather than isolating the weighting.)
+#[test]
+fn dvv_mass_weighted_path_reaches_minima_heteronuclear() {
+    let result = double_well_irc(IrcMethod::Dvv, &[1, 6, 8]);
+    assert_reaches_both_minima(&result, IrcMethod::Dvv);
+}
+
+/// The mass-weighting arithmetic itself: a coordinate displacement transforms as
+/// `√m · Δx`, so mass-weighting a Cartesian mode multiplies each atom's component by
+/// `√m` and renormalizes. A mass-blind integrator (treating `√m = 1`) would give a
+/// different direction — this is the assertion the separable double-well cannot make.
+#[test]
+fn mw_transition_dir_reweights_a_coordinate_by_sqrt_mass() {
+    use crate::opt::ts::irc::mw_transition_dir;
+    // Equal Cartesian displacement on an H and an O atom along x.
+    let mode = [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+    let m_h = Element::from_z(1).unwrap().mass();
+    let m_o = Element::from_z(8).unwrap().mass();
+    let dir = mw_transition_dir(&mode, &[m_h, m_o]);
+
+    // O's component grows relative to H's by exactly √(m_O/m_H)...
+    let ratio = dir[3] / dir[0]; // O_x / H_x
+    assert!(
+        (ratio - (m_o / m_h).sqrt()).abs() < 1e-12,
+        "O/H component ratio {ratio} != sqrt(m_O/m_H) {}",
+        (m_o / m_h).sqrt()
+    );
+    // ...the result is a unit vector...
+    let norm: f64 = dir.iter().map(|c| c * c).sum::<f64>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-12, "not normalized: {norm}");
+    // ...and the reweighting is non-trivial (a mass-blind version would give ratio 1).
+    assert!((ratio - 1.0).abs() > 1.0, "mass weighting had no effect");
+}
+
+/// Backward compatibility: an [`IrcEndpoints`](crate::opt::ts::IrcEndpoints) record
+/// serialized before the convergence/step fields existed (only the four
+/// geometry/energy keys) still deserializes, defaulting the new fields.
+#[test]
+fn irc_endpoints_round_trip_defaults_new_fields() {
+    let legacy = r#"{"forward":[[0.0,0.0,0.0]],"forward_energy":-1.5,
+                     "reverse":[[0.0,0.0,0.0]],"reverse_energy":-2.5}"#;
+    let ep: crate::opt::ts::IrcEndpoints = serde_json::from_str(legacy).unwrap();
+    assert_eq!(ep.forward_energy, -1.5);
+    assert_eq!(ep.reverse_energy, -2.5);
+    assert!(!ep.forward_converged && !ep.reverse_converged);
+    assert_eq!(ep.forward_steps, 0);
+    assert_eq!(ep.reverse_steps, 0);
+}
+
+/// A soft reaction mode: the force a short step off the saddle is already below
+/// `irc_gtol`, so a bare force test would accept the seed itself — sitting essentially
+/// on the saddle — as a converged minimum. The basin guard requires an endpoint to
+/// descend a clear margin below the saddle before it counts as converged, so the trace
+/// moves off the ridge into a basin. (With a soft mode the looser `irc_gtol` still
+/// halts the trace before the exact well bottom; the guarantee under test is that the
+/// endpoint is a genuine basin point below the saddle, not the near-saddle seed.)
+#[test]
+fn soft_mode_irc_descends_into_the_basin_not_the_seed() {
+    let x_ref = h3_positions();
+    let basis = internal_basis(&x_ref);
+    // Soft reaction-mode curvature `a`: the seed (0.1 off the ridge) has force ~a·0.1
+    // below irc_gtol yet sits only ~7e-5 below the saddle — short of a basin, so without
+    // the guard the trace would converge right there.
+    let a = 0.015;
+    let b = 0.0306;
+    let mut start = x_ref.clone();
+    for at in 0..3 {
         for c in 0..3 {
-            sep += (f[c] - r[c]).powi(2);
+            let i = 3 * at + c;
+            start[at][c] += 0.10 * basis[0][i] + 0.05 * basis[1][i];
         }
     }
-    assert!(sep.sqrt() > 0.1, "endpoints too close: {}", sep.sqrt());
+    let mut surf = Anharmonic {
+        x_ref: x_ref.clone(),
+        w: basis,
+        a,
+        b,
+        k2: 0.7,
+        k3: 0.9,
+    };
+    let mut opts = TsOptions::default();
+    opts.confirm_irc = true;
+    opts.recalc_hessian = 5;
+    let result = find_transition_state(&h3_molecule(&start), &mut surf, &opts, None).unwrap();
+    assert_eq!(result.status, TsStatus::Converged);
+    let irc = result.irc.expect("IRC requested");
+
+    assert!(
+        irc.forward_converged && irc.reverse_converged,
+        "endpoints not converged (fwd {} rev {})",
+        irc.forward_converged,
+        irc.reverse_converged
+    );
+    // Both endpoints descended a clear margin below the saddle into a basin — not the
+    // ~7e-5-below-saddle seed a bare force test would have accepted.
+    assert!(
+        irc.forward_energy < result.energy - 1.0e-4 && irc.reverse_energy < result.energy - 1.0e-4,
+        "endpoints did not descend below the saddle {:.6}: fwd {:.6} rev {:.6}",
+        result.energy,
+        irc.forward_energy,
+        irc.reverse_energy
+    );
+    // ...and on opposite sides of it along the reaction mode.
+    let mode = result
+        .verification
+        .as_ref()
+        .unwrap()
+        .reaction_mode
+        .as_ref()
+        .unwrap();
+    let pf = projection(&irc.forward, &result.positions, mode);
+    let pr = projection(&irc.reverse, &result.positions, mode);
+    assert!(
+        pf * pr < 0.0,
+        "endpoints on the same side (fwd {pf}, rev {pr})"
+    );
+}
+
+/// A converged endpoint records the steps it took (a nonzero, bounded count) — the
+/// per-endpoint diagnostics the result now carries.
+#[test]
+fn endpoint_step_counts_are_recorded() {
+    let result = double_well_irc(IrcMethod::Dvv, &[1, 1, 1]);
+    let irc = result.irc.as_ref().unwrap();
+    let opts = TsOptions::default();
+    for (label, steps, converged) in [
+        ("forward", irc.forward_steps, irc.forward_converged),
+        ("reverse", irc.reverse_steps, irc.reverse_converged),
+    ] {
+        assert!(steps > 0, "{label}: no integration steps recorded");
+        assert!(
+            steps <= opts.irc_max_steps,
+            "{label}: steps {steps} exceeds the cap"
+        );
+        // A converged endpoint stopped before the cap.
+        assert!(
+            !converged || steps < opts.irc_max_steps,
+            "{label}: converged yet ran to the step cap"
+        );
+    }
 }

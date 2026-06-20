@@ -6,7 +6,7 @@
 //! struct) from one flag/value pair, and [`parse_ts_algo`] decodes `--ts-algo`.
 //! Error strings mirror the existing CLI style ("--flag must be ...").
 
-use hartree::opt::ts::{TsAlgorithm, TsOptions};
+use hartree::opt::ts::{IrcMethod, TsAlgorithm, TsOptions};
 
 /// The value-taking `--ts-*` flags, so the argv loop in `main.rs` can recognise
 /// them in one membership test before routing through [`apply_ts_option`].
@@ -19,6 +19,9 @@ pub const TS_VALUE_FLAGS: &[&str] = &[
     "--ts-fd-step",
     "--ts-neg-tol",
     "--ts-algo",
+    "--ts-irc-method",
+    "--ts-irc-step",
+    "--ts-irc-max-steps",
 ];
 
 /// Parse the `--ts-algo` value. Accepts "prfo" and "dimer" (case-insensitive).
@@ -27,6 +30,19 @@ pub fn parse_ts_algo(s: &str) -> Result<TsAlgorithm, String> {
         "prfo" => Ok(TsAlgorithm::Prfo),
         "dimer" => Ok(TsAlgorithm::Dimer),
         _ => Err(format!("--ts-algo must be one of prfo, dimer (got {s:?})")),
+    }
+}
+
+/// Parse the `--ts-irc-method` value. Accepts "dvv", "gs2", and "eulerpc"
+/// (case-insensitive).
+pub fn parse_irc_method(s: &str) -> Result<IrcMethod, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "dvv" => Ok(IrcMethod::Dvv),
+        "gs2" => Ok(IrcMethod::GonzalezSchlegel),
+        "eulerpc" => Ok(IrcMethod::EulerPc),
+        _ => Err(format!(
+            "--ts-irc-method must be one of dvv, gs2, eulerpc (got {s:?})"
+        )),
     }
 }
 
@@ -41,6 +57,9 @@ pub fn apply_ts_option(opts: &mut TsOptions, flag: &str, value: &str) -> Result<
         "--ts-fd-step" => opts.fd_step = parse_pos_f64(flag, value, "bohr")?,             // > 0
         "--ts-neg-tol" => opts.negative_mode_tol = parse_pos_f64(flag, value, "a.u.")?,   // > 0
         "--ts-algo" => opts.algorithm = parse_ts_algo(value)?,
+        "--ts-irc-method" => opts.irc_method = parse_irc_method(value)?,
+        "--ts-irc-step" => opts.irc_step = parse_pos_f64(flag, value, "√amu·bohr")?, // > 0
+        "--ts-irc-max-steps" => opts.irc_max_steps = parse_usize(flag, value)?,      // >= 1
         other => return Err(format!("internal error: unhandled ts flag {other}")),
     }
     Ok(())
@@ -97,6 +116,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_irc_method_accepts_known_values() {
+        assert_eq!(parse_irc_method("dvv").unwrap(), IrcMethod::Dvv);
+        assert_eq!(
+            parse_irc_method("gs2").unwrap(),
+            IrcMethod::GonzalezSchlegel
+        );
+        assert_eq!(parse_irc_method("eulerpc").unwrap(), IrcMethod::EulerPc);
+        // Case-insensitive.
+        assert_eq!(parse_irc_method("DVV").unwrap(), IrcMethod::Dvv);
+        assert_eq!(parse_irc_method("EulerPC").unwrap(), IrcMethod::EulerPc);
+    }
+
+    #[test]
+    fn parse_irc_method_rejects_unknown_values() {
+        assert!(parse_irc_method("gonzalez").is_err());
+        assert!(parse_irc_method("bogus").is_err());
+        assert!(parse_irc_method("").is_err());
+    }
+
+    #[test]
     fn apply_sets_each_field_from_valid_value() {
         let mut o = TsOptions::default();
         apply_ts_option(&mut o, "--ts-max-iter", "42").unwrap();
@@ -119,6 +158,15 @@ mod tests {
 
         apply_ts_option(&mut o, "--ts-algo", "dimer").unwrap();
         assert_eq!(o.algorithm, TsAlgorithm::Dimer);
+
+        apply_ts_option(&mut o, "--ts-irc-method", "gs2").unwrap();
+        assert_eq!(o.irc_method, IrcMethod::GonzalezSchlegel);
+
+        apply_ts_option(&mut o, "--ts-irc-step", "0.05").unwrap();
+        assert_eq!(o.irc_step, 0.05);
+
+        apply_ts_option(&mut o, "--ts-irc-max-steps", "250").unwrap();
+        assert_eq!(o.irc_max_steps, 250);
     }
 
     #[test]
@@ -140,6 +188,10 @@ mod tests {
         assert!(apply_ts_option(&mut o, "--ts-max-iter", "0").is_err());
         assert!(apply_ts_option(&mut o, "--ts-neg-tol", "0").is_err());
         assert!(apply_ts_option(&mut o, "--ts-algo", "bogus").is_err());
+        assert!(apply_ts_option(&mut o, "--ts-irc-method", "bogus").is_err());
+        assert!(apply_ts_option(&mut o, "--ts-irc-step", "0").is_err());
+        assert!(apply_ts_option(&mut o, "--ts-irc-step", "-1").is_err());
+        assert!(apply_ts_option(&mut o, "--ts-irc-max-steps", "0").is_err());
         // A non-numeric integer is rejected too.
         assert!(apply_ts_option(&mut o, "--ts-max-iter", "abc").is_err());
         assert!(apply_ts_option(&mut o, "--ts-follow", "-1").is_err());
@@ -161,7 +213,12 @@ mod tests {
         // "internal error" arm.
         let mut o = TsOptions::default();
         for &flag in TS_VALUE_FLAGS {
-            let value = if flag == "--ts-algo" { "prfo" } else { "1" };
+            // Flags taking an enum keyword need a valid keyword; the rest accept "1".
+            let value = match flag {
+                "--ts-algo" => "prfo",
+                "--ts-irc-method" => "dvv",
+                _ => "1",
+            };
             apply_ts_option(&mut o, flag, value)
                 .unwrap_or_else(|e| panic!("flag {flag} should parse value {value:?}: {e}"));
         }

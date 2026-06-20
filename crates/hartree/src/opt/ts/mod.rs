@@ -38,14 +38,18 @@
 //! single near-saddle geometry these drivers consume from a reactant + product
 //! pair (IDPP interpolation with subgraph atom mapping). This file is the public
 //! contract — types, the two entry points, and their docs; the numerics live in
-//! [`numerics`] and [`prfo`].
+//! [`numerics`], [`prfo`], and the IRC path tracer in [`irc`].
 
 pub mod guess;
 
 mod dimer;
+mod irc;
 mod numerics;
 mod prfo;
 mod step;
+
+pub use irc::{IrcEndpoints, IrcMethod};
+pub use numerics::SaddleVerification;
 // The analytic-surface tests favour explicit index loops over the atom/Cartesian
 // grid and `TsOptions::default()` + field mutation (the documented way to build
 // the `#[non_exhaustive]` options); both read clearer here than the lint's
@@ -183,12 +187,42 @@ pub struct TsOptions {
     /// [`max_iter`](Self::max_iter) iterations.
     #[serde(default = "default_max_step_retries")]
     pub max_step_retries: usize,
+
+    /// IRC only ([`confirm_irc`](Self::confirm_irc)): which intrinsic-reaction-
+    /// coordinate integrator traces the path off the saddle. See [`IrcMethod`];
+    /// the default [`Dvv`](IrcMethod::Dvv) is Hessian-free.
+    #[serde(default)]
+    pub irc_method: IrcMethod,
+    /// IRC only: arc-length step of the integrator, in mass-weighted coordinates
+    /// (`√amu·bohr`). Also the size of the initial displacement off the saddle ridge.
+    #[serde(default = "default_irc_step")]
+    pub irc_step: f64,
+    /// IRC only: maximum integration steps **per endpoint** before the trace stops
+    /// and reports the endpoint as not converged.
+    #[serde(default = "default_irc_max_steps")]
+    pub irc_max_steps: usize,
+    /// IRC only: convergence threshold on the trans/rot-projected RMS force (atomic
+    /// units) — the trace has reached a minimum once it falls below this.
+    #[serde(default = "default_irc_gtol")]
+    pub irc_gtol: f64,
 }
 
 /// Default step-retry budget (see [`TsOptions::max_step_retries`]); also the serde
 /// default so options serialized before the field round-trip unchanged.
 fn default_max_step_retries() -> usize {
     6
+}
+
+/// Serde/`Default` values for the IRC controls, so options serialized before these
+/// fields existed round-trip unchanged (see [`TsOptions::irc_step`] etc.).
+fn default_irc_step() -> f64 {
+    0.1
+}
+fn default_irc_max_steps() -> usize {
+    150
+}
+fn default_irc_gtol() -> f64 {
+    1e-3
 }
 
 impl Default for TsOptions {
@@ -223,6 +257,10 @@ impl Default for TsOptions {
             negative_mode_tol: 1e-4,
             confirm_irc: false,
             max_step_retries: default_max_step_retries(),
+            irc_method: IrcMethod::Dvv,
+            irc_step: default_irc_step(),
+            irc_max_steps: default_irc_max_steps(),
+            irc_gtol: default_irc_gtol(),
         }
     }
 }
@@ -253,56 +291,6 @@ pub enum TsStatus {
     WrongImaginaryModeCount,
     /// A [`Progress`] observer returned [`Flow::Stop`] before convergence.
     StoppedEarly,
-}
-
-/// Negative-mode spectrum of the mass-weighted, translation/rotation-projected
-/// Cartesian Hessian at a geometry — the output of the shared [`verify_saddle`]
-/// step. Carries the evidence that classifies a point as a first-order saddle.
-/// `#[non_exhaustive]` so e.g. the full eigenvalue spectrum or normal modes can
-/// be added later.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct SaddleVerification {
-    /// Eigenvalues counted as negative under [`TsOptions::negative_mode_tol`]
-    /// (atomic units, ascending). Exactly one entry for a first-order saddle.
-    pub negative_eigenvalues: Vec<f64>,
-    /// The reaction-mode eigenvector: the normalized displacement of the lowest
-    /// (most negative) mode (Cartesian, length = natoms, input atom order), i.e.
-    /// the direction the IRC is traced along. `None` if there is no negative
-    /// mode. This is what an agent inspects to identify *which* reaction the
-    /// saddle describes, and what an IRC or TS thermochemistry step seeds from.
-    pub reaction_mode: Option<Vec<[f64; 3]>>,
-    /// The imaginary frequency in cm⁻¹ (reported negative, the
-    /// `-√(-λ)·FREQ_CONV_CM1` convention of [`crate::props::frequencies`]) of the
-    /// lowest mode, for chemistry-meaningful reporting and RRHO thermochemistry.
-    /// `None` if there is no negative mode.
-    pub imaginary_frequency_cm1: Option<f64>,
-}
-
-impl SaddleVerification {
-    /// `true` iff there is exactly one negative mode (a first-order saddle).
-    pub fn is_first_order_saddle(&self) -> bool {
-        self.negative_eigenvalues.len() == 1
-    }
-}
-
-/// Endpoints found by tracing the intrinsic reaction coordinate (IRC) a short
-/// way downhill from the converged saddle, in the `+` and `-` senses of the
-/// reaction mode ([`SaddleVerification::reaction_mode`]). Present in
-/// [`TsResult::irc`] only when [`TsOptions::confirm_irc`] was set and the trace
-/// ran; it is the evidence that the saddle joins two distinct minima rather than
-/// sitting on a shoulder.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IrcEndpoints {
-    /// Geometry reached following the reaction mode in the `+` sense
-    /// (Cartesian, atomic units, input atom order).
-    pub forward: Vec<[f64; 3]>,
-    /// Energy at the forward endpoint.
-    pub forward_energy: f64,
-    /// Geometry reached following the reaction mode in the `-` sense.
-    pub reverse: Vec<[f64; 3]>,
-    /// Energy at the reverse endpoint.
-    pub reverse_energy: f64,
 }
 
 /// Structured outcome of a transition-state search.

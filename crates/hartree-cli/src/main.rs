@@ -47,6 +47,7 @@ fn run() -> Result<bool, String> {
     let mut do_ts = false;
     let mut ts_options = hartree::opt::ts::TsOptions::default();
     let mut ts_flag_seen = false;
+    let mut irc_subflag_seen = false;
     let mut all_electron = false;
     let mut direct = false;
     let mut ri = false;
@@ -205,6 +206,8 @@ fn run() -> Result<bool, String> {
                 let value = take(&args, &mut i, &flag)?;
                 ts_flags::apply_ts_option(&mut ts_options, &flag, &value)?;
                 ts_flag_seen = true;
+                // The IRC sub-flags only take effect once `--ts-irc` enables the trace.
+                irc_subflag_seen |= flag.starts_with("--ts-irc-");
             }
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             path => xyz_path = Some(path.to_string()),
@@ -214,6 +217,8 @@ fn run() -> Result<bool, String> {
 
     if ts_flag_seen && !do_ts {
         eprintln!("warning: --ts-* flags are ignored without --ts");
+    } else if irc_subflag_seen && !ts_options.confirm_irc {
+        eprintln!("warning: --ts-irc-* flags are ignored without --ts-irc");
     }
 
     if let Some(task) = &recommend_task {
@@ -1514,16 +1519,29 @@ fn report_transition_state(
 
     if let Some(irc) = &result.irc {
         println!();
-        println!("IRC endpoint confirmation (short downhill trace along the reaction mode):");
+        println!(
+            "IRC endpoint confirmation (mass-weighted downhill trace along the reaction mode):"
+        );
         let df = irc.forward_energy - result.energy;
         let dr = irc.reverse_energy - result.energy;
+        let tag = |converged: bool, steps: usize| {
+            if converged {
+                format!("minimum, {steps} steps")
+            } else {
+                format!("step cap, {steps} steps")
+            }
+        };
         println!(
-            "  forward endpoint energy  {:>20.12} Eh   ΔE = {:>9.2e} Eh",
-            irc.forward_energy, df
+            "  forward endpoint energy  {:>20.12} Eh   ΔE = {:>9.2e} Eh   ({})",
+            irc.forward_energy,
+            df,
+            tag(irc.forward_converged, irc.forward_steps)
         );
         println!(
-            "  reverse endpoint energy  {:>20.12} Eh   ΔE = {:>9.2e} Eh",
-            irc.reverse_energy, dr
+            "  reverse endpoint energy  {:>20.12} Eh   ΔE = {:>9.2e} Eh   ({})",
+            irc.reverse_energy,
+            dr,
+            tag(irc.reverse_converged, irc.reverse_steps)
         );
         if df <= 0.0 && dr <= 0.0 {
             println!("  both endpoints relaxed below the saddle (ΔE <= 0).");
@@ -2203,9 +2221,16 @@ fn print_usage() {
          \x20                           and reports its frequency (rhf/uhf/rohf/DFT; mutually\n\
          \x20                           exclusive with --opt; no post-HF/RI/direct/COSX/X2C/\n\
          \x20                           smearing/implicit-solvent)\n\
-         \x20   --ts-irc                after a converged TS, trace the IRC a short way downhill\n\
-         \x20                           in both senses of the reaction mode and report the two\n\
-         \x20                           endpoint energies (confirms the basins the saddle joins)\n\
+         \x20   --ts-irc                after a converged TS, trace the intrinsic reaction\n\
+         \x20                           coordinate downhill in both senses of the reaction mode\n\
+         \x20                           into the two basins and report the endpoint energies\n\
+         \x20                           (confirms the minima the saddle joins)\n\
+         \x20   --ts-irc-method <dvv|gs2|eulerpc>  IRC integrator [default: dvv]; dvv is\n\
+         \x20                           Hessian-free, gs2 (Gonzalez–Schlegel) is constrained and\n\
+         \x20                           most accurate, eulerpc reuses one cached Hessian\n\
+         \x20   --ts-irc-step <step>    IRC arc-length step, mass-weighted (√amu·bohr)\n\
+         \x20                           [default: 0.1]\n\
+         \x20   --ts-irc-max-steps <int>  max IRC steps per endpoint [default: 150] (>= 1)\n\
          \x20   --ts-algo <prfo|dimer>  saddle-point algorithm [default: prfo]; both prfo\n\
          \x20                           (Hessian eigenvector-following) and dimer (Hessian-free,\n\
          \x20                           midpoint-gradient curvature estimate) are available\n\

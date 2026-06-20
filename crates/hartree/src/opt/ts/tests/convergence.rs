@@ -118,9 +118,8 @@ fn prfo_pure_bofill_on_curved_surface() {
     );
 }
 
-/// A second-order saddle (two negative curvatures): starting exactly at the
-/// stationary point converges geometrically at iteration 1, and `verify_saddle`
-/// must report the wrong imaginary-mode count.
+/// A second-order saddle (two negative curvatures): starting exactly at the stationary
+/// point converges at iteration 1, and `verify_saddle` reports the wrong mode count.
 #[test]
 fn wrong_imaginary_mode_count_end_to_end() {
     let x0 = h3_positions();
@@ -441,6 +440,28 @@ fn options_round_trip_defaults_new_step_retries_field() {
     value.as_object_mut().unwrap().remove("max_step_retries");
     let legacy: TsOptions = serde_json::from_value(value).unwrap();
     assert_eq!(legacy.max_step_retries, 6);
+}
+
+/// Backward compatibility for the IRC controls: an options object serialized before
+/// they existed (no such keys) still deserializes, defaulting every field via its
+/// `#[serde(default)]`.
+#[test]
+fn options_round_trip_defaults_new_irc_fields() {
+    use crate::opt::ts::IrcMethod;
+    let opts = TsOptions::default();
+    let json = serde_json::to_string(&opts).unwrap();
+
+    // Drop all IRC keys to mimic options written before the fields were added.
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    for key in ["irc_method", "irc_step", "irc_max_steps", "irc_gtol"] {
+        obj.remove(key);
+    }
+    let legacy: TsOptions = serde_json::from_value(value).unwrap();
+    assert_eq!(legacy.irc_method, IrcMethod::Dvv);
+    assert_eq!(legacy.irc_step, opts.irc_step);
+    assert_eq!(legacy.irc_max_steps, opts.irc_max_steps);
+    assert_eq!(legacy.irc_gtol, opts.irc_gtol);
 }
 
 /// A surface whose gradient is always non-finite, so the finite-difference Hessian

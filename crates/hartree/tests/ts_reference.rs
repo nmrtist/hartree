@@ -151,26 +151,48 @@ fn hcn_hnc_saddle_rhf_sto3g() {
         "imaginary frequency {imag:.1} cm⁻¹ drifted from baseline"
     );
 
-    // The saddle connects two distinct lower basins (the defining property of a
-    // transition state). Kept qualitative so it survives a better IRC tracer.
+    // The mass-weighted IRC integrator traces the path off the saddle and reaches
+    // the two distinct isomer minima (the defining property of a transition state).
     let irc = result.irc.as_ref().expect("irc endpoints");
     assert!(
-        irc.forward_energy < result.energy,
-        "forward endpoint {:.6} not below saddle {:.6}",
+        irc.forward_converged && irc.reverse_converged,
+        "an IRC endpoint did not reach a minimum (fwd conv={} steps={}, rev conv={} steps={})",
+        irc.forward_converged,
+        irc.forward_steps,
+        irc.reverse_converged,
+        irc.reverse_steps,
+    );
+    // Both endpoints relaxed well below the saddle into their basins.
+    assert!(
+        irc.forward_energy < result.energy - 0.05,
+        "forward endpoint {:.6} not well below saddle {:.6}",
         irc.forward_energy,
         result.energy
     );
     assert!(
-        irc.reverse_energy < result.energy,
-        "reverse endpoint {:.6} not below saddle {:.6}",
+        irc.reverse_energy < result.energy - 0.05,
+        "reverse endpoint {:.6} not well below saddle {:.6}",
         irc.reverse_energy,
         result.energy
     );
+    // The two endpoints are the two distinct isomers: in one the hydrogen sits on
+    // carbon (HCN: short C–H, long N–H), in the other on nitrogen (HNC: the reverse).
+    let fwd_h_on_c = bond(&irc.forward, 0, 2) < bond(&irc.forward, 1, 2);
+    let rev_h_on_c = bond(&irc.reverse, 0, 2) < bond(&irc.reverse, 1, 2);
     assert!(
-        (irc.forward_energy - irc.reverse_energy).abs() > 1e-3,
-        "endpoints landed in the same basin: {:.6} vs {:.6}",
-        irc.forward_energy,
-        irc.reverse_energy
+        fwd_h_on_c != rev_h_on_c,
+        "endpoints are not distinct isomers (both H-on-{})",
+        if fwd_h_on_c { "C" } else { "N" }
+    );
+    // HCN (H on carbon) lies below HNC, the established ordering of the two isomers.
+    let (e_hcn, e_hnc) = if fwd_h_on_c {
+        (irc.forward_energy, irc.reverse_energy)
+    } else {
+        (irc.reverse_energy, irc.forward_energy)
+    };
+    assert!(
+        e_hcn < e_hnc,
+        "HCN should lie below HNC, got HCN {e_hcn:.6} vs HNC {e_hnc:.6}"
     );
 
     // The instrumentation observed real work on every path the search uses.

@@ -11,8 +11,8 @@
 //! mode — climbing uphill toward the saddle along `N` while descending the rest.
 //! Convergence is tested on the trans/rot-projected Cartesian force/step exactly
 //! as in P-RFO; after it, the shared [`verify_saddle`](super::verify_saddle)
-//! check confirms one negative mode and the [`super::prfo::irc_endpoints`] tracer
-//! (reused, not duplicated) optionally confirms the basins the saddle joins.
+//! check confirms one negative mode and the [`super::irc`] tracer (reused, not
+//! duplicated) optionally confirms the basins the saddle joins.
 
 use std::f64::consts::PI;
 
@@ -417,7 +417,16 @@ pub(super) fn run_dimer<S: Surface>(
 
     let irc = if status == TsStatus::Converged && options.confirm_irc {
         match &verification.reaction_mode {
-            Some(mode) => Some(super::prfo::irc_endpoints(surface, &x, mode, options)?),
+            Some(mode) => {
+                match super::irc::irc_endpoints(surface, &x, mode, &masses, energy, options) {
+                    Ok(endpoints) => Some(endpoints),
+                    // A recoverable SCF failure during the (purely confirmatory) IRC
+                    // trace must not discard the converged saddle: report the saddle
+                    // without endpoints rather than turning success into a hard error.
+                    Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. })) => None,
+                    Err(e) => return Err(e),
+                }
+            }
             None => None,
         }
     } else {

@@ -2,11 +2,44 @@
 //! finite-difference Hessian, and saddle verification, shared by
 //! [`verify_saddle`](super::verify_saddle) and the [`super::prfo`] driver.
 
-use super::SaddleVerification;
+use serde::{Deserialize, Serialize};
+
 use crate::core::Molecule;
 use crate::core::units::FREQ_CONV_CM1;
 use crate::linalg::{mat_from_row_major, mat_to_row_major, matmul, symmetric_eigh_checked};
 use crate::opt::{OptError, Surface};
+
+/// Negative-mode spectrum of the mass-weighted, translation/rotation-projected
+/// Cartesian Hessian at a geometry — the output of the shared
+/// [`verify_saddle`](super::verify_saddle) step. Carries the evidence that
+/// classifies a point as a first-order saddle. `#[non_exhaustive]` so e.g. the full
+/// eigenvalue spectrum or normal modes can be added later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct SaddleVerification {
+    /// Eigenvalues counted as negative under
+    /// [`TsOptions::negative_mode_tol`](super::TsOptions::negative_mode_tol)
+    /// (atomic units, ascending). Exactly one entry for a first-order saddle.
+    pub negative_eigenvalues: Vec<f64>,
+    /// The reaction-mode eigenvector: the normalized displacement of the lowest
+    /// (most negative) mode (Cartesian, length = natoms, input atom order), i.e.
+    /// the direction the IRC is traced along. `None` if there is no negative
+    /// mode. This is what an agent inspects to identify *which* reaction the
+    /// saddle describes, and what an IRC or TS thermochemistry step seeds from.
+    pub reaction_mode: Option<Vec<[f64; 3]>>,
+    /// The imaginary frequency in cm⁻¹ (reported negative, the
+    /// `-√(-λ)·FREQ_CONV_CM1` convention of [`crate::props::frequencies`]) of the
+    /// lowest mode, for chemistry-meaningful reporting and RRHO thermochemistry.
+    /// `None` if there is no negative mode.
+    pub imaginary_frequency_cm1: Option<f64>,
+}
+
+impl SaddleVerification {
+    /// `true` iff there is exactly one negative mode (a first-order saddle).
+    pub fn is_first_order_saddle(&self) -> bool {
+        self.negative_eigenvalues.len() == 1
+    }
+}
 
 pub(super) struct MwSpectrum {
     /// Ascending eigenvalues (atomic units).

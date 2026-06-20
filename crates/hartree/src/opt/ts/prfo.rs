@@ -1,5 +1,4 @@
-//! Partitioned rational-function optimization (P-RFO / eigenvector following)
-//! and the lightweight IRC endpoint confirmation.
+//! Partitioned rational-function optimization (P-RFO / eigenvector following).
 //!
 //! The search runs in mass-weighted Cartesian coordinates with translations and
 //! rotations projected out (the [`crate::props::frequencies`] frame). Each step
@@ -19,7 +18,7 @@ use super::numerics::{
     predicted_change_cart, projected_force_norms, trans_rot_vectors, unmass_weight_step,
 };
 use super::step::{bofill_update, is_pathological, prfo_step, select_followed, update_trust_ts};
-use super::{Flow, IrcEndpoints, Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
+use super::{Flow, Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
 use crate::core::Molecule;
 use crate::opt::{OptError, OptStep, Surface};
 
@@ -319,7 +318,16 @@ pub(super) fn run_prfo<S: Surface>(
 
     let irc = if status == TsStatus::Converged && options.confirm_irc {
         match &verification.reaction_mode {
-            Some(mode) => Some(irc_endpoints(surface, &x, mode, options)?),
+            Some(mode) => {
+                match super::irc::irc_endpoints(surface, &x, mode, &masses, energy, options) {
+                    Ok(endpoints) => Some(endpoints),
+                    // A recoverable SCF failure during the (purely confirmatory) IRC
+                    // trace must not discard the converged saddle: report the saddle
+                    // without endpoints rather than turning success into a hard error.
+                    Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. })) => None,
+                    Err(e) => return Err(e),
+                }
+            }
             None => None,
         }
     } else {
@@ -346,96 +354,4 @@ pub(super) fn run_prfo<S: Surface>(
 /// [`prfo_step`]; the driver maps it to [`TsError::Numerical`] instead.
 fn finite_grad(g: &[[f64; 3]]) -> bool {
     g.iter().all(|v| v.iter().all(|c| c.is_finite()))
-}
-
-const IRC_DISPLACE: f64 = 0.2;
-const IRC_MAX_STEPS: usize = 20;
-const IRC_MAX_STEP: f64 = 0.2;
-const IRC_GTOL: f64 = 1e-3;
-
-/// Confirm the saddle joins two distinct basins by relaxing a short way downhill
-/// from `saddle ± reaction mode`. A cheap damped-descent endpoint check, not a
-/// mass-weighted IRC integrator.
-pub(super) fn irc_endpoints<S: Surface>(
-    surface: &mut S,
-    saddle: &[[f64; 3]],
-    reaction_mode: &[[f64; 3]],
-    options: &TsOptions,
-) -> Result<IrcEndpoints, TsError> {
-    let mut dir = reaction_mode.to_vec();
-    let dnorm = norm(&flatten(&dir));
-    if dnorm > 0.0 {
-        for d in &mut dir {
-            for c in d.iter_mut() {
-                *c /= dnorm;
-            }
-        }
-    }
-
-    let (forward, forward_energy) =
-        relax_downhill(surface, &add_scaled(saddle, &dir, IRC_DISPLACE), options)?;
-    let (reverse, reverse_energy) =
-        relax_downhill(surface, &add_scaled(saddle, &dir, -IRC_DISPLACE), options)?;
-    Ok(IrcEndpoints {
-        forward,
-        forward_energy,
-        reverse,
-        reverse_energy,
-    })
-}
-
-fn add_scaled(x: &[[f64; 3]], dir: &[[f64; 3]], scale: f64) -> Vec<[f64; 3]> {
-    x.iter()
-        .zip(dir)
-        .map(|(a, d)| {
-            [
-                a[0] + scale * d[0],
-                a[1] + scale * d[1],
-                a[2] + scale * d[2],
-            ]
-        })
-        .collect()
-}
-
-fn relax_downhill<S: Surface>(
-    surface: &mut S,
-    start: &[[f64; 3]],
-    options: &TsOptions,
-) -> Result<(Vec<[f64; 3]>, f64), TsError> {
-    let mut x = start.to_vec();
-    let mut energy = surface.energy(&x)?;
-    for _ in 0..IRC_MAX_STEPS {
-        let g = gradient(surface, &x, options.fd_step)?;
-        let gnorm = norm(&flatten(&g));
-        if gnorm < IRC_GTOL {
-            break;
-        }
-        let mut trial = (IRC_MAX_STEP / gnorm).min(1.0);
-        let mut accepted = false;
-        for _ in 0..5 {
-            let x_new: Vec<[f64; 3]> = x
-                .iter()
-                .zip(&g)
-                .map(|(xi, gi)| {
-                    [
-                        xi[0] - trial * gi[0],
-                        xi[1] - trial * gi[1],
-                        xi[2] - trial * gi[2],
-                    ]
-                })
-                .collect();
-            let e_new = surface.energy(&x_new)?;
-            if e_new <= energy {
-                x = x_new;
-                energy = e_new;
-                accepted = true;
-                break;
-            }
-            trial *= 0.5;
-        }
-        if !accepted {
-            break;
-        }
-    }
-    Ok((x, energy))
 }
