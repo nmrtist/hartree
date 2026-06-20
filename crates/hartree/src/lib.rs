@@ -44,8 +44,8 @@ pub use cp::{CpFragments, CpResult, counterpoise};
 pub use estimate::{EstimateBackend, MemoryEstimate, MemoryTerm, estimate_memory};
 pub use job::{
     BackendDowngrade, CosxDiagnostics, DftDiagnostics, FrequencyData, GbsaData, Job, JobOptions,
-    JobResult, Method, PostHfResult, PropertiesResult, RiDiagnostics, SmdData, ecp_summary,
-    optimize_geometry, optimize_geometry_dft, transition_state, transition_state_dft,
+    JobResult, Method, PostHfResult, PropertiesResult, RiDiagnostics, SmdData, TsGuessInput,
+    ecp_summary, optimize_geometry, optimize_geometry_dft, transition_state, transition_state_dft,
 };
 pub use periodic_job::{PeriodicFunctional, PeriodicJob, PeriodicJobResult, run_periodic};
 pub use surface::HfSurface;

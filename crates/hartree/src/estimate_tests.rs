@@ -147,6 +147,29 @@ fn transition_state_adds_hessian_and_concurrency_terms() {
 }
 
 #[test]
+fn two_endpoint_guess_does_not_change_the_estimate() {
+    // A two-endpoint TS search builds its guess from a product that shares the
+    // reactant's atom count and composition, so the saddle search still runs on a
+    // 3-atom molecule — the memory estimate is byte-identical to the single-geometry
+    // TS estimate, and the product carried in `ts_guess` adds no SCF working set.
+    let single = JobOptions {
+        transition_state: true,
+        ..JobOptions::default()
+    };
+    let two_endpoint = JobOptions {
+        transition_state: true,
+        ts_guess: Some(crate::TsGuessInput::new(water())),
+        ..JobOptions::default()
+    };
+    let single_est = estimate_memory(&job(Method::Rhf, single)).unwrap();
+    let two_est = estimate_memory(&job(Method::Rhf, two_endpoint)).unwrap();
+    assert_eq!(
+        single_est.peak_bytes, two_est.peak_bytes,
+        "two-endpoint guess changed the peak estimate"
+    );
+}
+
+#[test]
 fn unknown_basis_errors() {
     let j = Job {
         molecule: water(),

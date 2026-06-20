@@ -48,6 +48,10 @@ fn run() -> Result<bool, String> {
     let mut ts_options = hartree::opt::ts::TsOptions::default();
     let mut ts_flag_seen = false;
     let mut irc_subflag_seen = false;
+    let mut ts_product_path: Option<String> = None;
+    let mut ts_use_neb = false;
+    let mut ts_neb_images: Option<usize> = None;
+    let mut ts_scan_points: Option<usize> = None;
     let mut all_electron = false;
     let mut direct = false;
     let mut ri = false;
@@ -104,6 +108,34 @@ fn run() -> Result<bool, String> {
             }
             "--opt" => do_opt = true,
             "--ts" => do_ts = true,
+            "--ts-product" => {
+                ts_product_path = Some(take(&args, &mut i, "--ts-product")?);
+                ts_flag_seen = true;
+            }
+            "--ts-neb" => {
+                ts_use_neb = true;
+                ts_flag_seen = true;
+            }
+            "--ts-neb-images" => {
+                let n: usize = take(&args, &mut i, "--ts-neb-images")?
+                    .parse()
+                    .map_err(|_| "--ts-neb-images must be a positive integer".to_string())?;
+                if n == 0 {
+                    return Err("--ts-neb-images must be a positive integer (>= 1)".into());
+                }
+                ts_neb_images = Some(n);
+                ts_flag_seen = true;
+            }
+            "--ts-scan" => {
+                let n: usize = take(&args, &mut i, "--ts-scan")?
+                    .parse()
+                    .map_err(|_| "--ts-scan must be an integer point count".to_string())?;
+                if n < 3 {
+                    return Err("--ts-scan needs at least 3 path points".into());
+                }
+                ts_scan_points = Some(n);
+                ts_flag_seen = true;
+            }
             "--all-electron" => all_electron = true,
             "--direct" => direct = true,
             "--ri" => ri = true,
@@ -215,6 +247,33 @@ fn run() -> Result<bool, String> {
         i += 1;
     }
 
+    if ts_product_path.is_some() && !do_ts {
+        return Err(
+            "--ts-product gives the product endpoint for a two-endpoint transition-state \
+             search; add --ts to request the search"
+                .into(),
+        );
+    }
+    if ts_use_neb && ts_product_path.is_none() {
+        return Err(
+            "--ts-neb relaxes a band between two endpoints; provide the product geometry \
+             with --ts-product <file.xyz>"
+                .into(),
+        );
+    }
+    if ts_neb_images.is_some() && !ts_use_neb {
+        eprintln!("warning: --ts-neb-images is ignored without --ts-neb");
+    }
+    if ts_scan_points.is_some() && ts_product_path.is_none() {
+        return Err(
+            "--ts-scan places the guess at the energy peak between two endpoints; provide \
+             the product with --ts-product <file.xyz>"
+                .into(),
+        );
+    }
+    if ts_scan_points.is_some() && ts_use_neb {
+        eprintln!("warning: --ts-scan is ignored with --ts-neb (the band already finds the peak)");
+    }
     if ts_flag_seen && !do_ts {
         eprintln!("warning: --ts-* flags are ignored without --ts");
     } else if irc_subflag_seen && !ts_options.confirm_irc {
@@ -232,6 +291,31 @@ fn run() -> Result<bool, String> {
         .with_charge(charge)
         .with_multiplicity(multiplicity);
     molecule.validate().map_err(|e| e.to_string())?;
+
+    // Two-endpoint transition-state input: the main XYZ is the reactant, --ts-product
+    // is the product. A reaction conserves charge and multiplicity, so the product
+    // takes the reactant's. The guess shares the reactant's composition.
+    let ts_guess = if let Some(path) = &ts_product_path {
+        let pxyz = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
+        let product = Molecule::from_xyz(&pxyz)
+            .map_err(|e| e.to_string())?
+            .with_charge(charge)
+            .with_multiplicity(multiplicity);
+        product.validate().map_err(|e| e.to_string())?;
+        let mut input = hartree::TsGuessInput::new(product);
+        input.use_neb = ts_use_neb;
+        if let Some(n) = ts_neb_images {
+            input.neb_options.n_images = n;
+        }
+        // The energy-peaked scan applies only to the IDPP route; the band finds its own
+        // peak, so it is left unset under --ts-neb.
+        if !ts_use_neb {
+            input.scan_points = ts_scan_points;
+        }
+        Some(input)
+    } else {
+        None
+    };
 
     if do_sph && !do_freq {
         return Err("--sph modifies --freq; pass --freq as well".into());
@@ -697,6 +781,7 @@ fn run() -> Result<bool, String> {
             cosx,
             x2c,
             ts_options,
+            ts_guess,
             // The CLI runs one job per process, so it leaves rayon on its global
             // pool and sets no in-process memory budget; both knobs exist for
             // library/embedding callers that drive several jobs in one process.
@@ -787,6 +872,19 @@ fn run() -> Result<bool, String> {
     }
 
     if let Some(ts) = &result.transition_state {
+        if ts_product_path.is_some() {
+            let route = if ts_use_neb {
+                "climbing-image NEB band"
+            } else if ts_scan_points.is_some() {
+                "an energy-peaked IDPP path scan"
+            } else {
+                "IDPP interpolation"
+            };
+            println!(
+                "note: two-endpoint search -- guess built by {route} between the reactant \
+                 and --ts-product, then refined\n"
+            );
+        }
         report_transition_state(&molecule, &basis, &method_str, &ecp_atoms, ts);
         if !no_method_warnings {
             print_method_warnings(&result.method_warnings);
@@ -2221,6 +2319,19 @@ fn print_usage() {
          \x20                           and reports its frequency (rhf/uhf/rohf/DFT; mutually\n\
          \x20                           exclusive with --opt; no post-HF/RI/direct/COSX/X2C/\n\
          \x20                           smearing/implicit-solvent)\n\
+         \x20   --ts-product <file.xyz>  two-endpoint TS search: the main XYZ is the reactant\n\
+         \x20                           and this is the product. Builds a near-saddle guess\n\
+         \x20                           between them (a single IDPP guess by default) and seeds\n\
+         \x20                           the reaction coordinate before refining (requires --ts;\n\
+         \x20                           product takes the reactant's charge/multiplicity)\n\
+         \x20   --ts-neb                with --ts-product, relax a climbing-image NEB band onto\n\
+         \x20                           the minimum-energy path and refine its climbing image\n\
+         \x20                           instead of a single IDPP guess (more robust, costlier)\n\
+         \x20   --ts-neb-images <int>   interior images for the --ts-neb band [default: 8] (>= 1)\n\
+         \x20   --ts-scan <int>         with --ts-product (IDPP route), place the guess at the\n\
+         \x20                           energy maximum of the path: evaluate the surface at <int>\n\
+         \x20                           images and parabola-fit the peak (>= 3; better guess at\n\
+         \x20                           <int> extra single-point energies)\n\
          \x20   --ts-irc                after a converged TS, trace the intrinsic reaction\n\
          \x20                           coordinate downhill in both senses of the reaction mode\n\
          \x20                           into the two basins and report the endpoint energies\n\

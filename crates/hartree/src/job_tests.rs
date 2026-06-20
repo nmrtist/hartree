@@ -280,3 +280,41 @@ fn scf_non_convergence_yields_recovery_hint() {
     let ts_other = TsError::BadInitialGuess("too few atoms".into());
     assert_eq!(ts_error_message(&ts_other), ts_other.to_string());
 }
+
+/// The NEB-TS flattener unwraps an SCF non-convergence from *either* stage to the
+/// recovery hint, while leaving other errors' own messages intact.
+#[test]
+fn neb_ts_flattener_maps_scf_failure_to_hint() {
+    use crate::opt::ts::{NebError, NebTsError};
+    let scf = || OptError::ScfNotConverged { iterations: 1 };
+    let from_ts = NebTsError::Ts(TsError::SurfaceEvaluation(scf()));
+    assert_eq!(neb_ts_error_message(&from_ts), SCF_RECOVERY_HINT);
+    let from_neb = NebTsError::Neb(NebError::SurfaceEvaluation(scf()));
+    assert_eq!(neb_ts_error_message(&from_neb), SCF_RECOVERY_HINT);
+    // A non-SCF stage error keeps its own message.
+    let other = NebTsError::Neb(NebError::BadEndpoints("ordering".into()));
+    assert_eq!(neb_ts_error_message(&other), other.to_string());
+}
+
+/// A two-endpoint product without a transition-state search is rejected (the guess
+/// would have nowhere to go), with a message naming the missing `--ts`.
+#[test]
+fn ts_guess_without_transition_state_is_rejected() {
+    let options = JobOptions {
+        transition_state: false,
+        ts_guess: Some(TsGuessInput::new(h2())),
+        ..Default::default()
+    };
+    let result = Job {
+        molecule: h2(),
+        basis: "sto-3g".into(),
+        method: Method::Rhf,
+        options,
+    }
+    .run();
+    assert_rejects(
+        result,
+        "without requesting a transition-state search",
+        "ts_guess gate",
+    );
+}

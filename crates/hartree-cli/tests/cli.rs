@@ -118,3 +118,73 @@ fn rejects_open_shell_rhf() {
         .expect("run hartree");
     assert!(!output.status.success());
 }
+
+/// `--ts-product` is the two-endpoint TS input; without `--ts` it is a user error,
+/// caught before any SCF (so this stays fast).
+#[test]
+fn ts_product_without_ts_is_rejected() {
+    let xyz = std::env::temp_dir().join("hartree_cli_react.xyz");
+    let prod = std::env::temp_dir().join("hartree_cli_prod.xyz");
+    std::fs::write(&xyz, "2\nh2\nH 0 0 0\nH 0 0 0.74\n").unwrap();
+    std::fs::write(&prod, "2\nh2\nH 0 0 0\nH 0 0 0.90\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hartree"))
+        .arg(&xyz)
+        .args(["--method", "rhf", "--ts-product"])
+        .arg(&prod)
+        .output()
+        .expect("run hartree");
+    assert!(
+        !output.status.success(),
+        "should reject --ts-product sans --ts"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("add --ts"),
+        "expected a '--ts' hint, got:\n{stderr}"
+    );
+}
+
+/// `--ts-scan` also needs a second endpoint; without `--ts-product` it is rejected.
+#[test]
+fn ts_scan_without_product_is_rejected() {
+    let xyz = std::env::temp_dir().join("hartree_cli_react3.xyz");
+    std::fs::write(&xyz, "2\nh2\nH 0 0 0\nH 0 0 0.74\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hartree"))
+        .arg(&xyz)
+        .args(["--method", "rhf", "--ts", "--ts-scan", "7"])
+        .output()
+        .expect("run hartree");
+    assert!(
+        !output.status.success(),
+        "should reject --ts-scan sans product"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--ts-product"),
+        "expected a '--ts-product' hint, got:\n{stderr}"
+    );
+}
+
+/// `--ts-neb` needs a second endpoint; without `--ts-product` it is rejected.
+#[test]
+fn ts_neb_without_product_is_rejected() {
+    let xyz = std::env::temp_dir().join("hartree_cli_react2.xyz");
+    std::fs::write(&xyz, "2\nh2\nH 0 0 0\nH 0 0 0.74\n").unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_hartree"))
+        .arg(&xyz)
+        .args(["--method", "rhf", "--ts", "--ts-neb"])
+        .output()
+        .expect("run hartree");
+    assert!(
+        !output.status.success(),
+        "should reject --ts-neb sans product"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--ts-product"),
+        "expected a '--ts-product' hint, got:\n{stderr}"
+    );
+}

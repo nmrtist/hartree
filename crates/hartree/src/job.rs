@@ -11,7 +11,11 @@ use crate::dft::{
 use crate::disp::Dispersion;
 use crate::integrals::{ConventionalProvider, DfProvider, DirectProvider, IntegralProvider};
 use crate::linalg::{mat_from_row_major, mat_to_row_major};
-use crate::opt::ts::{Progress, TsError, TsOptions, TsResult, find_transition_state};
+use crate::opt::ts::guess::{GuessOptions, ScanOptions, build_ts_guess, build_ts_guess_scanned};
+use crate::opt::ts::{
+    NebOptions, NebTsError, Progress, TsError, TsOptions, TsResult, find_transition_state,
+    find_transition_state_from_endpoints,
+};
 use crate::opt::{OptError, OptOptions, OptResult, Surface, optimize};
 use crate::props::dipole::{center_of_mass, dipole_moment};
 use crate::props::frequencies::{FrequencyResult, harmonic_frequencies};
@@ -93,6 +97,60 @@ pub enum Method {
     Dft(FunctionalSpec),
 }
 
+/// Two-endpoint input for a transition-state search: a reactant (the job's
+/// [`molecule`](Job::molecule)) plus the `product` it reacts to. When this is set on a
+/// `transition_state` job, the search no longer starts from a single near-saddle guess
+/// — instead the job constructs one between the two minima and refines it.
+///
+/// Two construction routes:
+/// - the default builds a single image-dependent-pair-potential (IDPP) guess between
+///   the endpoints (cheap, no extra surface evaluations) and seeds the saddle search
+///   with the forming/breaking-bond reaction coordinate it reports;
+/// - [`use_neb`](Self::use_neb) instead relaxes a whole climbing-image NEB band onto
+///   the minimum-energy path and refines its climbing image (robust when no good
+///   single guess exists, at the cost of the band relaxation).
+///
+/// Either way the guess shares the reactant's atom count and composition, so the job's
+/// memory estimate and resource guardrails are unchanged. `#[non_exhaustive]`;
+/// construct via [`TsGuessInput::new`] and set the fields you need.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TsGuessInput {
+    /// The product minimum. Must hold the same atom multiset as the reactant (the IDPP
+    /// route maps atoms by connectivity; the NEB route requires identical atom
+    /// ordering for now).
+    pub product: Molecule,
+    /// Relax a climbing-image NEB band between the endpoints instead of building a
+    /// single IDPP guess. More robust for floppy or bimolecular reactions; more
+    /// expensive (one gradient per interior image per band iteration).
+    pub use_neb: bool,
+    /// NEB band controls, consulted only when [`use_neb`](Self::use_neb) is set.
+    pub neb_options: NebOptions,
+    /// IDPP guess-builder controls, consulted on the default (non-NEB) route.
+    pub guess_options: GuessOptions,
+    /// On the IDPP route (`use_neb = false`), place the guess at the *energy* maximum of
+    /// the interpolated path instead of a fixed interpolation fraction: `Some(n)` scans
+    /// `n` path points (must be ≥ 3), evaluating the SCF surface, and parabola-fits the
+    /// peak — a better single-point guess at the cost of `n` extra single-point energies.
+    /// `None` (the default) uses the single geometric IDPP image. Ignored when
+    /// [`use_neb`](Self::use_neb) is set (the band already finds the peak).
+    pub scan_points: Option<usize>,
+}
+
+impl TsGuessInput {
+    /// A two-endpoint TS input for `product`, defaulting to the single-IDPP-guess route
+    /// ([`use_neb`](Self::use_neb) `= false`) with default band/guess controls.
+    pub fn new(product: Molecule) -> Self {
+        Self {
+            product,
+            use_neb: false,
+            neb_options: NebOptions::default(),
+            guess_options: GuessOptions::default(),
+            scan_points: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JobOptions {
     pub all_electron: bool,
@@ -126,6 +184,14 @@ pub struct JobOptions {
     /// Knobs for the transition-state search (algorithm, trust radii, IRC, ...);
     /// only consulted when `transition_state` is set. See [`TsOptions`].
     pub ts_options: TsOptions,
+    /// Optional two-endpoint input for the transition-state search: when `Some` (and
+    /// `transition_state` is set), `molecule` is the reactant and this carries the
+    /// product. The job builds a near-saddle guess between the two minima — a single
+    /// IDPP guess, or a climbing-image NEB band — seeds the reaction coordinate, and
+    /// refines the saddle, instead of starting from `molecule` as a single guess. The
+    /// guess shares the reactant's composition, so the memory estimate is unchanged.
+    /// See [`TsGuessInput`].
+    pub ts_guess: Option<TsGuessInput>,
     /// Cap the rayon worker count for this job. When `Some(k)` with `k >= 1`,
     /// [`Job::run`] runs the whole job (the pre-flight memory estimate and the
     /// solve) inside a scoped `k`-thread pool, so the library's internal data
@@ -174,6 +240,7 @@ impl Default for JobOptions {
             cosx: false,
             x2c: false,
             ts_options: TsOptions::default(),
+            ts_guess: None,
             n_threads: None,
             mem_budget_bytes: None,
         }
@@ -1042,6 +1109,13 @@ impl Job {
                     .into(),
             );
         }
+        if opts.ts_guess.is_some() && !opts.transition_state {
+            return Err(
+                "a transition-state product endpoint was given without requesting a \
+                 transition-state search: set transition_state (the CLI --ts flag)"
+                    .into(),
+            );
+        }
         if opts.cosmo_file.is_some() && (opts.optimize_geometry || opts.transition_state) {
             return Err(
                 "COSMO file export cannot be combined with geometry optimization or \
@@ -1393,8 +1467,55 @@ impl Job {
             if let Some(srb) = opts.srb {
                 surface.set_srb(srb);
             }
-            let ts = find_transition_state(mol, &mut surface, &ts_opts, None)
-                .map_err(|e| ts_error_message(&e))?;
+            // Single-guess (start from `mol`) or two-endpoint (build a guess between
+            // `mol` and the product, then refine). The two-endpoint guess shares the
+            // reactant's composition, so the same `surface` drives it.
+            let ts = match &opts.ts_guess {
+                None => find_transition_state(mol, &mut surface, &ts_opts, None)
+                    .map_err(|e| ts_error_message(&e))?,
+                Some(g) if g.use_neb => {
+                    find_transition_state_from_endpoints(
+                        mol,
+                        &g.product,
+                        &mut surface,
+                        &g.neb_options,
+                        &ts_opts,
+                        None,
+                    )
+                    .map_err(|e| neb_ts_error_message(&e))?
+                    .transition_state
+                }
+                Some(g) => {
+                    // Build a guess between the endpoints and seed the saddle search with
+                    // the reaction coordinate (unless the caller already supplied a seed in
+                    // `ts_options`). The reactant is one fragment (already a combined
+                    // geometry); the IDPP builder maps it onto the product. `scan_points`
+                    // selects between a single geometric image and the energy-peaked scan
+                    // (which evaluates the surface, so it shares `surface`).
+                    let guess = match g.scan_points {
+                        Some(n_points) => build_ts_guess_scanned(
+                            std::slice::from_ref(mol),
+                            &g.product,
+                            &mut surface,
+                            &ScanOptions {
+                                guess: g.guess_options.clone(),
+                                n_points,
+                            },
+                        )
+                        .map_err(|e| e.to_string())?,
+                        None => {
+                            build_ts_guess(std::slice::from_ref(mol), &g.product, &g.guess_options)
+                                .map_err(|e| e.to_string())?
+                        }
+                    };
+                    let mut seeded = ts_opts.clone();
+                    if seeded.reaction_mode_seed.is_none() {
+                        seeded.reaction_mode_seed = guess.reaction_mode_seed();
+                    }
+                    find_transition_state(&guess.molecule, &mut surface, &seeded, None)
+                        .map_err(|e| ts_error_message(&e))?
+                }
+            };
             let scf = surface
                 .last_scf()
                 .cloned()
@@ -2271,6 +2392,20 @@ fn ts_error_message(e: &TsError) -> String {
             SCF_RECOVERY_HINT.to_string()
         }
         // `TsError` is `#[non_exhaustive]`; everything else keeps its own message.
+        other => other.to_string(),
+    }
+}
+
+/// Flatten a [`NebTsError`] (the two-endpoint NEB-TS pipeline) for the CLI. An SCF
+/// non-convergence at a band image or during the refinement gets the same recovery
+/// hint as the single-geometry path; everything else keeps its own message.
+fn neb_ts_error_message(e: &NebTsError) -> String {
+    use crate::opt::ts::NebError;
+    match e {
+        NebTsError::Ts(TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. }))
+        | NebTsError::Neb(NebError::SurfaceEvaluation(OptError::ScfNotConverged { .. })) => {
+            SCF_RECOVERY_HINT.to_string()
+        }
         other => other.to_string(),
     }
 }
