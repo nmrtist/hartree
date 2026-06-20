@@ -13,6 +13,7 @@ mod convergence;
 mod dimer;
 mod irc;
 mod linear;
+mod robustness;
 mod saddle;
 
 /// A bent, non-collinear arrangement of three identical atoms (Bohr). Equal

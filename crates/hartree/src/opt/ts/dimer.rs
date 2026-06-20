@@ -9,20 +9,20 @@
 //! align it with the softest mode (finite-differencing the curvature along `N`),
 //! then *translates* the midpoint by inverting the force component along that
 //! mode — climbing uphill toward the saddle along `N` while descending the rest.
-//! Convergence is tested on the Cartesian force/step exactly as in P-RFO; after
-//! it, the shared [`verify_saddle`](super::verify_saddle) check confirms one
-//! negative mode and the [`super::prfo::irc_endpoints`] tracer (reused, not
-//! duplicated) optionally confirms the basins the saddle joins.
+//! Convergence is tested on the trans/rot-projected Cartesian force/step exactly
+//! as in P-RFO; after it, the shared [`verify_saddle`](super::verify_saddle)
+//! check confirms one negative mode and the [`super::prfo::irc_endpoints`] tracer
+//! (reused, not duplicated) optionally confirms the basins the saddle joins.
 
 use std::f64::consts::PI;
 
 use super::numerics::{
     add_step, disp_norms, dot, force_norms, gradient, gram_schmidt, mass_weight_grad, masses_of,
-    norm, positions_of, trans_rot_vectors, unmass_weight_step,
+    norm, positions_of, projected_force_norms, trans_rot_vectors, unmass_weight_step,
 };
 use super::{Flow, Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
 use crate::core::Molecule;
-use crate::opt::{OptStep, Surface};
+use crate::opt::{OptError, OptStep, Surface};
 
 /// Maximum dimer rotations per outer (translation) step.
 const MAX_ROT: usize = 4;
@@ -140,12 +140,15 @@ pub(super) fn run_dimer<S: Surface>(
 
         let g0_cart = gradient(surface, &x, options.fd_step)?;
         let (max_force, rms_force) = force_norms(&g0_cart);
+        // Judge convergence (and best-so-far) on the trans/rot-projected force, the
+        // frame the rotation/translation runs in; keep the raw force in the record.
+        let (conv_force, conv_rms) = projected_force_norms(&g0_cart, &masses, &x);
         let (max_disp, rms_disp) = match &x_prev {
             Some(xp) => disp_norms(&x, xp),
             None => (0.0, 0.0),
         };
-        if max_force < best_force {
-            best_force = max_force;
+        if conv_force < best_force {
+            best_force = conv_force;
             best_x = x.clone();
             best_energy = energy;
         }
@@ -166,7 +169,7 @@ pub(super) fn run_dimer<S: Surface>(
             }
         }
 
-        let force_ok = max_force < options.max_force && rms_force < options.rms_force;
+        let force_ok = conv_force < options.max_force && conv_rms < options.rms_force;
         let disp_ok =
             x_prev.is_none() || (max_disp < options.max_disp && rms_disp < options.rms_disp);
         if force_ok && disp_ok {
@@ -298,7 +301,13 @@ pub(super) fn run_dimer<S: Surface>(
             )?,
         };
 
-        // TRANSLATION (note the PLUS sign on step_par — it climbs uphill along N).
+        // TRANSLATION (note the PLUS sign on step_par — it climbs uphill along N),
+        // with SCF backtracking: a climbing step can overshoot into a region where
+        // the SCF will not converge, so on `ScfNotConverged` shrink the trust radius
+        // and recompute the step from the same midpoint instead of propagating the
+        // failure. The dimer keeps no quadratic energy model, so unlike P-RFO it has
+        // no actual/predicted ratio to reject on — SCF recovery is the win here. A
+        // failure that persists through every retry is a soft stop, not an abort.
         let gpar = dot(&g0, &n_axis);
         let gperp_vec: Vec<f64> = g0
             .iter()
@@ -306,37 +315,73 @@ pub(super) fn run_dimer<S: Surface>(
             .map(|(g, ni)| g - gpar * ni)
             .collect();
         let step_par = gpar / curvature.abs().max(C_MIN);
-        let mut dq: Vec<f64> = n_axis.iter().map(|ni| step_par * ni).collect();
-        if curvature < 0.0 {
-            for (dqi, &gp) in dq.iter_mut().zip(&gperp_vec) {
-                *dqi -= ALPHA * gp;
+
+        let mut attempt_trust = trust;
+        let mut retries = 0usize;
+        let committed = loop {
+            let mut dq: Vec<f64> = n_axis.iter().map(|ni| step_par * ni).collect();
+            if curvature < 0.0 {
+                for (dqi, &gp) in dq.iter_mut().zip(&gperp_vec) {
+                    *dqi -= ALPHA * gp;
+                }
             }
-        }
-        let mut dq_norm = norm(&dq);
-        if dq_norm < 1e-10 {
-            // The gradient is (near-)orthogonal to the soft mode, so the Newton
-            // step vanishes; take a trust-sized step along the axis to keep
-            // climbing rather than stall in place.
-            for (v, &ni) in dq.iter_mut().zip(&n_axis) {
-                *v = trust * ni;
+            let mut dq_norm = norm(&dq);
+            if dq_norm < 1e-10 {
+                // The gradient is (near-)orthogonal to the soft mode, so the Newton
+                // step vanishes; take a trust-sized step along the axis to keep
+                // climbing rather than stall in place.
+                for (v, &ni) in dq.iter_mut().zip(&n_axis) {
+                    *v = attempt_trust * ni;
+                }
+                dq_norm = norm(&dq);
             }
-            dq_norm = norm(&dq);
-        }
-        if dq_norm > trust && dq_norm > 0.0 {
-            let scale = trust / dq_norm;
-            for v in &mut dq {
-                *v *= scale;
+            if dq_norm > attempt_trust && dq_norm > 0.0 {
+                let scale = attempt_trust / dq_norm;
+                for v in &mut dq {
+                    *v *= scale;
+                }
             }
-        }
-        let step_norm = norm(&dq);
-        let x_new = add_step(&x, &unmass_weight_step(&dq, &masses));
+            let step_norm = norm(&dq);
+            let x_new = add_step(&x, &unmass_weight_step(&dq, &masses));
+
+            let shrink_allowed =
+                retries < options.max_step_retries && attempt_trust > options.min_trust * 1.0001;
+            match surface.energy(&x_new) {
+                Ok(e) if e.is_finite() => break Some((x_new, e, step_norm)),
+                // A non-finite trial energy: retry smaller if we still can, else it
+                // is a genuine numerical fault.
+                Ok(_) if shrink_allowed => {
+                    retries += 1;
+                    attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
+                }
+                Ok(_) => {
+                    return Err(TsError::Numerical(
+                        "surface returned a non-finite energy".to_string(),
+                    ));
+                }
+                Err(OptError::ScfNotConverged { .. }) if shrink_allowed => {
+                    retries += 1;
+                    attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
+                }
+                // SCF failed and no retry budget remains: stop softly with best-so-far.
+                Err(OptError::ScfNotConverged { .. }) => break None,
+                Err(e) => return Err(TsError::SurfaceEvaluation(e)),
+            }
+        };
+
+        let Some((x_new, energy_new, step_norm)) = committed else {
+            // SCF would not converge from this midpoint even after backtracking;
+            // stop with the best geometry so far rather than aborting the search.
+            break;
+        };
 
         x_prev = Some(x.clone());
         x = x_new;
-        energy = surface.energy(&x)?;
+        energy = energy_new;
         axis = Some(n_axis);
         g_prev = Some(g0);
         last_step_norm = step_norm;
+        trust = attempt_trust;
         trust_prev = trust;
     }
 

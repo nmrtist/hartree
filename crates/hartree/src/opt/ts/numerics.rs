@@ -5,7 +5,7 @@
 use super::SaddleVerification;
 use crate::core::Molecule;
 use crate::core::units::FREQ_CONV_CM1;
-use crate::linalg::{mat_from_row_major, mat_to_row_major, matmul, symmetric_eigh};
+use crate::linalg::{mat_from_row_major, mat_to_row_major, matmul, symmetric_eigh_checked};
 use crate::opt::{OptError, Surface};
 
 pub(super) struct MwSpectrum {
@@ -63,6 +63,36 @@ pub(super) fn disp_norms(x: &[[f64; 3]], x_prev: &[[f64; 3]]) -> (f64, f64) {
         }
     }
     (max, (sum_sq / count as f64).sqrt())
+}
+
+/// Remove the rigid-body (translation/rotation) component of a Cartesian gradient
+/// in the mass-weighted frame the Hessian spectrum uses, returning the residual in
+/// Cartesian units. Where the gradient carries no rigid-body component this is the
+/// identity, so the force thresholds keep their meaning; it strips only a net
+/// force/torque (e.g. finite-difference residue, or drift accumulated over the
+/// climb) that would otherwise inflate the convergence metric at a true saddle.
+pub(super) fn project_trans_rot(g: &[[f64; 3]], masses: &[f64], x: &[[f64; 3]]) -> Vec<[f64; 3]> {
+    let basis = gram_schmidt(&trans_rot_vectors(x, masses));
+    let mut v = mass_weight_grad(g, masses);
+    for b in &basis {
+        let p: f64 = v.iter().zip(b).map(|(vi, bi)| vi * bi).sum();
+        for (vi, &bi) in v.iter_mut().zip(b) {
+            *vi -= p * bi;
+        }
+    }
+    (0..masses.len())
+        .map(|a| {
+            let s = masses[a].sqrt();
+            [v[3 * a] * s, v[3 * a + 1] * s, v[3 * a + 2] * s]
+        })
+        .collect()
+}
+
+/// `force_norms` of the gradient with rigid-body contamination projected out — the
+/// quantity the saddle search applies its force thresholds to (the step is taken in
+/// the same projected frame, so the convergence test and the step now agree).
+pub(super) fn projected_force_norms(g: &[[f64; 3]], masses: &[f64], x: &[[f64; 3]]) -> (f64, f64) {
+    force_norms(&project_trans_rot(g, masses, x))
 }
 
 pub(super) fn masses_of(molecule: &Molecule) -> Vec<f64> {
@@ -177,11 +207,17 @@ pub(super) fn matvec(h: &[f64], s: &[f64], n: usize) -> Vec<f64> {
         .collect()
 }
 
+/// Diagonalize the mass-weighted, translation/rotation-projected Cartesian
+/// Hessian. Routed through the [non-panicking eigensolver](symmetric_eigh_checked)
+/// because the input is a finite-difference (or quasi-Newton-maintained) Hessian
+/// that can drift non-finite or ill-conditioned; the `Err` lets the caller rebuild
+/// and retry rather than abort. The error string is wrapped into
+/// [`TsError::Numerical`](super::TsError::Numerical) at the driver boundary.
 pub(super) fn mw_projected_hessian(
     x: &[[f64; 3]],
     masses: &[f64],
     hess_cart: &[f64],
-) -> MwSpectrum {
+) -> Result<MwSpectrum, String> {
     let natom = x.len();
     let ndof = 3 * natom;
 
@@ -214,11 +250,11 @@ pub(super) fn mw_projected_hessian(
     let p = mat_from_row_major(ndof, &proj);
     let f = mat_from_row_major(ndof, &mw);
     let fp = matmul(&matmul(&p, &f), &p);
-    let eigh = symmetric_eigh(&fp);
-    MwSpectrum {
+    let eigh = symmetric_eigh_checked(&fp)?;
+    Ok(MwSpectrum {
         eigenvalues: eigh.values,
         eigenvectors: mat_to_row_major(&eigh.vectors),
-    }
+    })
 }
 
 /// The mass-weighted translation (3) and rotation (3, or 2 if linear) vectors,
@@ -312,11 +348,11 @@ pub(super) fn saddle_from_hessian(
     molecule: &Molecule,
     hessian: &[f64],
     tol: f64,
-) -> SaddleVerification {
+) -> Result<SaddleVerification, String> {
     let natom = molecule.len();
     let ndof = 3 * natom;
     let masses = masses_of(molecule);
-    let spec = mw_projected_hessian(&positions_of(molecule), &masses, hessian);
+    let spec = mw_projected_hessian(&positions_of(molecule), &masses, hessian)?;
 
     let negative_eigenvalues: Vec<f64> = spec
         .eigenvalues
@@ -349,9 +385,9 @@ pub(super) fn saddle_from_hessian(
             (None, None)
         };
 
-    SaddleVerification {
+    Ok(SaddleVerification {
         negative_eigenvalues,
         reaction_mode,
         imaginary_frequency_cm1,
-    }
+    })
 }

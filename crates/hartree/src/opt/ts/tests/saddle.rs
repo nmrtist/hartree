@@ -49,7 +49,7 @@ fn reaction_mode_is_cartesian_for_heteronuclear() {
 
     // Expected Cartesian reaction mode: un-mass-weight the lowest mass-weighted mode.
     let masses: Vec<f64> = mol.atoms.iter().map(|a| a.element.mass()).collect();
-    let spec = mw_projected_hessian(&x0, &masses, &h);
+    let spec = mw_projected_hessian(&x0, &masses, &h).unwrap();
     let q = column(&spec.eigenvectors, 9, 0);
     let mut cart = q.clone();
     for a in 0..3 {

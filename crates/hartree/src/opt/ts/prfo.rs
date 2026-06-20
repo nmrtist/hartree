@@ -5,22 +5,47 @@
 //! rotations projected out (the [`crate::props::frequencies`] frame). Each step
 //! diagonalizes the projected Hessian, follows one mode uphill while minimizing
 //! the rest (the partitioned RFO step), and maintains the Hessian by a Bofill
-//! update. Convergence is tested on the Cartesian force/step; after it, the
-//! shared [`verify_saddle`](super::verify_saddle) check confirms one negative mode.
+//! update. Convergence is tested on the trans/rot-projected Cartesian force and
+//! the step; after it, the shared [`verify_saddle`](super::verify_saddle) check
+//! confirms one negative mode.
+//!
+//! The per-step math (the RFO step, mode selection, the Bofill update, the trust
+//! adaption, and the acceptance test) lives in [`super::step`]; this file is the
+//! driver loop, the Hessian maintenance, and the step backtracking around them.
 
 use super::numerics::{
-    MwSpectrum, add_step, column, disp_norms, dot, fd_hessian, flatten, force_norms, gradient,
-    gram_schmidt, mass_weight_grad, masses_of, matvec, mw_projected_hessian, non_null_modes, norm,
-    overlap, positions_of, predicted_change_cart, trans_rot_vectors, unmass_weight_step,
+    add_step, column, disp_norms, fd_hessian, flatten, force_norms, gradient, gram_schmidt,
+    mass_weight_grad, masses_of, mw_projected_hessian, non_null_modes, norm, overlap, positions_of,
+    predicted_change_cart, projected_force_norms, trans_rot_vectors, unmass_weight_step,
 };
+use super::step::{bofill_update, is_pathological, prfo_step, select_followed, update_trust_ts};
 use super::{Flow, IrcEndpoints, Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
 use crate::core::Molecule;
-use crate::linalg::{mat_from_row_major, symmetric_eigh};
-use crate::opt::{OptStep, Surface};
+use crate::opt::{OptError, OptStep, Surface};
 
 /// Overlap with the previously followed eigenvector below which mode tracking is
 /// taken to have failed (and the Hessian is recomputed).
 const TRACK_TOL: f64 = 0.5;
+
+/// One accepted P-RFO step, threaded out of the backtracking loop in one piece:
+/// the data the trust adaption, Hessian update, and commit all consume. The
+/// gradient at `x_new` is *not* carried — it is evaluated once after acceptance, so
+/// a backtracking retry (which only needs the energy) does not pay for a discarded
+/// finite-difference gradient.
+struct AcceptedStep {
+    /// Mass-weighted step (flat), for the trust adaption's `step_norm`.
+    dxi: Vec<f64>,
+    /// Cartesian step, for the Bofill `s` vector.
+    dx: Vec<[f64; 3]>,
+    /// Model-predicted energy change, for the trust adaption and Hessian guard.
+    predicted: f64,
+    /// Trial geometry reached.
+    x_new: Vec<[f64; 3]>,
+    /// Energy at `x_new`.
+    energy_new: f64,
+    /// Actual energy change `energy_new - energy`, for the trust adaption.
+    actual: f64,
+}
 
 pub(super) fn run_prfo<S: Surface>(
     molecule: &Molecule,
@@ -44,6 +69,14 @@ pub(super) fn run_prfo<S: Surface>(
 
     let mut energy = surface.energy(&x)?;
     let mut g = gradient(surface, &x, options.fd_step)?;
+    // A non-finite energy/gradient at an accepted point yields no usable step (and
+    // a non-finite gradient would otherwise reach the panicking inner eigensolver
+    // in `prfo_step`); surface it as the documented soft fault.
+    if !energy.is_finite() || !finite_grad(&g) {
+        return Err(TsError::Numerical(
+            "surface returned a non-finite energy or gradient at the initial geometry".to_string(),
+        ));
+    }
     let mut hess = fd_hessian(surface, &x, options.fd_step)?;
 
     let mut trust = options
@@ -66,12 +99,16 @@ pub(super) fn run_prfo<S: Surface>(
     for iter in 1..=options.max_iter {
         iterations = iter;
         let (max_force, rms_force) = force_norms(&g);
+        // Convergence (and best-so-far) are judged on the trans/rot-projected force,
+        // the frame the step lives in; the history record keeps the raw force so the
+        // reported trace is unchanged.
+        let (conv_force, conv_rms) = projected_force_norms(&g, &masses, &x);
         let (max_disp, rms_disp) = match &x_prev {
             Some(xp) => disp_norms(&x, xp),
             None => (0.0, 0.0),
         };
-        if max_force < best_force {
-            best_force = max_force;
+        if conv_force < best_force {
+            best_force = conv_force;
             best_x = x.clone();
             best_energy = energy;
         }
@@ -92,7 +129,7 @@ pub(super) fn run_prfo<S: Surface>(
             }
         }
 
-        let force_ok = max_force < options.max_force && rms_force < options.rms_force;
+        let force_ok = conv_force < options.max_force && conv_rms < options.rms_force;
         let disp_ok =
             x_prev.is_none() || (max_disp < options.max_disp && rms_disp < options.rms_disp);
         if force_ok && disp_ok {
@@ -103,7 +140,18 @@ pub(super) fn run_prfo<S: Surface>(
             break;
         }
 
-        let mut spec = mw_projected_hessian(&x, &masses, &hess);
+        // Diagonalize the maintained Hessian's projected spectrum, self-healing a
+        // numerical failure once: a stale quasi-Newton (Bofill) Hessian can drift to
+        // a non-finite or ill-conditioned state the checked eigensolver rejects, so
+        // rebuild it from finite differences and retry before giving up.
+        let mut spec = match mw_projected_hessian(&x, &masses, &hess) {
+            Ok(s) => s,
+            Err(_) => {
+                hess = fd_hessian(surface, &x, options.fd_step)?;
+                steps_since_hess = 0;
+                mw_projected_hessian(&x, &masses, &hess).map_err(TsError::Numerical)?
+            }
+        };
         let mut non_null = non_null_modes(&spec);
         if non_null.is_empty() {
             break;
@@ -116,7 +164,7 @@ pub(super) fn run_prfo<S: Surface>(
             if overlap(&spec, ndof, followed, reference) < TRACK_TOL && steps_since_hess > 0 {
                 hess = fd_hessian(surface, &x, options.fd_step)?;
                 steps_since_hess = 0;
-                spec = mw_projected_hessian(&x, &masses, &hess);
+                spec = mw_projected_hessian(&x, &masses, &hess).map_err(TsError::Numerical)?;
                 non_null = non_null_modes(&spec);
                 if non_null.is_empty() {
                     break;
@@ -127,31 +175,105 @@ pub(super) fn run_prfo<S: Surface>(
         followed_vec = Some(column(&spec.eigenvectors, ndof, followed));
 
         let g_mw = mass_weight_grad(&g, &masses);
-        let mut dxi = prfo_step(&spec, &g_mw, &non_null, followed, trust);
-        if norm(&dxi) < 1e-10 {
-            // RFO produced no step (e.g. a symmetric guess with no gradient along
-            // the climbed mode): take a trust-sized step along it to break the stall.
-            for (i, slot) in dxi.iter_mut().enumerate() {
-                *slot = trust * spec.eigenvectors[i * ndof + followed];
-            }
-        }
-        let dx = unmass_weight_step(&dxi, &masses);
 
-        let predicted = predicted_change_cart(&g, &hess, &dx);
-        let x_new = add_step(&x, &dx);
-        let energy_new = surface.energy(&x_new)?;
-        let g_new = gradient(surface, &x_new, options.fd_step)?;
-        let actual = energy_new - energy;
+        // Step with backtracking: shrink the trust radius and retry from the same
+        // point when a trial step's SCF fails to converge, returns a non-finite
+        // energy, or grossly overshoots the quadratic model (see `is_pathological`).
+        // Only the energy is evaluated here — the decision needs nothing else — so a
+        // rejected retry does not pay for a (finite-difference) gradient; the
+        // gradient is taken once, below, after a step is accepted. A persistent SCF
+        // failure is a soft stop (best-so-far, NotConverged) rather than an abort.
+        let mut attempt_trust = trust;
+        let mut retries = 0usize;
+        let accepted = loop {
+            let mut dxi = prfo_step(&spec, &g_mw, &non_null, followed, attempt_trust);
+            if norm(&dxi) < 1e-10 {
+                // RFO produced no step (e.g. a symmetric guess with no gradient along
+                // the climbed mode): take a trust-sized step along it to break the stall.
+                for (i, slot) in dxi.iter_mut().enumerate() {
+                    *slot = attempt_trust * spec.eigenvectors[i * ndof + followed];
+                }
+            }
+            let dx = unmass_weight_step(&dxi, &masses);
+            let predicted = predicted_change_cart(&g, &hess, &dx);
+            let x_new = add_step(&x, &dx);
+
+            let shrink_allowed =
+                retries < options.max_step_retries && attempt_trust > options.min_trust * 1.0001;
+            match surface.energy(&x_new) {
+                Ok(energy_new) => {
+                    if !energy_new.is_finite() {
+                        // A non-finite trial energy: retry smaller if we still can,
+                        // else it is a genuine numerical fault.
+                        if shrink_allowed {
+                            retries += 1;
+                            attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
+                            continue;
+                        }
+                        return Err(TsError::Numerical(
+                            "surface returned a non-finite energy".to_string(),
+                        ));
+                    }
+                    let actual = energy_new - energy;
+                    if is_pathological(actual, predicted) && shrink_allowed {
+                        retries += 1;
+                        attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
+                        continue;
+                    }
+                    break Some(AcceptedStep {
+                        dxi,
+                        dx,
+                        predicted,
+                        x_new,
+                        energy_new,
+                        actual,
+                    });
+                }
+                Err(OptError::ScfNotConverged { .. }) if shrink_allowed => {
+                    retries += 1;
+                    attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
+                }
+                // SCF failed and no retry budget remains: stop softly with best-so-far.
+                Err(OptError::ScfNotConverged { .. }) => break None,
+                Err(e) => return Err(TsError::SurfaceEvaluation(e)),
+            }
+        };
+
+        let Some(step) = accepted else {
+            // The SCF would not converge from this point even after backtracking;
+            // stop with the best geometry so far rather than aborting the search.
+            break;
+        };
+
+        // The step is accepted: now (and only now) evaluate the gradient at it.
+        let g_new = gradient(surface, &step.x_new, options.fd_step)?;
+        if !finite_grad(&g_new) {
+            return Err(TsError::Numerical(
+                "surface returned a non-finite gradient at an accepted step".to_string(),
+            ));
+        }
+
         // Judge the trust step in the frame it was capped in (‖dxi‖, mass-weighted):
         // the Cartesian ‖dx‖ shrinks as dxi/√m and would stop the radius growing.
-        trust = update_trust_ts(trust, actual, predicted, norm(&dxi), options);
+        trust = update_trust_ts(
+            attempt_trust,
+            step.actual,
+            step.predicted,
+            norm(&step.dxi),
+            options,
+        );
 
         steps_since_hess += 1;
-        if options.recalc_hessian != 0 && steps_since_hess >= options.recalc_hessian {
-            hess = fd_hessian(surface, &x_new, options.fd_step)?;
+        // A step that was force-accepted despite overshooting the model (retries or
+        // the trust floor exhausted) carries a curvature sample the model could not
+        // describe; rebuild a fresh Hessian instead of feeding it to Bofill.
+        let forced_overshoot = is_pathological(step.actual, step.predicted);
+        let recalc_due = options.recalc_hessian != 0 && steps_since_hess >= options.recalc_hessian;
+        if forced_overshoot || recalc_due {
+            hess = fd_hessian(surface, &step.x_new, options.fd_step)?;
             steps_since_hess = 0;
         } else {
-            let s = flatten(&dx);
+            let s = flatten(&step.dx);
             let gf_new = flatten(&g_new);
             let gf_old = flatten(&g);
             let y: Vec<f64> = gf_new.iter().zip(&gf_old).map(|(a, b)| a - b).collect();
@@ -159,8 +281,8 @@ pub(super) fn run_prfo<S: Surface>(
         }
 
         x_prev = Some(x.clone());
-        x = x_new;
-        energy = energy_new;
+        x = step.x_new;
+        energy = step.energy_new;
         g = g_new;
     }
 
@@ -219,151 +341,11 @@ pub(super) fn run_prfo<S: Surface>(
     })
 }
 
-/// One partitioned RFO step in the mass-weighted eigenbasis: the `followed` mode
-/// is driven to a maximum, the rest to a minimum. Returns the trust-limited,
-/// mass-weighted Cartesian step (flat, length `ndof`).
-fn prfo_step(
-    spec: &MwSpectrum,
-    g_mw: &[f64],
-    non_null: &[usize],
-    followed: usize,
-    trust: f64,
-) -> Vec<f64> {
-    let ndof = spec.eigenvalues.len();
-    let fcomp = |k: usize| -> f64 {
-        (0..ndof)
-            .map(|i| spec.eigenvectors[i * ndof + k] * g_mw[i])
-            .sum()
-    };
-    let b = |k: usize| spec.eigenvalues[k];
-
-    // Followed mode: upper root of [[b_p, F_p], [F_p, 0]] gives an uphill step.
-    let fp = fcomp(followed);
-    let bp = b(followed);
-    let lambda_p = 0.5 * (bp + (bp * bp + 4.0 * fp * fp).sqrt());
-    let denom_p = bp - lambda_p;
-    let step_p = if denom_p.abs() > 1e-12 {
-        -fp / denom_p
-    } else {
-        0.0
-    };
-
-    // Remaining modes: lowest root of [[diag(b_N), F_N], [F_N^T, 0]] gives downhill steps.
-    let minimized: Vec<usize> = non_null
-        .iter()
-        .copied()
-        .filter(|&k| k != followed)
-        .collect();
-    let m = minimized.len();
-    let lambda_n = if m > 0 {
-        let mut aug = vec![0.0f64; (m + 1) * (m + 1)];
-        for (a, &k) in minimized.iter().enumerate() {
-            aug[a * (m + 1) + a] = b(k);
-            let fk = fcomp(k);
-            aug[a * (m + 1) + m] = fk;
-            aug[m * (m + 1) + a] = fk;
-        }
-        symmetric_eigh(&mat_from_row_major(m + 1, &aug)).values[0]
-    } else {
-        0.0
-    };
-
-    let mut dxi = vec![0.0f64; ndof];
-    for (i, slot) in dxi.iter_mut().enumerate() {
-        *slot += step_p * spec.eigenvectors[i * ndof + followed];
-    }
-    for &k in &minimized {
-        let denom = b(k) - lambda_n;
-        let step_k = if denom.abs() > 1e-12 {
-            -fcomp(k) / denom
-        } else {
-            0.0
-        };
-        for (i, slot) in dxi.iter_mut().enumerate() {
-            *slot += step_k * spec.eigenvectors[i * ndof + k];
-        }
-    }
-
-    let n = norm(&dxi);
-    if n > trust && n > 0.0 {
-        let scale = trust / n;
-        for v in &mut dxi {
-            *v *= scale;
-        }
-    }
-    dxi
-}
-
-/// First step: the `follow_mode`-th non-null mode by ascending eigenvalue.
-/// Later steps: the non-null mode of maximum overlap with the previous one.
-fn select_followed(
-    spec: &MwSpectrum,
-    non_null: &[usize],
-    follow_mode: usize,
-    previous: &Option<Vec<f64>>,
-) -> usize {
-    let ndof = spec.eigenvalues.len();
-    match previous {
-        None => non_null[follow_mode.min(non_null.len() - 1)],
-        Some(reference) => non_null
-            .iter()
-            .copied()
-            .max_by(|&a, &b| {
-                overlap(spec, ndof, a, reference)
-                    .partial_cmp(&overlap(spec, ndof, b, reference))
-                    .unwrap()
-            })
-            .unwrap(),
-    }
-}
-
-/// Bofill (1994) Hessian update — an SR1/PSB blend that, unlike BFGS, preserves
-/// the indefiniteness the reaction mode needs. `s` is the Cartesian step, `y` the
-/// gradient change.
-fn bofill_update(hess: &mut [f64], s: &[f64], y: &[f64], n: usize) {
-    let ss = dot(s, s);
-    if ss < 1e-14 {
-        return;
-    }
-    let hs = matvec(hess, s, n);
-    let delta: Vec<f64> = y.iter().zip(&hs).map(|(yi, hsi)| yi - hsi).collect();
-    let sd = dot(s, &delta);
-    let dd = dot(&delta, &delta);
-    let phi = if dd > 1e-14 {
-        (sd * sd) / (ss * dd)
-    } else {
-        0.0
-    };
-    let ms_ok = sd.abs() > 1e-12;
-    for i in 0..n {
-        for j in 0..n {
-            let ms = if ms_ok { delta[i] * delta[j] / sd } else { 0.0 };
-            let psb = (delta[i] * s[j] + s[i] * delta[j]) / ss - sd * s[i] * s[j] / (ss * ss);
-            hess[i * n + j] += phi * ms + (1.0 - phi) * psb;
-        }
-    }
-}
-
-/// Adapt the trust radius from how well the quadratic model predicted the energy
-/// change. `step_norm` is mass-weighted, matching `prfo_step`'s cap.
-fn update_trust_ts(
-    trust: f64,
-    actual: f64,
-    predicted: f64,
-    step_norm: f64,
-    opts: &TsOptions,
-) -> f64 {
-    if predicted.abs() < 1e-14 {
-        return trust;
-    }
-    let ratio = actual / predicted;
-    if (0.75..=1.25).contains(&ratio) && step_norm > 0.8 * trust {
-        (2.0 * trust).min(opts.max_trust)
-    } else if !(0.25..=1.75).contains(&ratio) {
-        (0.5 * trust).max(opts.min_trust)
-    } else {
-        trust
-    }
+/// Whether every component of a Cartesian gradient is finite. A non-finite
+/// gradient would otherwise flow into the (panicking) inner eigensolver of
+/// [`prfo_step`]; the driver maps it to [`TsError::Numerical`] instead.
+fn finite_grad(g: &[[f64; 3]]) -> bool {
+    g.iter().all(|v| v.iter().all(|c| c.is_finite()))
 }
 
 const IRC_DISPLACE: f64 = 0.2;

@@ -45,6 +45,7 @@ pub mod guess;
 mod dimer;
 mod numerics;
 mod prfo;
+mod step;
 // The analytic-surface tests favour explicit index loops over the atom/Cartesian
 // grid and `TsOptions::default()` + field mutation (the documented way to build
 // the `#[non_exhaustive]` options); both read clearer here than the lint's
@@ -117,9 +118,13 @@ pub struct TsOptions {
     /// for the numerical Hessian / curvature estimates the algorithms need.
     pub fd_step: f64,
 
-    /// Convergence threshold on the largest force component (atomic units).
+    /// Convergence threshold on the largest force component (atomic units). The
+    /// force is measured after projecting out the rigid-body translation/rotation
+    /// modes, so a residual net force/torque does not set a noise floor on
+    /// convergence.
     pub max_force: f64,
-    /// Convergence threshold on the RMS force.
+    /// Convergence threshold on the RMS force (after the same trans/rot projection
+    /// as [`max_force`](Self::max_force)).
     pub rms_force: f64,
     /// Convergence threshold on the largest step component.
     pub max_disp: f64,
@@ -163,6 +168,27 @@ pub struct TsOptions {
     /// connects two distinct basins; the endpoints land in [`TsResult::irc`].
     /// `false` skips the (extra surface evaluations) check.
     pub confirm_irc: bool,
+
+    /// Maximum times a single step is shrunk (to a quarter of the trust radius) and
+    /// retried from the same geometry before the search gives up on it. A trial step
+    /// is retried when its surface evaluation fails to converge
+    /// ([`OptError::ScfNotConverged`]) or returns a non-finite energy, and — for
+    /// P-RFO, which carries a quadratic model — when the step grossly overshoots the
+    /// model. Whatever the retry budget, an unrecovered trial-step SCF failure ends
+    /// the search *softly* ([`TsStatus::NotConverged`] with best-so-far) rather than
+    /// surfacing a [`TsError`]; only a failure at an already-accepted point (the
+    /// initial geometry, or an accepted step's gradient) is a hard error. `0`
+    /// disables backtracking: a converged step is accepted unconditionally and the
+    /// first unrecovered SCF failure soft-stops. Retries do not consume
+    /// [`max_iter`](Self::max_iter) iterations.
+    #[serde(default = "default_max_step_retries")]
+    pub max_step_retries: usize,
+}
+
+/// Default step-retry budget (see [`TsOptions::max_step_retries`]); also the serde
+/// default so options serialized before the field round-trip unchanged.
+fn default_max_step_retries() -> usize {
+    6
 }
 
 impl Default for TsOptions {
@@ -196,6 +222,7 @@ impl Default for TsOptions {
             dimer_delta: 1e-2,
             negative_mode_tol: 1e-4,
             confirm_irc: false,
+            max_step_retries: default_max_step_retries(),
         }
     }
 }
@@ -379,6 +406,12 @@ pub enum TsError {
     /// level shift) without parsing prose.
     #[error(transparent)]
     SurfaceEvaluation(#[from] OptError),
+    /// A numerical-linear-algebra failure that leaves no usable geometry: the
+    /// mass-weighted Hessian's eigendecomposition did not converge, or a
+    /// finite-difference Hessian carried a non-finite entry that the driver's one
+    /// self-healing recompute could not clear. Carries a human-readable reason.
+    #[error("transition-state numerics failed: {0}")]
+    Numerical(String),
     /// The starting geometry is unusable as a TS guess (e.g. too few atoms for a
     /// reaction coordinate, no negative curvature to follow, or degenerate
     /// coordinates). Carries a human-readable reason.
@@ -409,7 +442,9 @@ pub enum TsError {
 ///
 /// # Errors
 /// [`TsError::SurfaceEvaluation`] if a finite-difference energy/gradient
-/// evaluation fails while building the Hessian.
+/// evaluation fails while building the Hessian, or [`TsError::Numerical`] if the
+/// mass-weighted Hessian carries a non-finite entry or its eigendecomposition
+/// fails to converge.
 pub fn verify_saddle<S: Surface>(
     molecule: &Molecule,
     surface: &mut S,
@@ -418,11 +453,8 @@ pub fn verify_saddle<S: Surface>(
 ) -> Result<SaddleVerification, TsError> {
     let hessian = numerics::fd_hessian(surface, positions, options.fd_step)?;
     let molecule = numerics::with_positions(molecule, positions);
-    Ok(numerics::saddle_from_hessian(
-        &molecule,
-        &hessian,
-        options.negative_mode_tol,
-    ))
+    numerics::saddle_from_hessian(&molecule, &hessian, options.negative_mode_tol)
+        .map_err(TsError::Numerical)
 }
 
 /// Search for a first-order saddle point on `surface`, starting from `molecule`.

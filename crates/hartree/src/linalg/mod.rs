@@ -19,6 +19,33 @@ pub fn symmetric_eigh(a: &Mat) -> Eigh {
     Eigh { values, vectors }
 }
 
+/// Fallible counterpart to [`symmetric_eigh`]: returns `Err` instead of panicking
+/// when the input carries a non-finite entry or the iterative eigensolver fails to
+/// converge. Use this for matrices assembled from finite-difference data — a
+/// finite-difference Hessian can inherit a `NaN`/`inf` from a failed surface
+/// evaluation, or be ill-conditioned enough to stall the solver — so the caller
+/// can recover (e.g. rebuild the matrix) rather than abort the process. Keep
+/// [`symmetric_eigh`] for the small, well-conditioned matrices built internally.
+pub fn symmetric_eigh_checked(a: &Mat) -> Result<Eigh, String> {
+    let n = a.nrows();
+    for j in 0..a.ncols() {
+        for i in 0..n {
+            if !a[(i, j)].is_finite() {
+                return Err(format!(
+                    "non-finite entry ({i}, {j}) in symmetric eigendecomposition input"
+                ));
+            }
+        }
+    }
+    let decomposition = a
+        .self_adjoint_eigen(faer::Side::Lower)
+        .map_err(|_| "symmetric eigendecomposition failed to converge".to_string())?;
+    let eigenvalues = decomposition.S();
+    let values: Vec<f64> = (0..n).map(|i| eigenvalues[i]).collect();
+    let vectors = decomposition.U().to_owned();
+    Ok(Eigh { values, vectors })
+}
+
 pub fn mat_from_row_major(n: usize, data: &[f64]) -> Mat {
     assert_eq!(data.len(), n * n, "expected {n}×{n} = {} elements", n * n);
     Mat::from_fn(n, n, |i, j| data[i * n + j])
@@ -213,6 +240,18 @@ mod tests {
         let eigh = symmetric_eigh(&a);
         assert!((eigh.values[0] + 1.0).abs() < 1e-12);
         assert!((eigh.values[1] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn checked_eigh_matches_and_rejects_nonfinite() {
+        // Agrees with the panicking solver on a well-formed matrix.
+        let a = mat![[0.0, 1.0], [1.0, 0.0]];
+        let checked = symmetric_eigh_checked(&a).unwrap();
+        assert!((checked.values[0] + 1.0).abs() < 1e-12);
+        assert!((checked.values[1] - 1.0).abs() < 1e-12);
+        // Rejects non-finite entries instead of panicking.
+        assert!(symmetric_eigh_checked(&mat![[f64::NAN, 0.0], [0.0, 1.0]]).is_err());
+        assert!(symmetric_eigh_checked(&mat![[1.0, f64::INFINITY], [f64::INFINITY, 1.0]]).is_err());
     }
 
     #[test]

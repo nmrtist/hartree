@@ -44,7 +44,7 @@ fn linear_saddle_3n_minus_5_projection() {
 
     // Exactly 3N-5 internal modes survive the trans/rot projection.
     assert_eq!(
-        non_null_modes(&mw_projected_hessian(&x, &masses, &h)).len(),
+        non_null_modes(&mw_projected_hessian(&x, &masses, &h).unwrap()).len(),
         4
     );
 
