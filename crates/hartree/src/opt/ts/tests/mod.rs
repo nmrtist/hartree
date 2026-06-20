@@ -13,8 +13,10 @@ mod convergence;
 mod dimer;
 mod irc;
 mod linear;
+mod recovery;
 mod robustness;
 mod saddle;
+mod seed;
 
 /// A bent, non-collinear arrangement of three identical atoms (Bohr). Equal
 /// masses make mass-weighting a uniform scale, so the mass-weighted Hessian

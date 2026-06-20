@@ -1,50 +1,23 @@
 //! Partitioned rational-function optimization (P-RFO / eigenvector following).
 //!
 //! The search runs in mass-weighted Cartesian coordinates with translations and
-//! rotations projected out (the [`crate::props::frequencies`] frame). Each step
-//! diagonalizes the projected Hessian, follows one mode uphill while minimizing
-//! the rest (the partitioned RFO step), and maintains the Hessian by a Bofill
-//! update. Convergence is tested on the trans/rot-projected Cartesian force and
-//! the step; after it, the shared [`verify_saddle`](super::verify_saddle) check
-//! confirms one negative mode.
-//!
-//! The per-step math (the RFO step, mode selection, the Bofill update, the trust
-//! adaption, and the acceptance test) lives in [`super::step`]; this file is the
-//! driver loop, the Hessian maintenance, and the step backtracking around them.
+//! rotations projected out (the [`crate::props::frequencies`] frame). A single
+//! climb — diagonalize the projected Hessian, follow one mode uphill while
+//! minimizing the rest, maintain the Hessian by a Bofill update, with step
+//! backtracking — lives in [`super::climb`]; this file orchestrates it. After a
+//! climb converges geometrically the shared [`verify_saddle`](super::verify_saddle)
+//! check counts negative modes; if the count is wrong and a reaction-coordinate
+//! seed is available, the search displaces off that point along the seed (descending
+//! the spurious negative modes) and re-climbs, up to [`TsOptions::max_recover`] times.
 
+use super::climb::{ClimbStop, run_climb};
 use super::numerics::{
-    add_step, column, disp_norms, fd_hessian, flatten, force_norms, gradient, gram_schmidt,
-    mass_weight_grad, masses_of, mw_projected_hessian, non_null_modes, norm, overlap, positions_of,
-    predicted_change_cart, projected_force_norms, trans_rot_vectors, unmass_weight_step,
+    add_step, column, fd_hessian, gram_schmidt, masses_of, mw_projected_hessian, norm, overlap,
+    positions_of, trans_rot_vectors, unmass_weight_step,
 };
-use super::step::{bofill_update, is_pathological, prfo_step, select_followed, update_trust_ts};
-use super::{Flow, Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
+use super::{Progress, TsError, TsOptions, TsResult, TsStatus, verify_saddle};
 use crate::core::Molecule;
 use crate::opt::{OptError, OptStep, Surface};
-
-/// Overlap with the previously followed eigenvector below which mode tracking is
-/// taken to have failed (and the Hessian is recomputed).
-const TRACK_TOL: f64 = 0.5;
-
-/// One accepted P-RFO step, threaded out of the backtracking loop in one piece:
-/// the data the trust adaption, Hessian update, and commit all consume. The
-/// gradient at `x_new` is *not* carried — it is evaluated once after acceptance, so
-/// a backtracking retry (which only needs the energy) does not pay for a discarded
-/// finite-difference gradient.
-struct AcceptedStep {
-    /// Mass-weighted step (flat), for the trust adaption's `step_norm`.
-    dxi: Vec<f64>,
-    /// Cartesian step, for the Bofill `s` vector.
-    dx: Vec<[f64; 3]>,
-    /// Model-predicted energy change, for the trust adaption and Hessian guard.
-    predicted: f64,
-    /// Trial geometry reached.
-    x_new: Vec<[f64; 3]>,
-    /// Energy at `x_new`.
-    energy_new: f64,
-    /// Actual energy change `energy_new - energy`, for the trust adaption.
-    actual: f64,
-}
 
 pub(super) fn run_prfo<S: Surface>(
     molecule: &Molecule,
@@ -56,9 +29,8 @@ pub(super) fn run_prfo<S: Surface>(
     let natom = molecule.len();
     let ndof = 3 * natom;
 
-    let mut x = positions_of(molecule);
-
-    let n_tr = gram_schmidt(&trans_rot_vectors(&x, &masses)).len();
+    let x0 = positions_of(molecule);
+    let n_tr = gram_schmidt(&trans_rot_vectors(&x0, &masses)).len();
     if ndof < n_tr + 1 {
         return Err(TsError::BadInitialGuess(format!(
             "{natom} atom(s) leave no internal coordinate to follow ({ndof} \
@@ -66,292 +38,218 @@ pub(super) fn run_prfo<S: Surface>(
         )));
     }
 
-    let mut energy = surface.energy(&x)?;
-    let mut g = gradient(surface, &x, options.fd_step)?;
-    // A non-finite energy/gradient at an accepted point yields no usable step (and
-    // a non-finite gradient would otherwise reach the panicking inner eigensolver
-    // in `prfo_step`); surface it as the documented soft fault.
-    if !energy.is_finite() || !finite_grad(&g) {
-        return Err(TsError::Numerical(
-            "surface returned a non-finite energy or gradient at the initial geometry".to_string(),
-        ));
-    }
-    let mut hess = fd_hessian(surface, &x, options.fd_step)?;
+    let seed_mw = mass_weighted_seed(options, &masses, natom)?;
 
-    let mut trust = options
-        .trust_radius
-        .min(options.max_trust)
-        .max(options.min_trust);
     let mut history: Vec<OptStep> = Vec::new();
-    let mut x_prev: Option<Vec<[f64; 3]>> = None;
-    let mut followed_vec: Option<Vec<f64>> = None;
-    let mut steps_since_hess = 0usize;
+    let mut iter_counter = 0usize;
+    let mut x_start = x0;
 
-    let mut best_x = x.clone();
-    let mut best_energy = energy;
-    let mut best_force = f64::INFINITY;
-
-    let mut iterations = 0usize;
-    let mut converged_geom = false;
-    let mut stopped_early = false;
-
-    for iter in 1..=options.max_iter {
-        iterations = iter;
-        let (max_force, rms_force) = force_norms(&g);
-        // Convergence (and best-so-far) are judged on the trans/rot-projected force,
-        // the frame the step lives in; the history record keeps the raw force so the
-        // reported trace is unchanged.
-        let (conv_force, conv_rms) = projected_force_norms(&g, &masses, &x);
-        let (max_disp, rms_disp) = match &x_prev {
-            Some(xp) => disp_norms(&x, xp),
-            None => (0.0, 0.0),
-        };
-        if conv_force < best_force {
-            best_force = conv_force;
-            best_x = x.clone();
-            best_energy = energy;
-        }
-
-        let record = OptStep {
-            iteration: iter,
-            energy,
-            max_force,
-            rms_force,
-            max_disp,
-            rms_disp,
-        };
-        history.push(record);
-        if let Some(observer) = progress {
-            if observer.step(&record) == Flow::Stop {
-                stopped_early = true;
-                break;
-            }
-        }
-
-        let force_ok = conv_force < options.max_force && conv_rms < options.rms_force;
-        let disp_ok =
-            x_prev.is_none() || (max_disp < options.max_disp && rms_disp < options.rms_disp);
-        if force_ok && disp_ok {
-            converged_geom = true;
-            break;
-        }
-        if iter == options.max_iter {
-            break;
-        }
-
-        // Diagonalize the maintained Hessian's projected spectrum, self-healing a
-        // numerical failure once: a stale quasi-Newton (Bofill) Hessian can drift to
-        // a non-finite or ill-conditioned state the checked eigensolver rejects, so
-        // rebuild it from finite differences and retry before giving up.
-        let mut spec = match mw_projected_hessian(&x, &masses, &hess) {
-            Ok(s) => s,
-            Err(_) => {
-                hess = fd_hessian(surface, &x, options.fd_step)?;
-                steps_since_hess = 0;
-                mw_projected_hessian(&x, &masses, &hess).map_err(TsError::Numerical)?
-            }
-        };
-        let mut non_null = non_null_modes(&spec);
-        if non_null.is_empty() {
-            break;
-        }
-        let mut followed = select_followed(&spec, &non_null, options.follow_mode, &followed_vec);
-
-        // Mode tracking lost the climbed mode (usually a stale quasi-Newton
-        // Hessian): recompute once from finite differences and re-pick.
-        if let Some(reference) = &followed_vec {
-            if overlap(&spec, ndof, followed, reference) < TRACK_TOL && steps_since_hess > 0 {
-                hess = fd_hessian(surface, &x, options.fd_step)?;
-                steps_since_hess = 0;
-                spec = mw_projected_hessian(&x, &masses, &hess).map_err(TsError::Numerical)?;
-                non_null = non_null_modes(&spec);
-                if non_null.is_empty() {
-                    break;
-                }
-                followed = select_followed(&spec, &non_null, options.follow_mode, &followed_vec);
-            }
-        }
-        followed_vec = Some(column(&spec.eigenvectors, ndof, followed));
-
-        let g_mw = mass_weight_grad(&g, &masses);
-
-        // Step with backtracking: shrink the trust radius and retry from the same
-        // point when a trial step's SCF fails to converge, returns a non-finite
-        // energy, or grossly overshoots the quadratic model (see `is_pathological`).
-        // Only the energy is evaluated here — the decision needs nothing else — so a
-        // rejected retry does not pay for a (finite-difference) gradient; the
-        // gradient is taken once, below, after a step is accepted. A persistent SCF
-        // failure is a soft stop (best-so-far, NotConverged) rather than an abort.
-        let mut attempt_trust = trust;
-        let mut retries = 0usize;
-        let accepted = loop {
-            let mut dxi = prfo_step(&spec, &g_mw, &non_null, followed, attempt_trust);
-            if norm(&dxi) < 1e-10 {
-                // RFO produced no step (e.g. a symmetric guess with no gradient along
-                // the climbed mode): take a trust-sized step along it to break the stall.
-                for (i, slot) in dxi.iter_mut().enumerate() {
-                    *slot = attempt_trust * spec.eigenvectors[i * ndof + followed];
-                }
-            }
-            let dx = unmass_weight_step(&dxi, &masses);
-            let predicted = predicted_change_cart(&g, &hess, &dx);
-            let x_new = add_step(&x, &dx);
-
-            let shrink_allowed =
-                retries < options.max_step_retries && attempt_trust > options.min_trust * 1.0001;
-            match surface.energy(&x_new) {
-                Ok(energy_new) => {
-                    if !energy_new.is_finite() {
-                        // A non-finite trial energy: retry smaller if we still can,
-                        // else it is a genuine numerical fault.
-                        if shrink_allowed {
-                            retries += 1;
-                            attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
-                            continue;
-                        }
-                        return Err(TsError::Numerical(
-                            "surface returned a non-finite energy".to_string(),
-                        ));
-                    }
-                    let actual = energy_new - energy;
-                    if is_pathological(actual, predicted) && shrink_allowed {
-                        retries += 1;
-                        attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
-                        continue;
-                    }
-                    break Some(AcceptedStep {
-                        dxi,
-                        dx,
-                        predicted,
-                        x_new,
-                        energy_new,
-                        actual,
-                    });
-                }
-                Err(OptError::ScfNotConverged { .. }) if shrink_allowed => {
-                    retries += 1;
-                    attempt_trust = (0.25 * attempt_trust).max(options.min_trust);
-                }
-                // SCF failed and no retry budget remains: stop softly with best-so-far.
-                Err(OptError::ScfNotConverged { .. }) => break None,
-                Err(e) => return Err(TsError::SurfaceEvaluation(e)),
-            }
-        };
-
-        let Some(step) = accepted else {
-            // The SCF would not converge from this point even after backtracking;
-            // stop with the best geometry so far rather than aborting the search.
-            break;
-        };
-
-        // The step is accepted: now (and only now) evaluate the gradient at it.
-        let g_new = gradient(surface, &step.x_new, options.fd_step)?;
-        if !finite_grad(&g_new) {
-            return Err(TsError::Numerical(
-                "surface returned a non-finite gradient at an accepted step".to_string(),
-            ));
-        }
-
-        // Judge the trust step in the frame it was capped in (‖dxi‖, mass-weighted):
-        // the Cartesian ‖dx‖ shrinks as dxi/√m and would stop the radius growing.
-        trust = update_trust_ts(
-            attempt_trust,
-            step.actual,
-            step.predicted,
-            norm(&step.dxi),
+    // Climb, then (if it converged to the wrong negative-mode count and a seed is
+    // available) re-seed off that point and climb again, up to `max_recover` times.
+    for attempt in 0..=options.max_recover {
+        let climb = run_climb(
+            surface,
             options,
-        );
+            progress,
+            &masses,
+            &x_start,
+            seed_mw.as_deref(),
+            &mut history,
+            &mut iter_counter,
+        )?;
 
-        steps_since_hess += 1;
-        // A step that was force-accepted despite overshooting the model (retries or
-        // the trust floor exhausted) carries a curvature sample the model could not
-        // describe; rebuild a fresh Hessian instead of feeding it to Bofill.
-        let forced_overshoot = is_pathological(step.actual, step.predicted);
-        let recalc_due = options.recalc_hessian != 0 && steps_since_hess >= options.recalc_hessian;
-        if forced_overshoot || recalc_due {
-            hess = fd_hessian(surface, &step.x_new, options.fd_step)?;
-            steps_since_hess = 0;
-        } else {
-            let s = flatten(&step.dx);
-            let gf_new = flatten(&g_new);
-            let gf_old = flatten(&g);
-            let y: Vec<f64> = gf_new.iter().zip(&gf_old).map(|(a, b)| a - b).collect();
-            bofill_update(&mut hess, &s, &y, ndof);
-        }
-
-        x_prev = Some(x.clone());
-        x = step.x_new;
-        energy = step.energy_new;
-        g = g_new;
-    }
-
-    if stopped_early {
-        return Ok(TsResult {
-            positions: best_x,
-            energy: best_energy,
-            status: TsStatus::StoppedEarly,
-            iterations,
-            history,
-            verification: None,
-            irc: None,
-        });
-    }
-    if !converged_geom {
-        return Ok(TsResult {
-            positions: best_x,
-            energy: best_energy,
-            status: TsStatus::NotConverged,
-            iterations,
-            history,
-            verification: None,
-            irc: None,
-        });
-    }
-
-    // Verify with a fresh finite-difference Hessian, not the maintained one.
-    let verification = verify_saddle(molecule, surface, &x, options)?;
-    let status = if verification.is_first_order_saddle() {
-        TsStatus::Converged
-    } else {
-        TsStatus::WrongImaginaryModeCount
-    };
-
-    let irc = if status == TsStatus::Converged && options.confirm_irc {
-        match &verification.reaction_mode {
-            Some(mode) => {
-                match super::irc::irc_endpoints(surface, &x, mode, &masses, energy, options) {
-                    Ok(endpoints) => Some(endpoints),
-                    // A recoverable SCF failure during the (purely confirmatory) IRC
-                    // trace must not discard the converged saddle: report the saddle
-                    // without endpoints rather than turning success into a hard error.
-                    Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged { .. })) => None,
-                    Err(e) => return Err(e),
-                }
+        // Only a geometric convergence proceeds to verification; the soft outcomes
+        // return their best-so-far geometry directly.
+        let (x, energy) = match climb.stop {
+            ClimbStop::StoppedEarly => {
+                return Ok(soft_result(
+                    TsStatus::StoppedEarly,
+                    climb.x,
+                    climb.energy,
+                    iter_counter,
+                    history,
+                ));
             }
-            None => None,
+            ClimbStop::NotConverged => {
+                return Ok(soft_result(
+                    TsStatus::NotConverged,
+                    climb.x,
+                    climb.energy,
+                    iter_counter,
+                    history,
+                ));
+            }
+            ClimbStop::ConvergedGeom => (climb.x, climb.energy),
+        };
+
+        // Verify with a fresh finite-difference Hessian, not the maintained one.
+        let verification = verify_saddle(molecule, surface, &x, options)?;
+        if verification.is_first_order_saddle() {
+            let irc = if options.confirm_irc {
+                match &verification.reaction_mode {
+                    Some(mode) => {
+                        match super::irc::irc_endpoints(surface, &x, mode, &masses, energy, options)
+                        {
+                            Ok(endpoints) => Some(endpoints),
+                            // A recoverable SCF failure during the (purely confirmatory)
+                            // IRC trace must not discard the converged saddle: report it
+                            // without endpoints rather than turning success into an error.
+                            Err(TsError::SurfaceEvaluation(OptError::ScfNotConverged {
+                                ..
+                            })) => None,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            // Leave the surface cache at the returned saddle, not the last verification
+            // / IRC displacement, so a caller's `last_scf()` is the saddle wavefunction.
+            let _ = surface.energy(&x)?;
+            return Ok(TsResult {
+                positions: x,
+                energy,
+                status: TsStatus::Converged,
+                iterations: iter_counter,
+                history,
+                verification: Some(verification),
+                irc,
+            });
         }
-    } else {
-        None
-    };
 
-    // Leave the surface cache at the returned saddle, not the last verification /
-    // IRC displacement, so a caller's `last_scf()` is the saddle wavefunction.
-    let _ = surface.energy(&x)?;
+        // Wrong negative-mode count. If a seed pins the reaction coordinate and the
+        // recovery budget is not spent, displace off this point (descending the
+        // spurious negative modes, climbing the seed) and try again.
+        if attempt < options.max_recover {
+            if let Some(seed) = seed_mw.as_deref() {
+                x_start = recovery_perturbation(surface, &x, &masses, options, seed)?;
+                continue;
+            }
+        }
+        // Recovery is unavailable or exhausted: report the wrong-mode point, leaving
+        // the surface cache at it (not the last verification displacement) so a
+        // caller's `last_scf()` matches the returned geometry.
+        let _ = surface.energy(&x)?;
+        return Ok(TsResult {
+            positions: x,
+            energy,
+            status: TsStatus::WrongImaginaryModeCount,
+            iterations: iter_counter,
+            history,
+            verification: Some(verification),
+            irc: None,
+        });
+    }
+    unreachable!("the recovery loop returns on every branch");
+}
 
-    Ok(TsResult {
-        positions: x,
+/// A soft (non-verified) outcome carried on `Ok`: best-so-far geometry, no
+/// verification or IRC. Shared by the [`StoppedEarly`](TsStatus::StoppedEarly) and
+/// [`NotConverged`](TsStatus::NotConverged) exits.
+fn soft_result(
+    status: TsStatus,
+    positions: Vec<[f64; 3]>,
+    energy: f64,
+    iterations: usize,
+    history: Vec<OptStep>,
+) -> TsResult {
+    TsResult {
+        positions,
         energy,
         status,
         iterations,
         history,
-        verification: Some(verification),
-        irc,
-    })
+        verification: None,
+        irc: None,
+    }
 }
 
-/// Whether every component of a Cartesian gradient is finite. A non-finite
-/// gradient would otherwise flow into the (panicking) inner eigensolver of
-/// [`prfo_step`]; the driver maps it to [`TsError::Numerical`] instead.
-fn finite_grad(g: &[[f64; 3]]) -> bool {
-    g.iter().all(|v| v.iter().all(|c| c.is_finite()))
+/// Bring the optional Cartesian reaction-coordinate seed into the mass-weighted
+/// frame the Hessian spectrum lives in: a displacement mass-weights by √m (the
+/// inverse of a gradient) and is then normalized. An all-zero seed carries no
+/// direction (`None`); a seed of the wrong length cannot be a reaction coordinate.
+fn mass_weighted_seed(
+    options: &TsOptions,
+    masses: &[f64],
+    natom: usize,
+) -> Result<Option<Vec<f64>>, TsError> {
+    let Some(seed) = &options.reaction_mode_seed else {
+        return Ok(None);
+    };
+    if seed.len() != natom {
+        return Err(TsError::BadInitialGuess(format!(
+            "reaction_mode_seed has {} atom direction(s) but the molecule has {natom}",
+            seed.len()
+        )));
+    }
+    let mut q = vec![0.0f64; 3 * natom];
+    for (a, v) in seed.iter().enumerate() {
+        let s = masses[a].sqrt();
+        for c in 0..3 {
+            q[3 * a + c] = v[c] * s;
+        }
+    }
+    let nrm = norm(&q);
+    Ok((nrm > 1e-12).then(|| {
+        for v in &mut q {
+            *v /= nrm;
+        }
+        q
+    }))
+}
+
+/// Build the geometry to restart a climb from after the search converged to a point
+/// with the wrong number of negative modes. Given the known reaction-coordinate
+/// `seed` (mass-weighted, normalized), descend every *spurious* negative mode at
+/// `x_wrong` — every negative mode except the one most aligned with the seed — and
+/// add a component along the seed itself, so the re-climb pushes the extra imaginary
+/// directions into minima while climbing the intended reaction coordinate. (For a
+/// minimum, with no negative modes, the seed alone is the whole displacement.) The
+/// combined direction is scaled to the trust radius in the mass-weighted frame, then
+/// un-mass-weighted into the Cartesian displacement applied to `x_wrong`.
+fn recovery_perturbation<S: Surface>(
+    surface: &mut S,
+    x_wrong: &[[f64; 3]],
+    masses: &[f64],
+    options: &TsOptions,
+    seed_mw: &[f64],
+) -> Result<Vec<[f64; 3]>, TsError> {
+    let ndof = 3 * x_wrong.len();
+    let hess = fd_hessian(surface, x_wrong, options.fd_step)?;
+    let spec = mw_projected_hessian(x_wrong, masses, &hess).map_err(TsError::Numerical)?;
+
+    let negatives: Vec<usize> = (0..ndof)
+        .filter(|&k| spec.eigenvalues[k] < -options.negative_mode_tol)
+        .collect();
+    // The reaction-coordinate negative mode is the one most aligned with the seed;
+    // every other negative mode is spurious and gets descended.
+    let reaction = negatives.iter().copied().max_by(|&a, &b| {
+        overlap(&spec, ndof, a, seed_mw)
+            .partial_cmp(&overlap(&spec, ndof, b, seed_mw))
+            .unwrap()
+    });
+
+    let mut dir = vec![0.0f64; ndof];
+    for &k in &negatives {
+        if Some(k) != reaction {
+            // Either sign descends a maximum; take the eigensolver's sign.
+            let col = column(&spec.eigenvectors, ndof, k);
+            for (d, c) in dir.iter_mut().zip(&col) {
+                *d += c;
+            }
+        }
+    }
+    for (d, s) in dir.iter_mut().zip(seed_mw) {
+        *d += s;
+    }
+
+    let nrm = norm(&dir);
+    // The seed is a unit vector, so `dir` is degenerate only if the spurious-mode
+    // contributions exactly cancel it; fall back to the seed alone.
+    let basis = if nrm > 1e-12 { &dir } else { seed_mw };
+    let scale = options.trust_radius / norm(basis);
+    let scaled: Vec<f64> = basis.iter().map(|v| v * scale).collect();
+    Ok(add_step(x_wrong, &unmass_weight_step(&scaled, masses)))
 }

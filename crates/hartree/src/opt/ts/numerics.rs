@@ -21,16 +21,20 @@ pub struct SaddleVerification {
     /// [`TsOptions::negative_mode_tol`](super::TsOptions::negative_mode_tol)
     /// (atomic units, ascending). Exactly one entry for a first-order saddle.
     pub negative_eigenvalues: Vec<f64>,
-    /// The reaction-mode eigenvector: the normalized displacement of the lowest
-    /// (most negative) mode (Cartesian, length = natoms, input atom order), i.e.
-    /// the direction the IRC is traced along. `None` if there is no negative
-    /// mode. This is what an agent inspects to identify *which* reaction the
-    /// saddle describes, and what an IRC or TS thermochemistry step seeds from.
+    /// The reaction-mode eigenvector: the normalized displacement of the negative
+    /// mode (Cartesian, length = natoms, input atom order), i.e. the direction the
+    /// IRC is traced along. `Some` exactly for a first-order saddle (one negative
+    /// mode) — so `reaction_mode.is_some()` agrees with
+    /// [`is_first_order_saddle`](Self::is_first_order_saddle) — and `None` for a
+    /// minimum or a higher-order saddle, whose reaction coordinate is ambiguous.
+    /// This is what an agent inspects to identify *which* reaction the saddle
+    /// describes, and what an IRC or TS thermochemistry step seeds from.
     pub reaction_mode: Option<Vec<[f64; 3]>>,
     /// The imaginary frequency in cm⁻¹ (reported negative, the
     /// `-√(-λ)·FREQ_CONV_CM1` convention of [`crate::props::frequencies`]) of the
-    /// lowest mode, for chemistry-meaningful reporting and RRHO thermochemistry.
-    /// `None` if there is no negative mode.
+    /// negative mode, for chemistry-meaningful reporting and RRHO thermochemistry.
+    /// `Some` under the same first-order-saddle condition as
+    /// [`reaction_mode`](Self::reaction_mode); `None` otherwise.
     pub imaginary_frequency_cm1: Option<f64>,
 }
 
@@ -394,29 +398,33 @@ pub(super) fn saddle_from_hessian(
         .filter(|&l| l < -tol)
         .collect();
 
-    let (reaction_mode, imaginary_frequency_cm1) =
-        if spec.eigenvalues.first().is_some_and(|&l| l < -tol) {
-            let lambda = spec.eigenvalues[0];
-            // Un-mass-weight the lowest mode to a Cartesian displacement, then normalize.
-            let q = column(&spec.eigenvectors, ndof, 0);
-            let mut mode: Vec<[f64; 3]> = (0..natom)
-                .map(|a| {
-                    let s = masses[a].sqrt();
-                    [q[3 * a] / s, q[3 * a + 1] / s, q[3 * a + 2] / s]
-                })
-                .collect();
-            let nrm = norm(&flatten(&mode));
-            if nrm > 0.0 {
-                for m in &mut mode {
-                    for c in m.iter_mut() {
-                        *c /= nrm;
-                    }
+    // The reaction mode and imaginary frequency are only well defined for a
+    // first-order saddle (exactly one negative mode); a higher-order saddle has no
+    // single reaction coordinate. Gate them on the same count as
+    // `is_first_order_saddle`, so `reaction_mode.is_some()` agrees with it. The one
+    // negative mode is necessarily the lowest (eigenvalues are ascending).
+    let (reaction_mode, imaginary_frequency_cm1) = if negative_eigenvalues.len() == 1 {
+        let lambda = spec.eigenvalues[0];
+        // Un-mass-weight the lowest mode to a Cartesian displacement, then normalize.
+        let q = column(&spec.eigenvectors, ndof, 0);
+        let mut mode: Vec<[f64; 3]> = (0..natom)
+            .map(|a| {
+                let s = masses[a].sqrt();
+                [q[3 * a] / s, q[3 * a + 1] / s, q[3 * a + 2] / s]
+            })
+            .collect();
+        let nrm = norm(&flatten(&mode));
+        if nrm > 0.0 {
+            for m in &mut mode {
+                for c in m.iter_mut() {
+                    *c /= nrm;
                 }
             }
-            (Some(mode), Some(-(-lambda).sqrt() * FREQ_CONV_CM1))
-        } else {
-            (None, None)
-        };
+        }
+        (Some(mode), Some(-(-lambda).sqrt() * FREQ_CONV_CM1))
+    } else {
+        (None, None)
+    };
 
     Ok(SaddleVerification {
         negative_eigenvalues,

@@ -79,6 +79,59 @@ pub struct TsGuess {
     pub reaction_coordinate: Vec<ReactionBond>,
 }
 
+impl TsGuess {
+    /// The forming/breaking-bond direction as a Cartesian reaction-coordinate seed
+    /// for [`TsOptions::reaction_mode_seed`](super::TsOptions::reaction_mode_seed):
+    /// each reaction bond contributes its unit bond axis to the two atoms it links —
+    /// a forming bond drawing them together, a breaking bond pushing them apart — and
+    /// the concerted, normalized sum (one `[f64; 3]` per atom, in the guess atom
+    /// order) is returned. `None` when there is no reaction bond (e.g. a
+    /// single-fragment interpolation) or the contributions cancel, in which case a
+    /// caller leaves the seed unset and the saddle search falls back to `follow_mode`.
+    pub fn reaction_mode_seed(&self) -> Option<Vec<[f64; 3]>> {
+        if self.reaction_coordinate.is_empty() {
+            return None;
+        }
+        let pos: Vec<[f64; 3]> = self.molecule.atoms.iter().map(|a| a.position).collect();
+        let mut seed = vec![[0.0f64; 3]; pos.len()];
+        for bond in &self.reaction_coordinate {
+            let (i, j) = bond.atoms;
+            let d = [
+                pos[j][0] - pos[i][0],
+                pos[j][1] - pos[i][1],
+                pos[j][2] - pos[i][2],
+            ];
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if len < 1e-12 {
+                continue;
+            }
+            // A forming bond moves i and j toward each other; a breaking bond moves
+            // them apart. The overall sign is irrelevant (the saddle search compares
+            // |overlap|), but the relative signs across a concerted set of bonds
+            // define the coordinate.
+            let s = match bond.kind {
+                BondChange::Forming => 1.0,
+                BondChange::Breaking => -1.0,
+            };
+            for c in 0..3 {
+                let u = s * d[c] / len;
+                seed[i][c] += u;
+                seed[j][c] -= u;
+            }
+        }
+        let nrm: f64 = seed.iter().flatten().map(|x| x * x).sum::<f64>().sqrt();
+        if nrm < 1e-12 {
+            return None;
+        }
+        for v in &mut seed {
+            for c in v.iter_mut() {
+                *c /= nrm;
+            }
+        }
+        Some(seed)
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum GuessError {
@@ -384,5 +437,62 @@ mod tests {
         let guess = build_ts_guess(&[reactant], &product, &GuessOptions::default()).unwrap();
         assert_eq!(guess.molecule.len(), 4);
         assert!(guess.reaction_coordinate.is_empty());
+    }
+
+    #[test]
+    fn reaction_mode_seed_points_along_forming_bond() {
+        let product = ethane();
+        let frag_a = methyl([0.0, 0.0, 0.0]);
+        let frag_b = methyl([10.0, 0.0, 0.0]);
+        let guess = build_ts_guess(&[frag_a, frag_b], &product, &GuessOptions::default()).unwrap();
+
+        let forming: Vec<&ReactionBond> = guess
+            .reaction_coordinate
+            .iter()
+            .filter(|b| b.kind == BondChange::Forming)
+            .collect();
+        assert_eq!(forming.len(), 1);
+        let (i, j) = forming[0].atoms;
+
+        let seed = guess
+            .reaction_mode_seed()
+            .expect("a forming bond yields a seed");
+        assert_eq!(seed.len(), guess.molecule.len());
+
+        // The seed is the unit C–C axis carried antiparallel by the two carbons.
+        let p = &guess.molecule.atoms;
+        let d = [
+            p[j].position[0] - p[i].position[0],
+            p[j].position[1] - p[i].position[1],
+            p[j].position[2] - p[i].position[2],
+        ];
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let axis = [d[0] / n, d[1] / n, d[2] / n];
+        let oi: f64 = (0..3).map(|c| seed[i][c] * axis[c]).sum();
+        let oj: f64 = (0..3).map(|c| seed[j][c] * axis[c]).sum();
+        assert!(oi.abs() > 0.5 && oj.abs() > 0.5, "carbons carry the seed");
+        assert!(oi * oj < 0.0, "carbons move antiparallel along the bond");
+
+        // The seed is normalized, and the spectator hydrogens carry nothing.
+        let total: f64 = seed.iter().flatten().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((total - 1.0).abs() < 1e-9, "seed not normalized ({total})");
+        for (a, v) in seed.iter().enumerate() {
+            if a != i && a != j {
+                let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                assert!(mag < 1e-9, "spectator atom {a} carries seed {mag}");
+            }
+        }
+    }
+
+    #[test]
+    fn reaction_mode_seed_none_without_reaction_bonds() {
+        let reactant = methyl([0.0, 0.0, 0.0]);
+        let mut product = methyl([0.0, 0.0, 0.0]);
+        for a in &mut product.atoms {
+            a.position[2] += 0.3;
+        }
+        let guess = build_ts_guess(&[reactant], &product, &GuessOptions::default()).unwrap();
+        assert!(guess.reaction_coordinate.is_empty());
+        assert!(guess.reaction_mode_seed().is_none());
     }
 }

@@ -83,18 +83,22 @@ pub(super) fn prfo_step(
     dxi
 }
 
-/// First step: the `follow_mode`-th non-null mode by ascending eigenvalue.
-/// Later steps: the non-null mode of maximum overlap with the previous one.
+/// First step: the non-null mode of maximum overlap with the reaction-coordinate
+/// `seed` if one is supplied (anchoring the climb to the forming/breaking-bond
+/// direction, immune to an avoided-crossing reordering of the soft modes), else
+/// the `follow_mode`-th non-null mode by ascending eigenvalue. Later steps (once
+/// `previous` is set): the non-null mode of maximum overlap with the previous one.
+/// `seed` and `previous` are both in the mass-weighted frame of `spec`.
 pub(super) fn select_followed(
     spec: &MwSpectrum,
     non_null: &[usize],
     follow_mode: usize,
     previous: &Option<Vec<f64>>,
+    seed: Option<&[f64]>,
 ) -> usize {
     let ndof = spec.eigenvalues.len();
-    match previous {
-        None => non_null[follow_mode.min(non_null.len() - 1)],
-        Some(reference) => non_null
+    let max_overlap_with = |reference: &[f64]| -> usize {
+        non_null
             .iter()
             .copied()
             .max_by(|&a, &b| {
@@ -102,7 +106,15 @@ pub(super) fn select_followed(
                     .partial_cmp(&overlap(spec, ndof, b, reference))
                     .unwrap()
             })
-            .unwrap(),
+            .unwrap()
+    };
+    match (previous, seed) {
+        // Tracking the climbed mode dominates once a step has been taken.
+        (Some(reference), _) => max_overlap_with(reference),
+        // First step with a seed: anchor to the reaction coordinate.
+        (None, Some(seed)) => max_overlap_with(seed),
+        // First step, no seed: the requested softest mode.
+        (None, None) => non_null[follow_mode.min(non_null.len() - 1)],
     }
 }
 

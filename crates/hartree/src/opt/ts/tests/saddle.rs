@@ -83,6 +83,30 @@ fn reaction_mode_is_cartesian_for_heteronuclear() {
     );
 }
 
+/// A higher-order (second-order) saddle has no single reaction coordinate, so the
+/// reaction mode and imaginary frequency are withheld: `reaction_mode.is_some()`
+/// must agree with `is_first_order_saddle()` (the consistency the two fields
+/// promise), and both are `None` here even though the lowest mode is negative.
+#[test]
+fn higher_order_saddle_withholds_reaction_mode() {
+    let x0 = h3_positions();
+    let basis = internal_basis(&x0);
+    // Two negative curvatures: a second-order saddle.
+    let h = hessian_from(&basis, &[-0.4, -0.3, 0.9]);
+    let mol = h3_molecule(&x0);
+    let mut surf = Quadratic { x0: x0.clone(), h };
+    let v = verify_saddle(&mol, &mut surf, &x0, &TsOptions::default()).unwrap();
+    assert_eq!(v.negative_eigenvalues.len(), 2);
+    assert!(!v.is_first_order_saddle());
+    assert!(
+        v.reaction_mode.is_none(),
+        "a second-order saddle must not report a single reaction mode"
+    );
+    assert!(v.imaginary_frequency_cm1.is_none());
+    // The invariant the field docs promise.
+    assert_eq!(v.reaction_mode.is_some(), v.is_first_order_saddle());
+}
+
 #[test]
 fn verify_saddle_rejects_minimum() {
     let x0 = h3_positions();
