@@ -191,7 +191,9 @@ pub fn optimize<S: Surface>(
 
                 if actual < 0.0 {
                     let q_new = internals::values(&defs, &x_new);
-                    let s: Vec<f64> = q_new.iter().zip(&q).map(|(a, b)| a - b).collect();
+                    // Dihedral components are wrapped into (−π, π] so a torsion
+                    // crossing the ±π branch yields its true step, not a near-2π jump.
+                    let s = internals::displacement(&defs, &q_new, &q);
                     let y: Vec<f64> = gq_new.iter().zip(&gq).map(|(a, b)| a - b).collect();
                     bfgs_update(&mut hessian, &s, &y, nq);
                 }
@@ -237,6 +239,11 @@ fn init_hessian(defs: &[Internal]) -> Vec<f64> {
         h[i * nq + i] = match d {
             Internal::Bond(..) => 0.5,
             Internal::Angle(..) => 0.2,
+            // Torsions are the softest internal mode; a small positive seed keeps the
+            // initial Hessian positive-definite without over-restraining the rotation.
+            Internal::Dihedral(..) => 0.1,
+            // A co-linear bend is a bending mode like a valence angle; seed it likewise.
+            Internal::LinearBend(..) => 0.2,
         };
     }
     h
@@ -317,7 +324,13 @@ fn bfgs_update(hessian: &mut [f64], s: &[f64], y: &[f64], nq: usize) {
     }
 }
 
-fn update_trust(trust: f64, actual: f64, predicted: f64, step_norm: f64, opts: &OptOptions) -> f64 {
+fn update_trust(
+    trust: f64,
+    actual: f64,
+    predicted: f64,
+    step_norm: f64,
+    opts: &OptOptions,
+) -> f64 {
     if actual >= 0.0 {
         return (0.25 * trust).max(opts.min_trust);
     }
