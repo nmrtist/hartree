@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 hartree.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
 
 [dev-dependencies]
 serde = { workspace = true }

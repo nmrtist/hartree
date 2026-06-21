@@ -11,6 +11,7 @@ use hartree::props::population::PopulationAnalysis;
 use hartree::props::thermo::ThermoResult;
 use hartree::scf::{Reference, ScfResult, Smearing};
 use hartree::{DftDiagnostics, Job, JobOptions, Method, PostHfResult};
+use serde::Serialize;
 
 mod periodic;
 mod ts_flags;
@@ -52,6 +53,8 @@ fn run() -> Result<bool, String> {
     let mut ts_use_neb = false;
     let mut ts_neb_images: Option<usize> = None;
     let mut ts_scan_points: Option<usize> = None;
+    let mut ts_scan_coord: Option<hartree::CoordScanSpec> = None;
+    let mut ts_output_path: Option<String> = None;
     let mut all_electron = false;
     let mut direct = false;
     let mut ri = false;
@@ -134,6 +137,19 @@ fn run() -> Result<bool, String> {
                     return Err("--ts-scan needs at least 3 path points".into());
                 }
                 ts_scan_points = Some(n);
+                ts_flag_seen = true;
+            }
+            "--ts-scan-coord" => {
+                let spec = take(&args, &mut i, "--ts-scan-coord")?;
+                ts_scan_coord = Some(ts_flags::parse_scan_coord(&spec)?);
+                ts_flag_seen = true;
+            }
+            "--ts-output" => {
+                let path = take(&args, &mut i, "--ts-output")?;
+                if path.trim().is_empty() {
+                    return Err("--ts-output needs a non-empty file path".into());
+                }
+                ts_output_path = Some(path);
                 ts_flag_seen = true;
             }
             "--all-electron" => all_electron = true,
@@ -274,6 +290,13 @@ fn run() -> Result<bool, String> {
     if ts_scan_points.is_some() && ts_use_neb {
         eprintln!("warning: --ts-scan is ignored with --ts-neb (the band already finds the peak)");
     }
+    if ts_scan_coord.is_some() && ts_product_path.is_some() {
+        return Err(
+            "--ts-scan-coord is a single-ended distinguished-coordinate scan; it is mutually \
+             exclusive with the two-endpoint --ts-product route"
+                .into(),
+        );
+    }
     if ts_flag_seen && !do_ts {
         eprintln!("warning: --ts-* flags are ignored without --ts");
     } else if irc_subflag_seen && !ts_options.confirm_irc {
@@ -304,6 +327,10 @@ fn run() -> Result<bool, String> {
         product.validate().map_err(|e| e.to_string())?;
         let mut input = hartree::TsGuessInput::new(product);
         input.use_neb = ts_use_neb;
+        // Permute the product onto the reactant's atom order before building the band, the
+        // same correspondence the IDPP route applies, so a product whose atoms are listed
+        // in a different order than the reactant is handled identically on both routes.
+        input.neb_options.map_atoms = true;
         if let Some(n) = ts_neb_images {
             input.neb_options.n_images = n;
         }
@@ -782,6 +809,7 @@ fn run() -> Result<bool, String> {
             x2c,
             ts_options,
             ts_guess,
+            ts_coord_scan: ts_scan_coord.clone(),
             // The CLI runs one job per process, so it leaves rayon on its global
             // pool and sets no in-process memory budget; both knobs exist for
             // library/embedding callers that drive several jobs in one process.
@@ -884,8 +912,24 @@ fn run() -> Result<bool, String> {
                 "note: two-endpoint search -- guess built by {route} between the reactant \
                  and --ts-product, then refined\n"
             );
+            print_mapping_confidence(result.mapping_confidence.as_ref());
+        } else if ts_scan_coord.is_some() {
+            println!(
+                "note: single-ended search -- guess built by a distinguished-coordinate scan \
+                 (one internal coordinate driven, the rest relaxed), then refined\n"
+            );
         }
         report_transition_state(&molecule, &basis, &method_str, &ecp_atoms, ts);
+        if let Some(path) = &ts_output_path {
+            write_ts_json(
+                path,
+                &molecule,
+                &basis,
+                &method_str,
+                ts,
+                result.mapping_confidence.as_ref(),
+            );
+        }
         if !no_method_warnings {
             print_method_warnings(&result.method_warnings);
         }
@@ -1537,6 +1581,24 @@ fn report_optimization(
     println!("total energy        {:>20.12} Eh", result.energy);
 }
 
+/// Print a one-line warning when a two-endpoint atom mapping was ambiguous (symmetric or
+/// equivalent atoms it could not uniquely resolve), so the user knows the reaction
+/// coordinate and guess may rest on an arbitrary choice among interchangeable atoms.
+/// Threshold mirrors a "less than fully unique" mapping; a confident or absent mapping
+/// prints nothing.
+fn print_mapping_confidence(confidence: Option<&hartree::opt::ts::guess::MappingConfidence>) {
+    if let Some(c) = confidence {
+        if c.confidence < 1.0 {
+            println!(
+                "note: atom mapping confidence low ({:.2}); {} atom(s) ambiguous \
+                 (symmetric/equivalent atoms) -- inspect the mapping if the guess looks wrong\n",
+                c.confidence,
+                c.ambiguous.len()
+            );
+        }
+    }
+}
+
 fn report_transition_state(
     molecule: &Molecule,
     basis: &str,
@@ -1587,6 +1649,12 @@ fn report_transition_state(
             println!("transition-state search stopped early by an observer")
         }
         _ => println!("transition-state search finished with an unrecognized status"),
+    }
+
+    if !result.converged() {
+        if let Some(reason) = &result.diagnostic {
+            println!("reason: {reason}");
+        }
     }
 
     if let Some(v) = &result.verification {
@@ -1649,6 +1717,139 @@ fn report_transition_state(
                  inspect the geometry."
             );
         }
+    }
+}
+
+/// One atom in the serialized transition-state geometry: its element symbol and
+/// Cartesian coordinates in both angstrom and bohr (atomic units), so a consumer
+/// need not know hartree's internal unit convention.
+#[derive(Serialize)]
+struct TsJsonAtom {
+    element: String,
+    xyz_angstrom: [f64; 3],
+    xyz_bohr: [f64; 3],
+}
+
+/// The harmonic-verification summary of a serialized transition state: the
+/// imaginary frequency (cm^-1, negative by the usual convention) and the number of
+/// negative (imaginary) Hessian modes. Present only when the post-convergence
+/// verification ran.
+#[derive(Serialize)]
+struct TsJsonVerification {
+    imaginary_frequency_cm1: Option<f64>,
+    n_imaginary_modes: usize,
+}
+
+/// The two-endpoint IRC summary of a serialized transition state: the relaxed
+/// forward/reverse endpoint energies (Eh), whether each reached a minimum, and the
+/// step counts. Present only when an IRC trace ran.
+#[derive(Serialize)]
+struct TsJsonIrc {
+    forward_energy_eh: f64,
+    forward_converged: bool,
+    forward_steps: usize,
+    reverse_energy_eh: f64,
+    reverse_converged: bool,
+    reverse_steps: usize,
+}
+
+/// Machine-readable record of a transition-state search, written by `--ts-output`.
+/// A thin wrapper over [`TsResult`] that fixes units explicitly and folds in the
+/// CLI-side context (level of theory, atom-mapping confidence) the solver does not
+/// carry.
+#[derive(Serialize)]
+struct TsJson {
+    method: String,
+    basis: String,
+    status: String,
+    converged: bool,
+    energy_eh: f64,
+    n_steps: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    geometry: Vec<TsJsonAtom>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification: Option<TsJsonVerification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    irc: Option<TsJsonIrc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapping_confidence: Option<f64>,
+}
+
+/// A short, stable string for a [`TsStatus`], for the JSON `status` field.
+fn ts_status_str(status: TsStatus) -> &'static str {
+    match status {
+        TsStatus::Converged => "converged",
+        TsStatus::NotConverged => "not_converged",
+        TsStatus::WrongImaginaryModeCount => "wrong_imaginary_mode_count",
+        TsStatus::StoppedEarly => "stopped_early",
+        _ => "unknown",
+    }
+}
+
+/// Serialize a completed transition-state search to `path` as JSON. A write failure
+/// is reported but does not fail an otherwise-successful run.
+fn write_ts_json(
+    path: &str,
+    molecule: &Molecule,
+    basis: &str,
+    method: &str,
+    result: &TsResult,
+    mapping_confidence: Option<&hartree::opt::ts::guess::MappingConfidence>,
+) {
+    let geometry: Vec<TsJsonAtom> = molecule
+        .atoms
+        .iter()
+        .zip(&result.positions)
+        .map(|(atom, pos)| TsJsonAtom {
+            element: atom.element.symbol().to_string(),
+            xyz_angstrom: [
+                pos[0] / ANGSTROM_TO_BOHR,
+                pos[1] / ANGSTROM_TO_BOHR,
+                pos[2] / ANGSTROM_TO_BOHR,
+            ],
+            xyz_bohr: *pos,
+        })
+        .collect();
+
+    let verification = result.verification.as_ref().map(|v| TsJsonVerification {
+        imaginary_frequency_cm1: v.imaginary_frequency_cm1,
+        n_imaginary_modes: v.negative_eigenvalues.len(),
+    });
+
+    let irc = result.irc.as_ref().map(|i| TsJsonIrc {
+        forward_energy_eh: i.forward_energy,
+        forward_converged: i.forward_converged,
+        forward_steps: i.forward_steps,
+        reverse_energy_eh: i.reverse_energy,
+        reverse_converged: i.reverse_converged,
+        reverse_steps: i.reverse_steps,
+    });
+
+    let record = TsJson {
+        method: method.to_string(),
+        basis: basis.to_string(),
+        status: ts_status_str(result.status).to_string(),
+        converged: result.converged(),
+        energy_eh: result.energy,
+        n_steps: result.iterations,
+        reason: result.diagnostic.clone(),
+        geometry,
+        verification,
+        irc,
+        mapping_confidence: mapping_confidence.map(|c| c.confidence),
+    };
+
+    match serde_json::to_string_pretty(&record) {
+        Ok(mut json) => {
+            json.push('\n');
+            if let Err(e) = std::fs::write(path, json) {
+                eprintln!("warning: could not write --ts-output {path}: {e}");
+            } else {
+                println!("wrote machine-readable transition-state result to {path}");
+            }
+        }
+        Err(e) => eprintln!("error: could not serialize transition-state result: {e}"),
     }
 }
 
@@ -2332,6 +2533,17 @@ fn print_usage() {
          \x20                           energy maximum of the path: evaluate the surface at <int>\n\
          \x20                           images and parabola-fit the peak (>= 3; better guess at\n\
          \x20                           <int> extra single-point energies)\n\
+         \x20   --ts-scan-coord <spec>  single-ended distinguished-coordinate scan: drive one\n\
+         \x20                           internal coordinate of the input geometry across a range,\n\
+         \x20                           relaxing the rest at each point, and refine the saddle from\n\
+         \x20                           the energy peak. spec is \"i,j[,k[,l]]:start:end:steps\":\n\
+         \x20                           2 indices = bond i-j (range in angstrom), 3 = angle with\n\
+         \x20                           centre k in the middle, 4 = dihedral about j-k (range in\n\
+         \x20                           degrees); steps >= 3. Mutually exclusive with --ts-product\n\
+         \x20   --ts-output <file.json>  after the search, write a machine-readable JSON\n\
+         \x20                           record of the result (status, energy, final geometry\n\
+         \x20                           in angstrom and bohr, imaginary frequency, IRC summary,\n\
+         \x20                           step count; requires --ts)\n\
          \x20   --ts-irc                after a converged TS, trace the intrinsic reaction\n\
          \x20                           coordinate downhill in both senses of the reaction mode\n\
          \x20                           into the two basins and report the endpoint energies\n\
@@ -2342,19 +2554,32 @@ fn print_usage() {
          \x20   --ts-irc-step <step>    IRC arc-length step, mass-weighted (√amu·bohr)\n\
          \x20                           [default: 0.1]\n\
          \x20   --ts-irc-max-steps <int>  max IRC steps per endpoint [default: 150] (>= 1)\n\
+         \x20   --ts-irc-gtol <a.u.>    IRC convergence threshold on the projected RMS force\n\
+         \x20                           [default: 1e-3]\n\
          \x20   --ts-algo <prfo|dimer>  saddle-point algorithm [default: prfo]; both prfo\n\
          \x20                           (Hessian eigenvector-following) and dimer (Hessian-free,\n\
          \x20                           midpoint-gradient curvature estimate) are available\n\
+         \x20   --ts-dimer-delta <bohr>  dimer half-separation for the curvature estimate\n\
+         \x20                           [default: 1e-2] (--ts-algo dimer only)\n\
          \x20   --ts-max-iter <int>     max saddle-search iterations [default: 300] (>= 1)\n\
          \x20   --ts-trust <bohr>       initial trust radius for the climbing step [default: 0.2]\n\
          \x20   --ts-follow <int>       P-RFO mode to follow uphill, 0 = softest [default: 0]\n\
          \x20   --ts-recalc-hessian <int>  recompute the FD Hessian every N accepted steps;\n\
          \x20                           0 = compute once, then Bofill update [default: 0]\n\
+         \x20   --ts-stall-refresh <int>  refresh the FD Hessian after N consecutive\n\
+         \x20                           non-improving steps (P-RFO); a soft-surface aid for\n\
+         \x20                           floppy systems, 0 = off [default: 0], try 5 if a search\n\
+         \x20                           plateaus far from convergence\n\
          \x20   --ts-verify-hessian <strict|maintained|auto>  Hessian the post-convergence\n\
          \x20                           verification uses (P-RFO) [default: strict]; strict\n\
          \x20                           finite-differences a fresh one, maintained reuses the\n\
          \x20                           Bofill Hessian, auto reuses it unless a mode is near the\n\
          \x20                           threshold\n\
+         \x20   --ts-coordinates <mass-weighted|internal>  coordinate frame the P-RFO climb\n\
+         \x20                           steps in [default: mass-weighted]; internal uses redundant\n\
+         \x20                           internal coordinates (bonds+angles) for better conditioning\n\
+         \x20                           of soft reaction coordinates, falling back to mass-weighted\n\
+         \x20                           when the internal set is incomplete\n\
          \x20   --ts-fd-step <bohr>     finite-difference step for gradients/Hessian [default:\n\
          \x20                           5e-3]\n\
          \x20   --ts-neg-tol <a.u.>     eigenvalue cutoff for a negative (reaction) mode\n\

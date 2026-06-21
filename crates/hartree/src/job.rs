@@ -11,8 +11,10 @@ use crate::dft::{
 use crate::disp::Dispersion;
 use crate::integrals::{ConventionalProvider, DfProvider, DirectProvider, IntegralProvider};
 use crate::linalg::{mat_from_row_major, mat_to_row_major};
+use crate::opt::internals::Internal;
 use crate::opt::ts::guess::{
-    GuessOptions, MappingConfidence, ScanOptions, build_ts_guess, build_ts_guess_scanned,
+    CoordScanOptions, GuessOptions, MappingConfidence, ScanOptions, build_ts_guess,
+    build_ts_guess_scanned, coord_scan_peak,
 };
 use crate::opt::ts::{
     NebOptions, NebTsError, Progress, TsError, TsOptions, TsResult, find_transition_state,
@@ -153,6 +155,38 @@ impl TsGuessInput {
     }
 }
 
+/// A distinguished-coordinate (relaxed) scan for a transition-state search: drive one
+/// internal coordinate of the job's [`molecule`](Job::molecule) across a value range,
+/// relaxing every other coordinate at each grid point, and refine the saddle from the
+/// energy-peaked relaxed geometry. Single-ended — it needs no product, unlike the IDPP /
+/// NEB routes in [`TsGuessInput`]. `#[non_exhaustive]`; construct via [`CoordScanSpec::new`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CoordScanSpec {
+    /// The internal coordinate to drive (a bond, valence angle, or torsion), keyed by its
+    /// atom indices into [`molecule`](Job::molecule).
+    pub coordinate: Internal,
+    /// Start of the driven coordinate's value range (Bohr for a bond, radians for an
+    /// angle/dihedral).
+    pub start: f64,
+    /// End of the driven coordinate's value range (same units as [`start`](Self::start)).
+    pub end: f64,
+    /// Number of grid points across `[start, end]` inclusive (must be ≥ 3).
+    pub n_points: usize,
+}
+
+impl CoordScanSpec {
+    /// A scan of `coordinate` over `[start, end]` with `n_points` grid points.
+    pub fn new(coordinate: Internal, start: f64, end: f64, n_points: usize) -> Self {
+        Self {
+            coordinate,
+            start,
+            end,
+            n_points,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct JobOptions {
     pub all_electron: bool,
@@ -194,6 +228,12 @@ pub struct JobOptions {
     /// guess shares the reactant's composition, so the memory estimate is unchanged.
     /// See [`TsGuessInput`].
     pub ts_guess: Option<TsGuessInput>,
+    /// Optional single-ended distinguished-coordinate scan for the transition-state
+    /// search: when `Some` (and `transition_state` is set), one internal coordinate of
+    /// `molecule` is driven across a range, the rest relaxed at each grid point, and the
+    /// saddle refined from the energy peak. Mutually exclusive with [`ts_guess`](Self::ts_guess)
+    /// (which is the two-endpoint route). See [`CoordScanSpec`].
+    pub ts_coord_scan: Option<CoordScanSpec>,
     /// Cap the rayon worker count for this job. When `Some(k)` with `k >= 1`,
     /// [`Job::run`] runs the whole job (the pre-flight memory estimate and the
     /// solve) inside a scoped `k`-thread pool, so the library's internal data
@@ -243,6 +283,7 @@ impl Default for JobOptions {
             x2c: false,
             ts_options: TsOptions::default(),
             ts_guess: None,
+            ts_coord_scan: None,
             n_threads: None,
             mem_budget_bytes: None,
         }
@@ -1123,6 +1164,20 @@ impl Job {
                     .into(),
             );
         }
+        if opts.ts_coord_scan.is_some() && !opts.transition_state {
+            return Err(
+                "a distinguished-coordinate scan was given without requesting a \
+                 transition-state search: set transition_state (the CLI --ts flag)"
+                    .into(),
+            );
+        }
+        if opts.ts_coord_scan.is_some() && opts.ts_guess.is_some() {
+            return Err(
+                "a distinguished-coordinate scan and a product endpoint are mutually \
+                 exclusive: choose the single-ended scan or the two-endpoint route"
+                    .into(),
+            );
+        }
         if opts.cosmo_file.is_some() && (opts.optimize_geometry || opts.transition_state) {
             return Err(
                 "COSMO file export cannot be combined with geometry optimization or \
@@ -1475,16 +1530,67 @@ impl Job {
             if let Some(srb) = opts.srb {
                 surface.set_srb(srb);
             }
-            // Single-guess (start from `mol`) or two-endpoint (build a guess between
-            // `mol` and the product, then refine). The two-endpoint guess shares the
-            // reactant's composition, so the same `surface` drives it.
-            let (ts, mapping_confidence) = match &opts.ts_guess {
-                None => (
+            // Single-guess (start from `mol`), two-endpoint (build a guess between
+            // `mol` and the product, then refine), or a single-ended distinguished-
+            // coordinate scan. Each guess shares the reactant's composition, so the same
+            // `surface` drives it.
+            let (ts, mapping_confidence) = match (&opts.ts_coord_scan, &opts.ts_guess) {
+                (Some(spec), _) => {
+                    // Reject a driven coordinate that names an atom outside the molecule
+                    // before it reaches the Wilson-B builder, which indexes the geometry
+                    // directly (a raw index would otherwise panic the process).
+                    let n_atoms = mol.len();
+                    let in_range = match spec.coordinate {
+                        Internal::Bond(i, j) => i < n_atoms && j < n_atoms,
+                        Internal::Angle(i, k, j) => i.max(k).max(j) < n_atoms,
+                        Internal::Dihedral(i, j, k, l) => i.max(j).max(k).max(l) < n_atoms,
+                        Internal::LinearBend(i, k, j, _) => i.max(k).max(j) < n_atoms,
+                    };
+                    if !in_range {
+                        return Err(format!(
+                            "--ts-scan-coord references an atom index outside the \
+                             {n_atoms}-atom molecule"
+                        ));
+                    }
+                    // Drive one internal coordinate across its range, relaxing the rest at
+                    // each grid value, and refine the saddle from the energy peak. The
+                    // peak's reaction-coordinate tangent seeds the climb's reaction mode.
+                    let peak = coord_scan_peak(
+                        mol,
+                        &CoordScanOptions::new(
+                            spec.coordinate,
+                            spec.start,
+                            spec.end,
+                            spec.n_points,
+                        ),
+                        &mut surface,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let peak_mol = {
+                        let atoms = mol
+                            .atoms
+                            .iter()
+                            .zip(&peak.geometry)
+                            .map(|(a, p)| crate::core::Atom::new(a.element, *p))
+                            .collect();
+                        Molecule::new(atoms, mol.charge, mol.multiplicity)
+                    };
+                    let mut seeded = ts_opts.clone();
+                    if seeded.reaction_mode_seed.is_none() {
+                        seeded.reaction_mode_seed = Some(peak.tangent);
+                    }
+                    (
+                        find_transition_state(&peak_mol, &mut surface, &seeded, None)
+                            .map_err(|e| ts_error_message(&e))?,
+                        None,
+                    )
+                }
+                (None, None) => (
                     find_transition_state(mol, &mut surface, &ts_opts, None)
                         .map_err(|e| ts_error_message(&e))?,
                     None,
                 ),
-                Some(g) if g.use_neb => {
+                (None, Some(g)) if g.use_neb => {
                     let neb_ts = find_transition_state_from_endpoints(
                         mol,
                         &g.product,
@@ -1497,7 +1603,7 @@ impl Job {
                     let confidence = neb_ts.neb.mapping_confidence.clone();
                     (neb_ts.transition_state, confidence)
                 }
-                Some(g) => {
+                (None, Some(g)) => {
                     // Build a guess between the endpoints and seed the saddle search with
                     // the reaction coordinate (unless the caller already supplied a seed in
                     // `ts_options`). The reactant is one fragment (already a combined
