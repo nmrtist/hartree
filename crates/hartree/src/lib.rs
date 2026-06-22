@@ -4,6 +4,15 @@
 //! basis/integrals, SCF and post-SCF methods, corrections/extensions, and the
 //! higher-level drivers (`job`, `multilevel`, `w1`, …) that orchestrate them.
 
+/// The crate version, taken from `CARGO_PKG_VERSION` at compile time so it always
+/// matches the version declared in `Cargo.toml`.
+///
+/// ```
+/// assert_eq!(hartree::VERSION, env!("CARGO_PKG_VERSION"));
+/// assert!(!hartree::VERSION.is_empty());
+/// ```
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // Foundation
 pub mod core;
 pub mod linalg;
