@@ -181,8 +181,10 @@ fn guards_open_shell_and_bad_bases() {
         ..W1Options::default()
     };
     let err = run_w1(&ag2, &opts).unwrap_err();
+    // Ag on an all-electron correlation-consistent basis surfaces the heavy-element-aware
+    // error (the W1 cc-pVnZ bases carry no ECP and do not define Z > 36).
     assert!(
-        err.contains("Z=47") && err.contains("not defined"),
+        err.contains("Z=47") && err.contains("heavy-element support"),
         "unexpected error: {err}"
     );
 

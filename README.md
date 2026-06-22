@@ -132,7 +132,7 @@ The `hartree` crate is the main entry point for library users.
 - **Post-HF** is closed-shell, RHF-reference only; no open-shell MP2/CCSD/CCSD(T), and no post-HF on Kohn-Sham orbitals.
 - **Analytic gradients** cover RHF/UHF and KS LDA/GGA/tau-meta-GGA/global hybrids; post-HF, ROHF, and solvated optimizations fall back where documented.
 - **Frequencies** are RHF-only and use a numerical Hessian of the analytic gradient.
-- **Relativistic scope** is all-electron through Kr; selected heavier elements are available with def2-ECP support and the documented guardrails.
+- **Relativistic scope** is all-electron through Kr. Heavier elements use small-core def2-ECPs across the full def2-ECP range Rb–Rn (Z = 37–86, including the 4f lanthanides), available with the def2-SVP / def2-TZVP orbital basis (other def2 bases and the 3c composites do not carry the heavy orbital set). Hartree–Fock and plain Kohn–Sham DFT run on the ECP path (post-HF, double hybrids, X2C, and properties on ECP atoms are rejected); `--x2c` otherwise provides energy-only scalar-relativistic all-electron cores.
 - **DFT scope** is LDA/GGA/tau-meta-GGA/global-hybrid; no range-separated hybrids, VV10 optimization/frequencies, or ROKS.
 - **RI-JK** is energy-only; no RI-MP2 or DF gradients.
 - **Solvation** has no analytic solvation gradients; solvated `--freq` is rejected, and `.cosmo` export is for downstream COSMO-RS workflows rather than a built-in COSMO-RS solver.

@@ -214,6 +214,28 @@ fn new_tasks_resolve_and_stay_on_supported_methods() {
 }
 
 #[test]
+fn thermochemistry_note_states_actual_heavy_element_coverage() {
+    // The heavy-element note must reflect what hartree actually vendors (def2-ECP for
+    // Ag/Sn/I/Au on def2-SVP/def2-TZVP), not claim blanket automatic ECP coverage for
+    // every Z > 36 — only those bases carry the heavy orbital split.
+    let notes = recommend("thermochemistry").unwrap().notes.join(" ");
+    assert!(
+        notes.contains("Z > 36"),
+        "mentions the heavy-element regime: {notes}"
+    );
+    // The note must state the actual coverage: the full def2-ECP Rb–Rn range on the
+    // heavy-capable def2-SVP/def2-TZVP orbital bases.
+    assert!(
+        notes.contains("Rb") && notes.contains("Rn"),
+        "names the supported def2-ECP range: {notes}"
+    );
+    assert!(
+        notes.contains("def2-SVP") || notes.contains("def2-TZVP"),
+        "names the heavy-capable orbital bases: {notes}"
+    );
+}
+
+#[test]
 fn transition_state_note_is_algorithm_aware() {
     use crate::opt::ts::{TsAlgorithm, TsOptions};
 

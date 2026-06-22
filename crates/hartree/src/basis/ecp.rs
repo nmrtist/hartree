@@ -144,10 +144,10 @@ fn parse_element(z: u32, element: &BseEcpElement) -> Result<ElementEcp> {
         .keys()
         .max()
         .ok_or_else(|| BasisError::Schema(format!("Z={z}: ECP has no channels")))?;
-    if max_l > 4 {
+    if max_l > 5 {
         return Err(BasisError::Schema(format!(
             "Z={z}: ECP local channel l={max_l} exceeds the supported \
-             projector range (l <= 4)"
+             projector range (l <= 5)"
         )));
     }
     let local = channels.remove(&max_l).expect("max_l key exists");
@@ -186,7 +186,12 @@ mod tests {
     fn def2_ecp_shapes() {
         let set = def2_ecp();
         assert_eq!(set.name, "def2-ECP");
-        assert_eq!(set.elements(), vec![47, 50, 53, 79]);
+        // Full def2-ECP range: every element Rb (37) through Rn (86).
+        assert_eq!(set.elements(), (37..=86).collect::<Vec<u32>>());
+        assert!(set.get(36).is_none(), "no ECP below Rb");
+        assert!(set.get(87).is_none(), "no ECP above Rn");
+
+        // f-local elements (s/p/d projectors + f local): spot-check known ECPnnM* shapes.
         for (z, n_core, counts) in [
             (47, 28, [2, 4, 4, 4]),  // Ag: ECP28MWB
             (50, 28, [2, 4, 6, 6]),  // Sn: ECP28MDF
@@ -205,12 +210,25 @@ mod tests {
                     "Z={z} channel l={l} primitives"
                 );
             }
+        }
+
+        // Lanthanides Ce (58)-Lu (71): small-core ECP28 with an h local channel and
+        // s/p/d/f/g projectors -- the L=5 regime that the raised parser cap admits.
+        for z in 58..=71u32 {
+            let e = set.get(z).unwrap();
+            assert_eq!(e.n_core, 28, "Z={z} lanthanide ECP28 core");
+            assert_eq!(e.max_l, 5, "Z={z} local channel is h");
+            assert_eq!(e.semilocal.len(), 5, "Z={z} s/p/d/f/g projectors");
+        }
+
+        // Every def2-ECP primitive is a pure Gaussian (r^0, n = 2) with positive zeta.
+        for z in set.elements() {
+            let e = set.get(z).unwrap();
             for p in e.local.iter().chain(e.semilocal.iter().flatten()) {
                 assert_eq!(p.n, 2, "Z={z}: def2-ECP primitives are r^0 (n = 2)");
-                assert!(p.zeta > 0.0);
+                assert!(p.zeta > 0.0, "Z={z}: positive zeta");
             }
         }
-        assert!(set.get(36).is_none(), "no ECP below Rb");
     }
 
     #[test]

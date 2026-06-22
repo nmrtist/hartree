@@ -181,12 +181,48 @@ impl BasisSet {
 
         for (atom_index, atom) in molecule.atoms.iter().enumerate() {
             let z = atom.element.z();
-            let defs = self
-                .shells_for(z)
-                .ok_or_else(|| BasisError::ElementNotInSet {
-                    z,
-                    set: self.name.clone(),
-                })?;
+            let defs = match self.shells_for(z) {
+                Some(defs) => defs,
+                // Z > 36 needs a small-core ECP plus a matching heavy orbital basis.
+                // hartree vendors def2-ECP and the def2 heavy orbital split only for
+                // Ag/Sn/I/Au, and the split is merged only into def2-SVP/def2-TZVP, so
+                // give a heavy-element-aware message instead of the bare "not in set".
+                None if z > 36 => {
+                    let hint = if self.ecp_for(z).is_some() {
+                        // def2 basis: the ECP is loaded but this set carries no heavy shells.
+                        format!(
+                            "hartree has a def2-ECP for Z={z}, but the heavy def2 orbital \
+                             basis is bundled only with def2-SVP and def2-TZVP — rerun with \
+                             --basis def2-svp or --basis def2-tzvp"
+                        )
+                    } else if (37..=86).contains(&z) {
+                        // In the def2-ECP range, but this basis family has no ECP at all.
+                        format!(
+                            "Z={z} is in the def2-ECP range (Rb–Rn) but the {:?} basis is \
+                             all-electron only — use --basis def2-svp or --basis def2-tzvp \
+                             for small-core ECP support",
+                            self.name
+                        )
+                    } else {
+                        // Beyond the def2-ECP range (Z > 86).
+                        format!(
+                            "Z={z} is beyond hartree's def2-ECP range (Rb 37 – Rn 86); for \
+                             all-electron scalar relativity use --x2c with an all-electron basis"
+                        )
+                    };
+                    return Err(BasisError::UnsupportedHeavyElement {
+                        z,
+                        set: self.name.clone(),
+                        hint,
+                    });
+                }
+                None => {
+                    return Err(BasisError::ElementNotInSet {
+                        z,
+                        set: self.name.clone(),
+                    });
+                }
+            };
 
             let center = atom.position;
             for def in defs {
@@ -657,13 +693,24 @@ mod tests {
     }
 
     #[test]
-    fn def2_sets_cover_h_through_kr() {
+    fn def2_sets_element_coverage() {
+        // The def2-ECP heavy orbital split (Rb 37 - Rn 86) is merged into def2-SVP and
+        // def2-TZVP, and so into the ma- sets derived from them; every other def2 orbital
+        // set is all-electron H-Kr only.
+        const HEAVY_SPLIT: [&str; 4] = ["def2-svp", "def2-tzvp", "ma-def2-svp", "ma-def2-tzvp"];
         for name in DEF2_SETS {
             let set = BasisSet::load(name).unwrap();
             for z in 1..=36 {
                 assert!(set.shells_for(z).is_some(), "{name} missing Z={z}");
             }
-            assert!(set.shells_for(37).is_none(), "{name} should stop at Kr");
+            if HEAVY_SPLIT.contains(&name) {
+                for z in 37..=86 {
+                    assert!(set.shells_for(z).is_some(), "{name} missing heavy Z={z}");
+                }
+                assert!(set.shells_for(87).is_none(), "{name} should stop at Rn");
+            } else {
+                assert!(set.shells_for(37).is_none(), "{name} should stop at Kr");
+            }
         }
         assert!(BasisSet::load("cc-pvdz").unwrap().shells_for(19).is_none());
     }
@@ -689,6 +736,71 @@ mod tests {
         ] {
             let ao = BasisSet::load(name).unwrap().build(&atom(sym)).unwrap();
             assert_eq!(ao.n_ao(), nao, "{name} {sym} AO count");
+        }
+    }
+
+    #[test]
+    fn heavy_ecp_elements_build_and_unsupported_ones_explain_why() {
+        let atom = |sym: &str| Molecule::from_xyz(&format!("1\natom\n{sym} 0 0 0\n")).unwrap();
+
+        // Representative vendored def2-ECP elements build on the heavy-split bases
+        // (SVP/TZVP), each carrying an ECP with its documented core size -- including a
+        // lanthanide (Yb), whose h local channel exercises the raised parser cap.
+        for (name, sym, n_core) in [
+            ("def2-svp", "Ag", 28u32), // 4d, f-local
+            ("def2-tzvp", "I", 28),    // 5p, f-local
+            ("def2-svp", "Au", 60),    // 5d, ECP60, f-local
+            ("def2-tzvp", "Pb", 60),   // 6p, ECP60, f-local
+            ("def2-svp", "Yb", 28),    // 4f lanthanide, ECP28, h-local (L=5)
+        ] {
+            let ao = BasisSet::load(name).unwrap().build(&atom(sym)).unwrap();
+            assert_eq!(ao.ecps().len(), 1, "{name} {sym}: one ECP center");
+            assert_eq!(ao.ecp_core_electrons(), n_core, "{name} {sym} core count");
+            assert_eq!(ao.ecps()[0].n_core, n_core, "{name} {sym} ECP n_core");
+        }
+
+        // Hint branch 1: a vendored ECP element on a def2 basis WITHOUT the heavy orbital
+        // split redirects to def2-SVP/def2-TZVP, not the bare "not in set".
+        let err = BasisSet::load("def2-mtzvpp")
+            .unwrap()
+            .build(&atom("Ag"))
+            .unwrap_err();
+        match err {
+            BasisError::UnsupportedHeavyElement { z, ref hint, .. } => {
+                assert_eq!(z, 47);
+                assert!(hint.contains("def2-svp"), "hint should redirect: {hint}");
+            }
+            other => panic!("expected UnsupportedHeavyElement, got {other:?}"),
+        }
+
+        // Hint branch 2: an in-range heavy element on an all-electron (non-def2) basis
+        // points at the def2 ECP bases.
+        let err = BasisSet::load("cc-pvdz")
+            .unwrap()
+            .build(&atom("I"))
+            .unwrap_err();
+        match err {
+            BasisError::UnsupportedHeavyElement { z, ref hint, .. } => {
+                assert_eq!(z, 53);
+                assert!(
+                    hint.contains("def2-svp"),
+                    "hint should point at def2: {hint}"
+                );
+            }
+            other => panic!("expected UnsupportedHeavyElement, got {other:?}"),
+        }
+
+        // Hint branch 3: beyond the def2-ECP range (Z > 86) explains the limit and --x2c.
+        let err = BasisSet::load("def2-svp")
+            .unwrap()
+            .build(&atom("U"))
+            .unwrap_err();
+        match err {
+            BasisError::UnsupportedHeavyElement { z, ref hint, .. } => {
+                assert_eq!(z, 92);
+                assert!(hint.contains("--x2c"), "hint should mention --x2c: {hint}");
+            }
+            other => panic!("expected UnsupportedHeavyElement, got {other:?}"),
         }
     }
 

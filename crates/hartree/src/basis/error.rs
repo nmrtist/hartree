@@ -18,6 +18,11 @@ pub enum BasisError {
     #[error("element Z={z} is not defined in basis set {set:?}")]
     ElementNotInSet { z: u32, set: String },
 
+    #[error(
+        "element Z={z} needs heavy-element support that basis set {set:?} does not provide: {hint}"
+    )]
+    UnsupportedHeavyElement { z: u32, set: String, hint: String },
+
     #[error("malformed basis JSON: {0}")]
     Json(#[from] serde_json::Error),
 

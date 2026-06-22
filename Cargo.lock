@@ -806,9 +806,9 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "integral"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88749432f15a8abe1f4815aadb35f1436476a39d2df869a102bf84353a9e51c0"
+checksum = "5f9cdd38a31085a45718bd420c9da9bb9477c51410e70d9299a9c1903ab39e5e"
 dependencies = [
  "latx",
  "rayon",

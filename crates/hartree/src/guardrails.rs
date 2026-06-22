@@ -316,9 +316,12 @@ pub const RECOMMENDATIONS: &[Recommendation] = &[
              molecule energies but need a large/QZ basis (e.g. def2-QZVPP) and are energy-\
              only (closed-shell, no --opt/--freq); the global hybrids pw6b95 and pbe0 are \
              solid reaction-energy choices",
-            "for heavy elements (Z > 36) the def2 family supplies small-core ECPs \
-             automatically (scalar relativity + reduced cost); reserve --x2c (all-electron, \
-             energy-only scalar-relativistic) for cases needing explicit relativistic cores",
+            "heavy elements (Z > 36) use def2-ECP small-core potentials: hartree covers the \
+             full def2-ECP range Rb–Rn (37–86, including the 4f lanthanides) with the def2-SVP \
+             and def2-TZVP orbital basis — the 3c composites (def2-mTZVPP) and the other def2 \
+             bases do not carry the heavy orbital set, so choose def2-SVP/def2-TZVP for a \
+             heavy-element job. For all-electron scalar relativity use --x2c (energy-only \
+             scalar-relativistic)",
             "the Minnesota functional m06-2x is accurate but grid/basis sensitive — keep a \
              fine grid and add dispersion (m06-l is not available in hartree)",
         ],

@@ -132,22 +132,44 @@ the same angular momentum. No exponent is fitted or guessed.
 
 ## def2-ECP and the heavy-element (Z > 36) def2 subset
 
-- **Files** (retrieved **2026-06-12**, verbatim BSE REST responses):
-  - `def2-svp.heavy.json` — `GET /api/basis/def2-svp/format/json/?elements=47,50,53,79`
-  - `def2-tzvp.heavy.json` — `GET /api/basis/def2-tzvp/format/json/?elements=47,50,53,79`
-  - `../ecp/def2-ecp.json` — `GET /api/basis/def2-ecp/format/json/?elements=47,50,53,79`
+- **Files** (verbatim BSE REST responses for the full Rb–Rn range):
+  - `def2-svp.heavy.json` — `GET /api/basis/def2-svp/format/json/?elements=37,38,…,86`
+  - `def2-tzvp.heavy.json` — `GET /api/basis/def2-tzvp/format/json/?elements=37,38,…,86`
+  - `../ecp/def2-ecp.json` — `GET /api/basis/def2-ecp/format/json/?elements=37,38,…,86`
     (BSE name **def2-ECP / 1**, "Data from Turbomole 7.3")
-- **Elements:** Ag (47), Sn (50), I (53), Au (79) — a representative subset
-  (4d transition metal, 5p main group ×2, 5d row-6 metal); extending to the
-  full Rb–Rn range is a data-only re-download with a wider `elements=` list.
+- **Elements:** the full def2-ECP range Rb (37) – Rn (86), all 50 elements
+  (4d/5d transition metals, the 5p/6p main group, Cs/Ba, and the 4f
+  lanthanides). The def2-ECP convention is checked against an independent PySCF
+  reference on AgH/HI (agreement to ~1e-12).
+- **Validated method coverage.** RHF/UHF and plain Kohn–Sham DFT (PBE, PBE0)
+  run on the ECP path; closed-shell RHF and KS energies on Pd / Xe / Hg / Yb
+  (spanning 4d / 5p / 5d / 4f) are pinned to independent PySCF references to 1e-5
+  (`tests/ecp.rs`). The second heavy orbital set, def2-TZVP, is energy-anchored on
+  Pd and Hg (whose def2-TZVP valence basis is genuinely larger than def2-SVP);
+  def2-TZVP for Xe is byte-identical to def2-SVP in the BSE source, so it is not a
+  distinctness anchor. The integration grid is built from the *full* nuclear charge
+  Z while the ECP density carries only valence electrons, and above Kr the
+  Treutler–Ahlrichs ξ is the element-independent 1.0 fallback — so
+  `tests/heavy_grid.rs` checks the full-Z grid integrates the valence density
+  (∫ρ = Z − n_core to ≤1e-8, Yb 4f the loosest) and that KS energies are
+  converged at the default grid level (level-3↔4 drift ≤1.1e-6 Eh). Analytic RHF
+  gradients on the ECP path are checked against finite difference for both the
+  f-local (AgH) and the h-local lanthanide (YbH2 — the high-l gradient regime
+  enabled by integral 0.4.0) channels, agreeing to ≤6e-8 Eh/bohr
+  (`tests/grad_ecp_gradients.rs`). Post-HF, double hybrids, `--x2c`, properties,
+  implicit solvation, FOD and RI-JK on ECP atoms remain rejected (see `job.rs`).
 - **Layout choice.** The heavy elements live in *separate* `.heavy.json` files
   merged at load time, so the established all-electron H–Kr files stay
   byte-identical (no light-element drift risk) and extension is mechanical.
-- **ECPs:** Ag/Sn/I use 28-core potentials (ECP28: MWB for Ag — Andrae,
-  Häußermann, Dolg, Stoll, Preuß, Theor. Chim. Acta 77, 123 (1990) — MDF for
-  Sn/I), Au the 60-core ECP60MDF; max angular momentum of the orbital sets on
-  these elements is f (l = 3) and the ECP local channel is f, both inside the
-  integral engine's validated l ≤ 4 range.
+- **ECPs:** core sizes follow the def2 standard — 28-core (ECP28: MWB/MDF) for
+  the 4d row, the 5p main group, and the 4f lanthanides; 46-core for Cs/Ba/La;
+  60-core (ECP60MDF) for the 5d row and 6p main group (Andrae, Häußermann, Dolg,
+  Stoll, Preuß, Theor. Chim. Acta 77, 123 (1990), and the Karlsruhe MDF series).
+  The orbital sets reach g (l = 4) at most. The ECP local channel is f (l = 3)
+  for every element except the 4f lanthanides Ce–Lu, whose local channel is h
+  (l = 5) with s/p/d/f/g projectors — within the integral engine's
+  `MAX_ECP_GRAD_PROJ = 5` projector-count cap (exactly saturated) and admitted
+  by the parser's local-channel cap (l ≤ 5).
 - **Conventions (verified by hand against the published Ag ECP28MWB table):**
   the BSE block with the highest angular momentum is the local channel `U_L`;
   lower channels are the already-subtracted differences `U_l − U_L` (the
