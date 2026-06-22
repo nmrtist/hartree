@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "hartree"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "criterion",
  "faer",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "hartree-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "hartree",
  "serde",
