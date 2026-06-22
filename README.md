@@ -60,7 +60,7 @@ Recent stable Rust is required (`edition = 2024`, MSRV `1.87`).
 hartree water.xyz --basis cc-pvdz --method rhf
 
 # Open-shell UHF
-hartree oh.xyz --basis cc-pvdz --method uhf --spin 2
+hartree oh.xyz --basis cc-pvdz --method uhf --multiplicity 2
 
 # Closed-shell CCSD
 hartree water.xyz --basis cc-pvdz --method ccsd

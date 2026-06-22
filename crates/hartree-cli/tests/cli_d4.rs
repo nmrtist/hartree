@@ -106,7 +106,7 @@ fn d4_energy_responds_to_net_charge() {
             "hf-d4",
             "--charge",
             charge,
-            "--spin",
+            "--multiplicity",
             if charge == "0" { "1" } else { "2" },
         ]);
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();

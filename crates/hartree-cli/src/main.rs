@@ -104,10 +104,10 @@ fn run() -> Result<bool, String> {
                     .parse()
                     .map_err(|_| "--charge must be an integer".to_string())?
             }
-            "--spin" | "--mult" => {
-                multiplicity = take(&args, &mut i, "--spin")?
+            flag @ ("--multiplicity" | "--mult" | "--spin") => {
+                multiplicity = take(&args, &mut i, flag)?
                     .parse()
-                    .map_err(|_| "--spin must be a positive integer (2S+1)".to_string())?
+                    .map_err(|_| "--multiplicity must be a positive integer (2S+1)".to_string())?
             }
             "--opt" => do_opt = true,
             "--ts" => do_ts = true,
@@ -2509,7 +2509,8 @@ fn print_usage() {
          \x20   --grid <0..4>           DFT integration grid level [default: 3]\n\
          \x20                           (only valid with a functional method)\n\
          \x20   --charge <int>          net charge [default: 0]\n\
-         \x20   --spin <int>            spin multiplicity 2S+1 [default: 1]\n\
+         \x20   --multiplicity <int>    spin multiplicity 2S+1 [default: 1]\n\
+         \x20                           (aliases: --mult, --spin)\n\
          \x20   --all-electron          correlate all orbitals for mp2/ccsd/ccsd(t) (default:\n\
          \x20                           noble-gas frozen core)\n\
          \x20   --opt                   optimize the geometry (analytic gradient for rhf/uhf,\n\
@@ -2680,7 +2681,7 @@ fn print_usage() {
          \x20                           --bhess; see crate docs)\n\
          \x20   --method gfn2-xtb       run the external `xtb` binary (GFN2-xTB); --method\n\
          \x20   --method gfn-ff         gfn-ff runs GFN-FF. Detected on PATH or via\n\
-         \x20                           HARTREE_XTB_PATH; honours --charge/--spin/--alpb/--opt.\n\
+         \x20                           HARTREE_XTB_PATH; honours --charge/--multiplicity/--alpb/--opt.\n\
          \x20                           A clear 'xtb binary not found' error with install\n\
          \x20                           guidance is raised when absent\n\
          \x20   --conformers [crest]    conformer ensemble search. Bare --conformers uses the\n\

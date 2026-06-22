@@ -113,6 +113,7 @@ fn rejects_open_shell_rhf() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_hartree"))
         .arg(&xyz)
+        // exercises the back-compat --spin alias for --multiplicity
         .args(["--method", "rhf", "--spin", "2"])
         .output()
         .expect("run hartree");

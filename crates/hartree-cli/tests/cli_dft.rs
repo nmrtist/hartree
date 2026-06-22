@@ -60,7 +60,7 @@ fn pbe_open_shell_is_uks() {
         "6-31g",
         "--method",
         "pbe",
-        "--spin",
+        "--mult",
         "2",
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -199,7 +199,7 @@ fn freq_uhf_radical_works_with_qrrho_w0() {
         "sto-3g",
         "--method",
         "uhf",
-        "--spin",
+        "--multiplicity",
         "2",
         "--freq",
         "--qrrho-w0",
