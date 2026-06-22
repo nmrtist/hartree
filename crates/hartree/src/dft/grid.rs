@@ -12,31 +12,40 @@ use crate::dft::error::DftError;
 
 pub const MAX_LEVEL: usize = 4;
 
+/// Heaviest element the DFT grid supports (Rn, Z = 86 — periods 1–6). The radial
+/// (Treutler–Ahlrichs ξ) and partition (Bragg–Slater) tables cover this range.
+pub const MAX_GRID_Z: u32 = 86;
+
 const PARTITION_CUTOFF: f64 = 1e-14;
 
-pub const RAD_GRIDS: [[usize; 3]; 5] = [
-    [10, 15, 20], // level 0
-    [30, 40, 50], // level 1
-    [40, 60, 65], // level 2
-    [50, 75, 80], // level 3
-    [60, 90, 95], // level 4
+// Per-period grid density. Columns are period 1–6 (period_index); rows are grid
+// levels 0–4. Columns 0–2 (Z ≤ 18) are unchanged; columns 3–5 (periods 4–6) adopt
+// PySCF's default radial/angular plan, where radial points grow per period and the
+// angular (Lebedev) order saturates after period 3.
+pub const RAD_GRIDS: [[usize; 6]; 5] = [
+    [10, 15, 20, 30, 35, 40],    // level 0
+    [30, 40, 50, 60, 65, 70],    // level 1
+    [40, 60, 65, 75, 80, 85],    // level 2
+    [50, 75, 80, 90, 95, 100],   // level 3
+    [60, 90, 95, 105, 110, 115], // level 4
 ];
 
-pub const ANG_NPTS: [[usize; 3]; 5] = [
-    [50, 86, 110],   // level 0  (degrees 11, 15, 17)
-    [110, 194, 194], // level 1  (17, 23, 23)
-    [194, 302, 302], // level 2  (23, 29, 29)
-    [302, 302, 434], // level 3  (29, 29, 35)
-    [434, 590, 590], // level 4  (35, 41, 41)
+pub const ANG_NPTS: [[usize; 6]; 5] = [
+    [50, 86, 110, 110, 110, 110], // level 0  (degrees 11, 15, 17, 17, 17, 17)
+    [110, 194, 194, 194, 194, 194], // level 1  (17, 23, 23, 23, 23, 23)
+    [194, 302, 302, 302, 302, 302], // level 2  (23, 29, 29, 29, 29, 29)
+    [302, 302, 434, 434, 434, 434], // level 3  (29, 29, 35, 35, 35, 35)
+    [434, 590, 590, 590, 590, 590], // level 4  (35, 41, 41, 41, 41, 41)
 ];
 
 fn period_index(z: u32) -> usize {
-    if z <= 2 {
-        0
-    } else if z <= 10 {
-        1
-    } else {
-        2
+    match z {
+        0..=2 => 0,   // period 1
+        3..=10 => 1,  // period 2
+        11..=18 => 2, // period 3 (unchanged for Z ≤ 18)
+        19..=36 => 3, // period 4  K–Kr
+        37..=54 => 4, // period 5  Rb–Xe
+        _ => 5,       // period 6  Cs–Rn
     }
 }
 
@@ -64,7 +73,7 @@ impl MolecularGrid {
         }
         for atom in &mol.atoms {
             let z = atom.element.z();
-            if !(1..=18).contains(&z) {
+            if !(1..=MAX_GRID_Z).contains(&z) {
                 return Err(DftError::UnsupportedElement(z));
             }
         }
@@ -248,10 +257,26 @@ mod tests {
             MolecularGrid::build(&mol, 5),
             Err(DftError::InvalidGridLevel(5))
         ));
-        let heavy = Molecule::new(vec![atom(19, [0.0; 3])], 0, 1);
+        // Period 7 (here U, Z=92) is past the supported range and is rejected cleanly.
+        let beyond = Molecule::new(vec![atom(92, [0.0; 3])], 0, 1);
         assert!(matches!(
-            MolecularGrid::build(&heavy, 3),
-            Err(DftError::UnsupportedElement(19))
+            MolecularGrid::build(&beyond, 3),
+            Err(DftError::UnsupportedElement(92))
         ));
+    }
+
+    #[test]
+    fn builds_grid_for_heavy_elements() {
+        // Period 4–6 elements (Fe, Br, Au) now build a non-empty grid; before the
+        // Bragg/ξ tables were extended these panicked or were rejected at Z > 18.
+        for z in [26u32, 35, 79, MAX_GRID_Z] {
+            let mol = Molecule::new(vec![atom(z, [0.0; 3])], 0, 1);
+            let grid = MolecularGrid::build(&mol, 3).unwrap();
+            assert!(!grid.is_empty(), "Z={z} produced an empty grid");
+            assert!(
+                grid.weights.iter().all(|&w| w.is_finite()),
+                "Z={z} grid has non-finite weights"
+            );
+        }
     }
 }

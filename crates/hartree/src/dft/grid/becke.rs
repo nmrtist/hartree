@@ -1,14 +1,39 @@
 use crate::core::Molecule;
 use crate::core::units::ANGSTROM_TO_BOHR;
 
-const BRAGG_ANGSTROM: [f64; 18] = [
+/// Bragg–Slater atomic radii (Å) for the Becke fuzzy-cell size adjustment, Z = 1–86
+/// (H–Rn). Source: J. C. Slater, J. Chem. Phys. 41, 3199 (1964), with Becke's
+/// H = 0.35 modification (J. Chem. Phys. 88, 2547 (1988)) and the conventional
+/// noble-gas fills. Identical to PySCF `dft/radi.py` BRAGG_RADII; the Z = 1–18 head
+/// is unchanged and the Z = 19–86 tail is cross-checked against the QCDevs `grid`
+/// table and the KnowledgeDoor transcription of Slater (1964).
+#[rustfmt::skip]
+const BRAGG_ANGSTROM: [f64; 86] = [
     0.35, 1.40, // H, He
     1.45, 1.05, 0.85, 0.70, 0.65, 0.60, 0.50, 1.50, // Li..Ne
     1.80, 1.50, 1.25, 1.10, 1.00, 1.00, 1.00, 1.80, // Na..Ar
+    2.20, 1.80, 1.60, 1.40, 1.35, 1.40, 1.40, 1.40, 1.35, 1.35, 1.35, 1.35, // K..Zn
+    1.30, 1.25, 1.15, 1.15, 1.15, 1.90, // Ga..Kr
+    2.35, 2.00, 1.80, 1.55, 1.45, 1.45, 1.35, 1.30, 1.35, 1.40, 1.60, 1.55, // Rb..Cd
+    1.55, 1.45, 1.45, 1.40, 1.40, 2.10, // In..Xe
+    2.60, 2.15, // Cs, Ba
+    1.95, 1.85, 1.85, 1.85, 1.85, 1.85, 1.85, // La..Eu
+    1.80, 1.75, 1.75, 1.75, 1.75, 1.75, 1.75, // Gd..Yb
+    1.75, // Lu
+    1.55, 1.45, 1.35, 1.35, 1.30, 1.35, 1.35, 1.35, 1.50, // Hf..Hg
+    1.90, 1.80, 1.60, 1.90, 1.45, 2.10, // Tl..Rn
 ];
 
 fn bragg_radius_bohr(z: u32) -> f64 {
-    BRAGG_ANGSTROM[(z - 1) as usize] * ANGSTROM_TO_BOHR
+    // The DFT grid gate (grid::MolecularGrid::build) already caps Z at the table
+    // length; clamp to the heaviest entry as a defensive fallback. The Becke
+    // partition is only weakly sensitive to the exact radius (it merely biases the
+    // fuzzy-cell boundary), so this never affects a supported calculation.
+    let angstrom = BRAGG_ANGSTROM
+        .get((z - 1) as usize)
+        .copied()
+        .unwrap_or(BRAGG_ANGSTROM[BRAGG_ANGSTROM.len() - 1]);
+    angstrom * ANGSTROM_TO_BOHR
 }
 
 #[inline]
@@ -242,10 +267,18 @@ mod tests {
 
     #[test]
     fn bragg_table_spot_check() {
+        assert_eq!(BRAGG_ANGSTROM.len(), 86); // through Rn
         assert_eq!(BRAGG_ANGSTROM[0], 0.35); // H
         assert_eq!(BRAGG_ANGSTROM[7], 0.60); // O
         assert_eq!(BRAGG_ANGSTROM[16], 1.00); // Cl
+        assert_eq!(BRAGG_ANGSTROM[25], 1.40); // Fe (Z=26)
+        assert_eq!(BRAGG_ANGSTROM[34], 1.15); // Br (Z=35)
+        assert_eq!(BRAGG_ANGSTROM[78], 1.35); // Au (Z=79)
+        assert_eq!(BRAGG_ANGSTROM[85], 2.10); // Rn (Z=86)
         assert!((bragg_radius_bohr(8) - 0.60 * ANGSTROM_TO_BOHR).abs() < 1e-15);
+        assert!((bragg_radius_bohr(79) - 1.35 * ANGSTROM_TO_BOHR).abs() < 1e-15);
+        // Past the table the radius clamps to the heaviest (Rn) entry instead of panicking.
+        assert!((bragg_radius_bohr(120) - 2.10 * ANGSTROM_TO_BOHR).abs() < 1e-15);
     }
 
     #[test]

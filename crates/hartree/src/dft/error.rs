@@ -25,7 +25,7 @@ pub enum DftError {
     #[error("grid level {0} out of range (expected 0..=4)")]
     InvalidGridLevel(usize),
 
-    #[error("element Z={0} is not supported by the DFT grid (H–Ar only)")]
+    #[error("element Z={0} is not supported by the DFT grid (Z = 1–86, H–Rn)")]
     UnsupportedElement(u32),
 
     #[error("angular momentum l={0} exceeds the grid evaluator maximum")]

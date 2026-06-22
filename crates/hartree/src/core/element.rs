@@ -50,13 +50,24 @@ impl Element {
     }
 }
 
+// Cordero et al., "Covalent radii revisited", Dalton Trans. 2008, 2832 (single
+// covalent radii, Å), Z = 1–96 (H–Cm). For Z > 96 `covalent_radius` falls back to a
+// 1.5 Å placeholder. Cross-checked against the pkienzle/periodictable transcription.
 #[rustfmt::skip]
-static COVALENT_RADII_ANGSTROM: [f64; 36] = [
+static COVALENT_RADII_ANGSTROM: [f64; 96] = [
     0.31, 0.28,
     1.28, 0.96, 0.84, 0.76, 0.71, 0.66, 0.57, 0.58,
     1.66, 1.41, 1.21, 1.11, 1.07, 1.05, 1.02, 1.06,
     2.03, 1.76, 1.70, 1.60, 1.53, 1.39, 1.39, 1.32, 1.26, 1.24, 1.32, 1.22,
     1.22, 1.20, 1.19, 1.20, 1.20, 1.16,
+    2.20, 1.95, 1.90, 1.75, 1.64, 1.54, 1.47, 1.46, 1.42, 1.39, 1.45, 1.44,
+    1.42, 1.39, 1.39, 1.38, 1.39, 1.40,
+    2.44, 2.15,
+    2.07, 2.04, 2.03, 2.01, 1.99, 1.98, 1.98, 1.96, 1.94, 1.92, 1.92, 1.89, 1.90, 1.87, 1.87,
+    1.75, 1.70, 1.62, 1.51, 1.44, 1.41, 1.36, 1.36, 1.32,
+    1.45, 1.46, 1.48, 1.40, 1.50, 1.50,
+    2.60, 2.21,
+    2.15, 2.06, 2.00, 1.96, 1.90, 1.87, 1.80, 1.69,
 ];
 
 #[rustfmt::skip]
@@ -134,9 +145,16 @@ mod tests {
 
     #[test]
     fn covalent_radii_are_sane() {
+        assert_eq!(COVALENT_RADII_ANGSTROM.len(), 96); // through Cm
         let h = Element::from_symbol("H").unwrap().covalent_radius();
         assert!((h - 0.31 * ANGSTROM_TO_BOHR).abs() < 1e-9);
-        for z in 1..=36u32 {
+        // Heavy spot check (Cordero): U = 1.96 Å.
+        let u = Element::from_symbol("U").unwrap().covalent_radius();
+        assert!((u - 1.96 * ANGSTROM_TO_BOHR).abs() < 1e-9);
+        // Z > table length falls back to the 1.5 Å placeholder.
+        let beyond = Element::from_z(97).unwrap().covalent_radius();
+        assert!((beyond - 1.5 * ANGSTROM_TO_BOHR).abs() < 1e-9);
+        for z in 1..=96u32 {
             let r = Element::from_z(z).unwrap().covalent_radius();
             assert!((0.4..6.0).contains(&r), "Z={z} covalent radius {r} bohr");
         }
