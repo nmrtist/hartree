@@ -19,6 +19,7 @@ Core dependencies:
 | **Post-HF** | MP2, CCSD, CCSD(T) for closed-shell RHF references |
 | **DFT** | RKS / UKS with LDA, GGA, tau-meta-GGA, and global hybrids |
 | **Gradients & optimization** | Analytic RHF/UHF and KS gradients, redundant-internal-coordinate optimization, finite-difference fallback where needed |
+| **Transition states & reaction paths** | P-RFO and dimer saddle search in mass-weighted or redundant-internal coordinates, single-geometry / two-endpoint (IDPP and climbing-image NEB) / distinguished-coordinate-scan guessing, harmonic saddle verification, and IRC tracing (DVV / GS2 / EulerPC) |
 | **Properties** | dipole, Mulliken/Lowdin charges, Mayer bond orders, T1 and HOMO-LUMO diagnostics |
 | **Frequencies** | RHF numerical Hessian, harmonic frequencies, RRHO thermochemistry |
 | **Dispersion & composites** | D3(BJ), D4, gCP, SRB, and `r2scan-3c`, `b3lyp-3c`, `b97-3c`, `pbeh-3c` |
@@ -71,6 +72,12 @@ hartree water.xyz --basis cc-pvdz --method pbe --grid 3
 # Optimization followed by properties and frequencies
 hartree water.xyz --basis cc-pvdz --method rhf --opt
 hartree water.xyz --basis cc-pvdz --method rhf --properties --freq --symmetry-number 2
+
+# Transition-state search from a single guess, confirmed by an IRC trace
+hartree ts_guess.xyz --basis def2-svp --method rhf --ts --ts-irc
+
+# Double-ended search from reactant and product endpoints via a climbing-image NEB band
+hartree reactant.xyz --basis def2-svp --method rhf --ts --ts-product product.xyz --ts-neb
 
 # Dispersion, RI-JK, and solvent
 hartree water.xyz --basis def2-svp --method b3lyp-d3 --ri --solvent water
@@ -153,7 +160,7 @@ command-line driver:
 | `dft` | molecular KS DFT |
 | `periodic` | periodic GPW DFT |
 | `cc` | MP2, CCSD, CCSD(T) |
-| `grad` / `opt` / `props` | gradients, optimization, properties, frequencies |
+| `grad` / `opt` / `props` | gradients, optimization, transition-state search / IRC, properties, frequencies |
 | `disp` / `solv` | dispersion, composite corrections, and solvent models |
 | `ext` | external-program interfaces (xtb, CREST) and conformer generation |
 
