@@ -4,6 +4,7 @@
 
 - No C or Fortran dependencies in the hartree workspace.
 - Molecular methods and periodic methods live in the same release surface.
+- Element coverage spans the periodic table from H through Rn: all-electron through Kr, and small-core def2-ECPs across the full def2-ECP range Rb–Rn (Z = 37–86, including the 4f lanthanides).
 - Validation is based on committed reference data, so build and test do not require external programs.
 
 Core dependencies:
@@ -18,6 +19,7 @@ Core dependencies:
 | **SCF** | RHF / UHF / ROHF, DIIS, level shift, GWH guess, in-core / direct / RI-JK backends |
 | **Post-HF** | MP2, CCSD, CCSD(T) for closed-shell RHF references |
 | **DFT** | RKS / UKS with LDA, GGA, tau-meta-GGA, and global hybrids |
+| **Relativistic & heavy elements** | all-electron through Kr; small-core def2-ECPs across the full def2-ECP range Rb–Rn (Z = 37–86, including the 4f lanthanides) with def2-SVP / def2-TZVP, on the HF and Kohn-Sham DFT energy and gradient paths; energy-only scalar-relativistic all-electron X2C cores |
 | **Gradients & optimization** | Analytic RHF/UHF and KS gradients, redundant-internal-coordinate optimization, finite-difference fallback where needed |
 | **Transition states & reaction paths** | P-RFO and dimer saddle search in mass-weighted or redundant-internal coordinates, single-geometry / two-endpoint (IDPP and climbing-image NEB) / distinguished-coordinate-scan guessing, harmonic saddle verification, and IRC tracing (DVV / GS2 / EulerPC) |
 | **Properties** | dipole, Mulliken/Lowdin charges, Mayer bond orders, T1 and HOMO-LUMO diagnostics |
@@ -68,6 +70,9 @@ hartree water.xyz --basis cc-pvdz --method ccsd
 
 # Kohn-Sham DFT
 hartree water.xyz --basis cc-pvdz --method pbe --grid 3
+
+# Heavy-element DFT through a small-core def2-ECP (Rb-Rn)
+hartree agcl.xyz --basis def2-svp --method pbe --grid 3
 
 # Optimization followed by properties and frequencies
 hartree water.xyz --basis cc-pvdz --method rhf --opt
