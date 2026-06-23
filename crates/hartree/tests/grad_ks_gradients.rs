@@ -10,7 +10,11 @@ const GRID_LEVEL: usize = 3;
 fn tight_options() -> ScfOptions {
     ScfOptions {
         energy_tol: 1e-10,
-        error_tol: 1e-6,
+        // Resolve the SCF tightly enough that the analytic-vs-FD(h=1e-3) comparison is
+        // limited by the finite-difference truncation floor (~5e-7 here), not by SCF
+        // convergence slack: a looser bound (e.g. 1e-6) leaves residual density error
+        // that surfaces as ~1e-6 gradient noise.
+        error_tol: 1e-9,
         max_iter: 512,
         incremental_fock: false,
         level_shift: 0.3,
