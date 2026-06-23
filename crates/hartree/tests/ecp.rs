@@ -72,6 +72,90 @@ fn ecp_scf_regression() {
     );
 }
 
+/// External validation of the def2-ECP heavy-element coverage. Closed-shell (1S0) heavy
+/// atoms spanning the range: 4d (Pd), 5p (Xe), 5d/ECP60 (Hg), and the 4f lanthanide
+/// Yb -- whose h local channel exercises the L=5 ECP path the raised parser cap admits.
+/// The references are independent PySCF RHF/def2-SVP runs over the same raw def2-ECP,
+/// so these are external anchors, not self-pins.
+/// Tolerance 1e-5: two independent codes (the diatomic AgH/HI pins agree to ~1e-12).
+#[test]
+fn heavy_atoms_match_external_pyscf_reference() {
+    for (sym, e_ref) in [
+        ("Pd", -127.0003510202),
+        ("Xe", -328.2983936756),
+        ("Hg", -152.5503994976),
+        ("Yb", -1155.6519630909),
+    ] {
+        let mol = Molecule::from_xyz(&format!("1\n{sym}\n{sym} 0 0 0\n")).unwrap();
+        let r = job(mol, "def2-svp", Method::Rhf).run().unwrap();
+        assert!(r.scf.converged, "{sym}: SCF did not converge");
+        assert!(
+            (r.scf.energy - e_ref).abs() < 1e-5,
+            "{sym}/def2-SVP RHF = {:.10} vs PySCF {:.10} (d = {:.2e})",
+            r.scf.energy,
+            e_ref,
+            r.scf.energy - e_ref
+        );
+    }
+}
+
+/// External validation of Kohn-Sham DFT on the def2-ECP path. Plain (non-double-hybrid)
+/// KS runs on ECP atoms; the integration grid is built
+/// from the full nuclear charge Z while the density carries only valence electrons, so the
+/// XC quadrature over an ECP density is its own code path. PBE (pure GGA) and PBE0 (global
+/// hybrid → exercises exact exchange on the ECP) on the 4d/5p/5d/4f closed-shell atoms are
+/// pinned to independent PySCF RKS/def2-SVP references (grids.level 5). hartree runs its
+/// default grid (level 3); the residual is
+/// grid-resolution only (≤7e-7, confirmed by the L3↔L4 convergence test in heavy_grid.rs).
+#[test]
+fn heavy_atoms_dft_match_external_pyscf_reference() {
+    for (sym, xc, e_ref) in [
+        ("Pd", "pbe", -127.8475034429),
+        ("Pd", "pbe0", -127.8251192787),
+        ("Xe", "pbe", -329.3428716167),
+        ("Xe", "pbe0", -329.3776809901),
+        ("Hg", "pbe", -153.5515859678),
+        ("Hg", "pbe0", -153.5101501239),
+        ("Yb", "pbe", -1159.5350682049),
+        ("Yb", "pbe0", -1159.1539942942),
+    ] {
+        let mol = Molecule::from_xyz(&format!("1\n{sym}\n{sym} 0 0 0\n")).unwrap();
+        let method = Method::Dft(hartree::dft::FunctionalSpec::parse(xc).unwrap());
+        let r = job(mol, "def2-svp", method).run().unwrap();
+        assert!(r.scf.converged, "{sym}/{xc}: KS did not converge");
+        assert!(
+            (r.scf.energy - e_ref).abs() < 1e-5,
+            "{sym}/def2-SVP {xc} = {:.10} vs PySCF {:.10} (d = {:.2e})",
+            r.scf.energy,
+            e_ref,
+            r.scf.energy - e_ref
+        );
+    }
+}
+
+/// External validation of the *second* vendored heavy basis, def2-TZVP. The coverage tests
+/// above all use def2-SVP; this pins def2-TZVP energies too. Pd (4d) and Hg
+/// (5d/ECP60) are pinned to independent PySCF RHF/def2-TZVP references — both have a genuinely
+/// larger valence basis than def2-SVP (energies differ from the def2-SVP pins above), so this
+/// exercises the def2-TZVP heavy basis data and the ECP path together. (Xe is deliberately
+/// omitted: its def2-TZVP entry is byte-identical to def2-SVP in the BSE source — 16 shells /
+/// 31 primitives — so it would not test anything def2-TZVP-specific.)
+#[test]
+fn heavy_atoms_def2tzvp_match_external_pyscf_reference() {
+    for (sym, e_ref) in [("Pd", -127.0301941786), ("Hg", -152.5543268793)] {
+        let mol = Molecule::from_xyz(&format!("1\n{sym}\n{sym} 0 0 0\n")).unwrap();
+        let r = job(mol, "def2-tzvp", Method::Rhf).run().unwrap();
+        assert!(r.scf.converged, "{sym}: SCF did not converge");
+        assert!(
+            (r.scf.energy - e_ref).abs() < 1e-5,
+            "{sym}/def2-TZVP RHF = {:.10} vs PySCF {:.10} (d = {:.2e})",
+            r.scf.energy,
+            e_ref,
+            r.scf.energy - e_ref
+        );
+    }
+}
+
 #[test]
 fn ecp_scf_stability_and_backends() {
     let mol = agh();

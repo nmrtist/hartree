@@ -8,7 +8,10 @@ fn tight_options() -> ScfOptions {
     ScfOptions {
         energy_tol: 1e-12,
         error_tol: 1e-10,
-        max_iter: 256,
+        // The lanthanide YbH2 4f14 case is a near-degenerate SCF that can take a few
+        // hundred iterations at displaced geometries (a static level shift only makes it
+        // worse), so keep a comfortable budget; AgH converges in tens.
+        max_iter: 1024,
         ..ScfOptions::default()
     }
 }
@@ -18,6 +21,20 @@ fn agh() -> Molecule {
         vec![
             Atom::new(Element::from_z(47).unwrap(), [0.0, 0.0, 0.0]),
             Atom::new(Element::from_z(1).unwrap(), [0.25, -0.35, 2.9]),
+        ],
+        0,
+        1,
+    )
+}
+
+fn ybh2() -> Molecule {
+    // Yb (Z=70, ECP28 -> 42 valence) + 2 H = 44 e -> closed-shell RHF (na=nb=22).
+    // Asymmetric bent geometry (~1.9 A bonds) so no gradient component is trivially zero.
+    Molecule::new(
+        vec![
+            Atom::new(Element::from_z(70).unwrap(), [0.0, 0.0, 0.0]),
+            Atom::new(Element::from_z(1).unwrap(), [0.3, -0.4, 3.6]),
+            Atom::new(Element::from_z(1).unwrap(), [-0.3, 0.5, -3.5]),
         ],
         0,
         1,
@@ -126,4 +143,41 @@ fn agh_gradient_invariances() {
     }
     let r_res = r.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
     assert!(r_res < 1e-8, "rotational residual {r_res:.3e}");
+}
+
+/// Lanthanide ECP gradient: Yb's def2-ECP has the h (l=5) local channel and s/p/d/f/g
+/// projectors -- the high-l gradient regime integral 0.4.0 enabled (MAX_ECP_GRAD_L = 5,
+/// with MAX_ECP_GRAD_PROJ = 5 exactly saturated). The AgH test above only exercises the
+/// f-local (l=3) path. Closed-shell YbH2 (44 e) at an asymmetric geometry; analytic vs
+/// finite difference confirms the h-local + g-projector gradient contributions are correct
+/// (observed worst component ~6e-8 Eh/bohr).
+#[test]
+#[ignore = "very slow (~5 min): YbH2 lanthanide ECP gradient by finite difference"]
+fn lanthanide_gradient_matches_finite_difference() {
+    let mol = ybh2();
+    let g = analytic(&mol, "def2-svp", 22, 22);
+    let scale = g
+        .iter()
+        .flat_map(|v| v.iter())
+        .fold(0.0_f64, |m, &x| m.max(x.abs()));
+    assert!(scale > 1e-3, "gradient suspiciously small: {scale:.3e}");
+
+    let mut t = [0.0; 3];
+    for v in &g {
+        for k in 0..3 {
+            t[k] += v[k];
+        }
+    }
+    let t_res = t.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
+    assert!(t_res < 1e-8, "translational residual {t_res:.3e}");
+
+    let fd = finite_difference(&mol, "def2-svp", 22, 22, 1e-3);
+    let err = max_component_error(&g, &fd);
+    eprintln!(
+        "YbH2/def2-SVP (h-local ECP) analytic vs FD(h=1e-3): worst component {err:.3e} Eh/bohr"
+    );
+    assert!(
+        err < 1e-6,
+        "analytic vs FD(h=1e-3) worst component {err:.3e} (bar 1e-6)"
+    );
 }
