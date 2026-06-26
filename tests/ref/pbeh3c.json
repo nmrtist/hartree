@@ -1,8 +1,8 @@
 {
   "provenance": {
-    "note": "SELF-GENERATED regression fixture (NOT an external oracle): produced by hartree itself (round 10) to pin the PBEh-3c composite against drift. Geometries from tests/ref/geometries.json (bohr).",
+    "note": "SELF-GENERATED regression fixture (NOT an external oracle): produced by hartree itself to pin the PBEh-3c composite against drift, on the production point-efficient pruned level-3 grid. The composite entries and the bare_functional pin both use the level-3 grid; the corrections never enter the SCF, so bare_functional equals the composite water e_scf. Geometries from tests/ref/geometries.json (bohr).",
     "engines": {
-      "scf": "hartree RKS hyb_gga_xc_pbeh_3c (xcx private id 100005: PBE-x kappa=1.0245 mu=10/81 + PBE-c beta=0.03, 42% exact exchange), def2-mSVP, grid 3",
+      "scf": "hartree RKS hyb_gga_xc_pbeh_3c (xcx private id 100005: PBE-x kappa=1.0245 mu=10/81 + PBE-c beta=0.03, 42% exact exchange), def2-mSVP, grid 3 (Treutler-Ahlrichs radial, five-zone angular pruning)",
       "d3": "hartree D3(BJ)-ATM, pbeh-3c parameters (s6=1, s8=0.0, a1=0.4860, a2=4.5000, s9=1; ATM zero damping, simple-dftd3 convention)",
       "gcp": "hartree gCP, PBEh-3c parameter set (sigma=1, eta=1.32492, alpha=0.27649, beta=1.95600, damped k_s=4 k_e=6, mSVP emiss/nbas tables; mctc-gcp case('pbeh3c') convention)"
     },
@@ -11,22 +11,22 @@
   "entries": [
     {
       "molecule": "water",
-      "e_scf": -76.23060538322888,
+      "e_scf": -76.23060536755068,
       "e_disp": -0.0002115432253947548,
       "e_gcp": 0.002608983765147221,
-      "e_total": -76.22820794268912
+      "e_total": -76.22820792701093
     },
     {
       "molecule": "water_dimer",
-      "e_scf": -152.44295647155406,
+      "e_scf": -152.44295703776902,
       "e_disp": -0.0008397739149001832,
       "e_gcp": 0.010442363169670541,
-      "e_total": -152.4333538822993
+      "e_total": -152.43335444851425
     }
   ],
   "bare_functional": {
     "molecule": "water",
-    "e_scf": -76.23060538322888,
-    "note": "plain hyb_gga_xc_pbeh_3c/def2-mSVP grid-3 SCF, no corrections (functional-wiring sanity pin; exx_fraction 0.42 exercises the hybrid EXX path)"
+    "e_scf": -76.23060536755068,
+    "note": "plain hyb_gga_xc_pbeh_3c/def2-mSVP grid-3 SCF, no corrections (functional-wiring sanity pin; exx_fraction 0.42 exercises the hybrid EXX path); equals the composite water e_scf since the corrections never enter the SCF"
   }
 }

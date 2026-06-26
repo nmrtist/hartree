@@ -13,8 +13,12 @@ fn tight_options() -> ScfOptions {
         // Resolve the SCF tightly enough that the analytic-vs-FD(h=1e-3) comparison is
         // limited by the finite-difference truncation floor (~5e-7 here), not by SCF
         // convergence slack: a looser bound (e.g. 1e-6) leaves residual density error
-        // that surfaces as ~1e-6 gradient noise.
-        error_tol: 1e-9,
+        // that surfaces as ~1e-6 gradient noise. The constant level shift below holds a
+        // fixed Fock bias, so the DIIS error settles on a floor rather than vanishing;
+        // on the pruned default grid that floor is ~3e-8 (vs ~4e-10 unpruned), so the
+        // bound is 1e-7 — still well under the 5e-7 FD floor. (Production SCF uses no
+        // level shift and converges to machine precision on the pruned grid.)
+        error_tol: 1e-7,
         max_iter: 512,
         incremental_fock: false,
         level_shift: 0.3,

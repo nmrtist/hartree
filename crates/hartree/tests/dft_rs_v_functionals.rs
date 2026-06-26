@@ -53,12 +53,15 @@ fn run(func: &str, reference: Reference) -> ScfResult {
     .unwrap()
 }
 
+// Self-pinned hartree RKS energies (water/def2-svp/grid 3) on the default
+// point-efficient pruned grid (a moderated Treutler–Ahlrichs radial set with the
+// full five-zone angular pruning); the grid-sensitive m06-2x meta-GGA is the loosest.
 const FIXTURES: &[(&str, f64)] = &[
-    ("m06-2x", -76.295765442771),
-    ("pw6b95", -76.409241911428),
-    ("b97m-v", -76.344774855425),
-    ("wb97x-v", -76.345153316564),
-    ("wb97m-v", -76.341760561980),
+    ("m06-2x", -76.295766206199),
+    ("pw6b95", -76.409242001923),
+    ("b97m-v", -76.344774687374),
+    ("wb97x-v", -76.345153292028),
+    ("wb97m-v", -76.341760482814),
 ];
 
 #[test]

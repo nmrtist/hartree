@@ -4,9 +4,8 @@ use crate::core::units::ANGSTROM_TO_BOHR;
 /// Bragg–Slater atomic radii (Å) for the Becke fuzzy-cell size adjustment, Z = 1–86
 /// (H–Rn). Source: J. C. Slater, J. Chem. Phys. 41, 3199 (1964), with Becke's
 /// H = 0.35 modification (J. Chem. Phys. 88, 2547 (1988)) and the conventional
-/// noble-gas fills. Identical to PySCF `dft/radi.py` BRAGG_RADII; the Z = 1–18 head
-/// is unchanged and the Z = 19–86 tail is cross-checked against the QCDevs `grid`
-/// table and the KnowledgeDoor transcription of Slater (1964).
+/// noble-gas fills. The Z = 1–18 head is unchanged and the Z = 19–86 tail is
+/// cross-checked against independent transcriptions of Slater (1964).
 #[rustfmt::skip]
 const BRAGG_ANGSTROM: [f64; 86] = [
     0.35, 1.40, // H, He
@@ -24,7 +23,7 @@ const BRAGG_ANGSTROM: [f64; 86] = [
     1.90, 1.80, 1.60, 1.90, 1.45, 2.10, // Tl..Rn
 ];
 
-fn bragg_radius_bohr(z: u32) -> f64 {
+pub(crate) fn bragg_radius_bohr(z: u32) -> f64 {
     // The DFT grid gate (grid::MolecularGrid::build) already caps Z at the table
     // length; clamp to the heaviest entry as a defensive fallback. The Becke
     // partition is only weakly sensitive to the exact radius (it merely biases the

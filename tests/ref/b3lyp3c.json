@@ -1,6 +1,6 @@
 {
   "provenance": {
-    "note": "SELF-GENERATED regression fixture (NOT an external oracle): produced by hartree itself (round 08) to pin the B3LYP-3c composite against drift. Geometries from tests/ref/geometries.json (bohr).",
+    "note": "SELF-GENERATED regression fixture (NOT an external oracle): produced by hartree itself to pin the B3LYP-3c composite against drift, on the production point-efficient pruned level-3 grid. Geometries from tests/ref/geometries.json (bohr).",
     "engines": {
       "scf": "hartree RKS b3lyp5 (xcx hyb_gga_xc_b3lyp5, libxc 475 convention), def2-mSVP, grid 3",
       "d3": "hartree D3(BJ)-ATM, b3lyp-3c parameters (s6=1, s8=1.9889, a1=0.3981, a2=4.4211, s9=1; ATM zero damping alp=16, rs9=4/3 over D3 cutoff radii, simple-dftd3 convention)",
@@ -11,17 +11,17 @@
   "entries": [
     {
       "molecule": "water",
-      "e_scf": -76.3410095718237,
+      "e_scf": -76.34100957557429,
       "e_disp": -5.79257694984268e-4,
       "e_gcp": 1.45564878520519e-2,
-      "e_total": -76.3270323416667
+      "e_total": -76.32703234541722
     },
     {
       "molecule": "water_dimer",
-      "e_scf": -152.665113039086,
+      "e_scf": -152.66511267680812,
       "e_disp": -2.21141232452132e-3,
       "e_gcp": 3.38904840446669e-2,
-      "e_total": -152.633433967366
+      "e_total": -152.633433605088
     }
   ]
 }

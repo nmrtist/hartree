@@ -44,8 +44,8 @@ fn wb97xv_water_vv10_total() {
     );
     assert!((r.best_energy() - (r.scf.energy + e_nl)).abs() < 1e-14);
     println!("wb97x-v: E_scf = {:.12}  E_nl = {:.12}", r.scf.energy, e_nl);
-    assert!((r.scf.energy - -76.345153316564).abs() < 1e-8);
-    assert!((e_nl - 0.047365112632).abs() < 1e-9);
+    assert!((r.scf.energy - -76.345153292028).abs() < 1e-8);
+    assert!((e_nl - 0.047365112642).abs() < 1e-9);
 }
 
 #[test]
@@ -55,8 +55,8 @@ fn b97mv_water_vv10_total() {
     let e_nl = r.vv10_energy.expect("B97M-V carries VV10");
     assert!(e_nl > 0.0 && e_nl < 0.1);
     println!("b97m-v: E_scf = {:.12}  E_nl = {:.12}", r.scf.energy, e_nl);
-    assert!((r.scf.energy - -76.344774855425).abs() < 1e-8);
-    assert!((e_nl - 0.047367027076).abs() < 1e-9);
+    assert!((r.scf.energy - -76.344774687374).abs() < 1e-8);
+    assert!((e_nl - 0.047367026618).abs() < 1e-9);
 }
 
 #[test]
@@ -77,8 +77,8 @@ fn b97mv_def2_svpd_protocol_single_point() {
         e_nl,
         r.best_energy()
     );
-    assert!((r.scf.energy - -76.362229389405).abs() < 1e-8);
-    assert!((e_nl - 0.047338494247).abs() < 1e-9);
+    assert!((r.scf.energy - -76.362229246367).abs() < 1e-8);
+    assert!((e_nl - 0.047338493691).abs() < 1e-9);
 }
 
 #[test]

@@ -2,10 +2,9 @@ use std::f64::consts::{LN_2, PI};
 
 /// Treutler–Ahlrichs radial-grid ξ adjustment factors, Z = 1–36 (H–Kr), from
 /// Treutler & Ahlrichs, J. Chem. Phys. 102, 346 (1995), Table 1. The original
-/// paper tabulates ξ only through Kr; the Z = 1–18 head is unchanged and matches
-/// PySCF `dft/radi.py` byte-for-byte. For Z > 36 (not in the paper) we fall back to
-/// ξ = 1.0 — the element-independent value Psi4 uses for every element — and let the
-/// larger heavy-element radial-point counts in `RAD_GRIDS` carry the resolution.
+/// paper tabulates ξ only through Kr. For Z > 36 (not in the paper) we fall back to
+/// ξ = 1.0 — the element-independent default — and let the larger heavy-element
+/// radial-point counts in `RAD_GRIDS` carry the resolution.
 #[rustfmt::skip]
 const TA_XI: [f64; 36] = [
     0.8, 0.9, // H, He
