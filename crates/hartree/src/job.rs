@@ -27,7 +27,8 @@ use crate::props::hessian::numerical_hessian;
 use crate::props::population::{PopulationAnalysis, population_analysis};
 use crate::props::thermo::{ThermoResult, rrho_thermochemistry_w0};
 use crate::scf::{
-    Reference, ScfOptions, ScfResult, Smearing, SolventModel, XcContributor, run_scf_with_env,
+    GridSchedule, Reference, ScfOptions, ScfResult, Smearing, SolventModel, XcContributor,
+    run_scf_multigrid, run_scf_with_env,
 };
 use crate::solv::Cpcm;
 
@@ -75,6 +76,80 @@ pub(crate) fn x2c_hcore_override(
     )
     .map(|out| out.h)
     .map_err(|e| e.to_string())
+}
+
+/// Build the cheap warm-up grid for the two-stage SCF schedule, or `None` for a plain
+/// single-grid SCF. It is enabled for Kohn–Sham DFT at production grid levels (3 and up),
+/// dropping two levels for the coarse stage (e.g. level 3 → level 1) so the early SCF
+/// iterations — which only have to steer the density, not set its final accuracy — cost a
+/// fraction of a fine-grid Fock build. The escape hatch `HARTREE_NO_MULTIGRID` forces the
+/// single-grid path. The converged result is unaffected: the SCF only ever converges on
+/// the fine grid (see [`crate::scf::GridSchedule`]).
+fn coarse_grid_for(
+    mol: &Molecule,
+    ao: &crate::basis::AoBasis,
+    method: &Method,
+    grid_level: usize,
+) -> Result<Option<GridXc>, String> {
+    if grid_level < 3 || std::env::var_os("HARTREE_NO_MULTIGRID").is_some() {
+        return Ok(None);
+    }
+    match method {
+        Method::Dft(spec) => Ok(Some(
+            GridXc::new(mol, ao, spec, grid_level - 2).map_err(|e| e.to_string())?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// SCF orbital-gradient error at which the two-stage schedule refines from the coarse to
+/// the fine integration grid. It is set high on purpose: the first few SCF steps make large
+/// density moves off the initial guess where integration accuracy is irrelevant, so running
+/// them on the cheap grid costs nothing, while switching to the fine grid well before
+/// convergence means the fine stage drives the *same* iteration sequence to the *same*
+/// fixed point as a single-grid run (no coarse-grid re-convergence penalty).
+const GRID_SWITCH_ERROR: f64 = 1e-1;
+
+/// Run the SCF, taking the two-stage grid schedule when a `coarse` warm-up grid is present
+/// and falling back to the single-grid driver otherwise.
+#[allow(clippy::too_many_arguments)]
+fn run_scf_staged<P: IntegralProvider>(
+    provider: &P,
+    n_alpha: usize,
+    n_beta: usize,
+    reference: Reference,
+    nuclear_repulsion: f64,
+    options: &ScfOptions,
+    xc: Option<&dyn XcContributor>,
+    solvent: Option<&dyn SolventModel>,
+    coarse: Option<&dyn XcContributor>,
+) -> Result<ScfResult, crate::scf::ScfError> {
+    match coarse {
+        Some(coarse) => run_scf_multigrid(
+            provider,
+            n_alpha,
+            n_beta,
+            reference,
+            nuclear_repulsion,
+            options,
+            xc,
+            solvent,
+            GridSchedule {
+                coarse,
+                switch_error: GRID_SWITCH_ERROR,
+            },
+        ),
+        None => run_scf_with_env(
+            provider,
+            n_alpha,
+            n_beta,
+            reference,
+            nuclear_repulsion,
+            options,
+            xc,
+            solvent,
+        ),
+    }
 }
 
 pub fn ecp_summary(mol: &Molecule, set: &BasisSet) -> Vec<(String, u32, u32)> {
@@ -2248,6 +2323,15 @@ impl Job {
         };
         let xc_ref = grid_xc.as_ref().map(|g| g as &dyn XcContributor);
         let cosx_setup = opts.cosx.then(|| (ao.shells().to_vec(), ao.n_ao()));
+        // The two-stage grid schedule applies to the exchange-free path only (COSX serves
+        // exact exchange for hybrids and runs its own grid). Build the coarse warm-up grid
+        // before `ao` is moved into the provider.
+        let grid_coarse = if cosx_setup.is_none() {
+            coarse_grid_for(mol, &ao, &self.method, opts.grid_level)?
+        } else {
+            None
+        };
+        let coarse_ref = grid_coarse.as_ref().map(|g| g as &dyn XcContributor);
         let provider = DfProvider::new(ao.into_integral(), &aux, setup.charges)
             .map_err(|e| e.to_string())?
             .with_ecps(setup.ecps);
@@ -2289,7 +2373,7 @@ impl Job {
             .map_err(|e| e.to_string())?;
             (scf, Some(diag))
         } else {
-            let scf = run_scf_with_env(
+            let scf = run_scf_staged(
                 &provider,
                 n_alpha,
                 n_beta,
@@ -2298,6 +2382,7 @@ impl Job {
                 &base_opts,
                 xc_ref,
                 solv_ref,
+                coarse_ref,
             )
             .map_err(|e| e.to_string())?;
             (scf, None)
@@ -2420,6 +2505,12 @@ impl Job {
         };
         let xc_ref = grid_xc.as_ref().map(|g| g as &dyn XcContributor);
         let cosx_setup = opts.cosx.then(|| (ao.shells().to_vec(), ao.n_ao()));
+        let grid_coarse = if cosx_setup.is_none() {
+            coarse_grid_for(mol, &ao, &self.method, opts.grid_level)?
+        } else {
+            None
+        };
+        let coarse_ref = grid_coarse.as_ref().map(|g| g as &dyn XcContributor);
         let provider =
             ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
         let cpcm = self.build_cpcm(&provider, mol)?;
@@ -2456,7 +2547,7 @@ impl Job {
             .map_err(|e| e.to_string())?;
             (scf, Some(diag))
         } else {
-            let scf = run_scf_with_env(
+            let scf = run_scf_staged(
                 &provider,
                 n_alpha,
                 n_beta,
@@ -2465,6 +2556,7 @@ impl Job {
                 &base_opts,
                 xc_ref,
                 solv_ref,
+                coarse_ref,
             )
             .map_err(|e| e.to_string())?;
             (scf, None)

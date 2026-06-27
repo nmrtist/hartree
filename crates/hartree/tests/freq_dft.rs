@@ -111,10 +111,13 @@ fn r2scan_3c_hf_frequencies() {
     }
     .run()
     .unwrap();
-    check_freqs(&result, 5, &[4109.38], 1.0);
+    // Pinned on the production level-3 grid (the r2scan-3c composite default). The
+    // denser reference-quality grid 4 gives ~4109.4 cm⁻¹ and E = -100.4438572991
+    // (pinned by the r2scan3c grid-4 oracle).
+    check_freqs(&result, 5, &[4108.23], 1.0);
     assert!(result.gcp_energy.is_some() && result.dispersion_energy.is_some());
     let th = &result.frequencies.as_ref().unwrap().thermochemistry;
-    assert!((result.best_energy() - -100.4438572991).abs() < 1e-6);
+    assert!((result.best_energy() - -100.4438580784).abs() < 1e-6);
     assert!((th.enthalpy - (result.best_energy() + th.enthalpy_corr)).abs() < 1e-12);
 }
 

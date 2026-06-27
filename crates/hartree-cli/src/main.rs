@@ -2466,7 +2466,7 @@ fn print_usage() {
          \x20                           and -d3/-d4 suffixes are rejected (each defines its\n\
          \x20                           own corrections):\n\
          \x20                           r2scan-3c: r2scan/def2-mTZVPP + D4 (method-specific\n\
-         \x20                           parameters) + gCP, grid defaults to 4\n\
+         \x20                           parameters) + gCP, grid defaults to 3\n\
          \x20                           b3lyp-3c: b3lyp5/def2-mSVP + D3(BJ)-ATM + gCP\n\
          \x20                           (DFT/SV(P) parameters)\n\
          \x20                           b97-3c: refitted B97 GGA/mTZVP + D3(BJ)-ATM + SRB\n\

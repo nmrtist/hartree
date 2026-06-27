@@ -36,6 +36,9 @@ fn molecule(name: &str) -> Molecule {
 
 fn composite_options() -> JobOptions {
     JobOptions {
+        // The composite ships grid level 3 in production; this oracle deliberately pins the
+        // denser reference-quality level 4 so it validates the functional + composite
+        // machinery against the external references at fixed, maximal integration accuracy.
         grid_level: 4,
         dispersion: Some(Dispersion::D4(D4Params::R2SCAN_3C)),
         gcp: Some(GcpParams::R2SCAN_3C),

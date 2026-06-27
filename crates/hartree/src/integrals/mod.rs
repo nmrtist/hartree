@@ -29,8 +29,18 @@ pub trait IntegralProvider {
 
     fn build_jk(&self, densities: &[Mat]) -> JkResult;
 
+    /// Coulomb-only build. Pure (semi-)local functionals carry no exact exchange, so the
+    /// SCF never needs K — only J enters their Fock matrix. The default falls back to the
+    /// full J/K build and discards K; backends whose K build is the dominant cost (the
+    /// density-fitted and integral-direct ones) override this to skip K entirely.
     fn build_j(&self, densities: &[Mat]) -> Vec<Mat> {
         self.build_jk(densities).coulomb
+    }
+
+    /// Screening-aware Coulomb-only build, the J counterpart of [`build_jk_screened`]
+    /// used by the incremental-Fock path. Same contract as [`build_j`].
+    fn build_j_screened(&self, densities: &[Mat]) -> Vec<Mat> {
+        self.build_jk_screened(densities).coulomb
     }
 
     fn dipole_integrals(&self, origin: [f64; 3]) -> [Vec<f64>; 3];
@@ -556,7 +566,12 @@ impl DirectProvider {
         self.tau
     }
 
-    fn jk_for_density(&self, d: &[f64], dmax: Option<&[f64]>) -> (Vec<f64>, Vec<f64>) {
+    fn jk_for_density(
+        &self,
+        d: &[f64],
+        dmax: Option<&[f64]>,
+        want_k: bool,
+    ) -> (Vec<f64>, Vec<f64>) {
         let n = self.n_basis;
         let nsh = self.shell_nfunc.len();
         let q = &self.schwarz;
@@ -570,13 +585,15 @@ impl DirectProvider {
         bra_pairs
             .par_iter()
             .fold(zero, |(mut j, mut k), &(sa, sb)| {
-                self.accumulate_bra_pair(sa, sb, d, dmax, &mut j, &mut k);
+                self.accumulate_bra_pair(sa, sb, d, dmax, &mut j, &mut k, want_k);
                 (j, k)
             })
             .reduce(zero, |(mut ja, mut ka), (jb, kb)| {
                 for i in 0..ja.len() {
                     ja[i] += jb[i];
-                    ka[i] += kb[i];
+                    if want_k {
+                        ka[i] += kb[i];
+                    }
                 }
                 (ja, ka)
             })
@@ -603,6 +620,7 @@ impl DirectProvider {
         dmax
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn accumulate_bra_pair(
         &self,
         sa: usize,
@@ -611,6 +629,7 @@ impl DirectProvider {
         dmax: Option<&[f64]>,
         j: &mut [f64],
         k: &mut [f64],
+        want_k: bool,
     ) {
         let n = self.n_basis;
         let nf = &self.shell_nfunc;
@@ -660,7 +679,7 @@ impl DirectProvider {
                                     continue;
                                 }
                                 let g = block[base + e];
-                                scatter_eri(j, k, d, n, g, mu, nu, lam, sig);
+                                scatter_eri(j, k, d, n, g, mu, nu, lam, sig, want_k);
                             }
                         }
                     }
@@ -682,6 +701,7 @@ fn scatter_eri(
     nu: usize,
     lam: usize,
     sig: usize,
+    want_k: bool,
 ) {
     let perms = [
         (mu, nu, lam, sig),
@@ -699,7 +719,12 @@ fn scatter_eri(
             continue;
         }
         j[a * n + b] += g * d[c * n + e];
-        k[a * n + c] += g * d[b * n + e];
+        // A pure (semi-)local functional needs no exchange matrix; the K scatter (half the
+        // per-integral work here) is skipped, and the Fock build multiplies the zeroed K by
+        // c_x = 0 regardless.
+        if want_k {
+            k[a * n + c] += g * d[b * n + e];
+        }
     }
 }
 
@@ -797,7 +822,10 @@ impl DfProvider {
         self.naux
     }
 
-    fn jk_for_density(&self, d: &[f64], j_out: &mut [f64], k_out: &mut [f64]) {
+    /// Density-fitted Coulomb matrix J = B (Bᵀ d), the cheap O(naux·npair) half of the
+    /// fitted build. Factored out of [`Self::jk_for_density`] so the exchange-free SCF
+    /// path can skip the expensive O(naux·n³) K contraction entirely.
+    fn j_for_density(&self, d: &[f64], j_out: &mut [f64]) {
         let n = self.n_basis;
         let naux = self.naux;
         let npair = n * (n + 1) / 2;
@@ -818,6 +846,12 @@ impl DfProvider {
                 j_out[nu * n + mu] = v;
             }
         }
+    }
+
+    fn jk_for_density(&self, d: &[f64], j_out: &mut [f64], k_out: &mut [f64]) {
+        let n = self.n_basis;
+        let naux = self.naux;
+        self.j_for_density(d, j_out);
 
         let qs: Vec<usize> = (0..naux).collect();
         let partials: Vec<Vec<f64>> = qs
@@ -916,6 +950,22 @@ impl IntegralProvider for DfProvider {
         }
         JkResult { coulomb, exchange }
     }
+
+    /// Coulomb-only fit: the O(naux·npair) J build without the O(naux·n³) K contraction,
+    /// which is ~99% of [`Self::jk_for_density`]'s cost. The exchange-free SCF path takes
+    /// this so a pure functional never pays for an exchange matrix it multiplies by zero.
+    fn build_j(&self, densities: &[Mat]) -> Vec<Mat> {
+        let n = self.n_basis;
+        densities
+            .iter()
+            .map(|density| {
+                let d = mat_to_row_major(density);
+                let mut j = vec![0.0; n * n];
+                self.j_for_density(&d, &mut j);
+                mat_from_row_major(n, &j)
+            })
+            .collect()
+    }
 }
 
 impl IntegralProvider for DirectProvider {
@@ -968,7 +1018,7 @@ impl IntegralProvider for DirectProvider {
         let mut exchange = Vec::with_capacity(densities.len());
         for density in densities {
             let d = mat_to_row_major(density);
-            let (j, k) = self.jk_for_density(&d, None);
+            let (j, k) = self.jk_for_density(&d, None, true);
             coulomb.push(mat_from_row_major(n, &j));
             exchange.push(mat_from_row_major(n, &k));
         }
@@ -982,10 +1032,35 @@ impl IntegralProvider for DirectProvider {
         for density in densities {
             let d = mat_to_row_major(density);
             let dmax = self.shell_pair_dmax(&d);
-            let (j, k) = self.jk_for_density(&d, Some(&dmax));
+            let (j, k) = self.jk_for_density(&d, Some(&dmax), true);
             coulomb.push(mat_from_row_major(n, &j));
             exchange.push(mat_from_row_major(n, &k));
         }
         JkResult { coulomb, exchange }
+    }
+
+    fn build_j(&self, densities: &[Mat]) -> Vec<Mat> {
+        let n = self.n_basis;
+        densities
+            .iter()
+            .map(|density| {
+                let d = mat_to_row_major(density);
+                let (j, _) = self.jk_for_density(&d, None, false);
+                mat_from_row_major(n, &j)
+            })
+            .collect()
+    }
+
+    fn build_j_screened(&self, densities: &[Mat]) -> Vec<Mat> {
+        let n = self.n_basis;
+        densities
+            .iter()
+            .map(|density| {
+                let d = mat_to_row_major(density);
+                let dmax = self.shell_pair_dmax(&d);
+                let (j, _) = self.jk_for_density(&d, Some(&dmax), false);
+                mat_from_row_major(n, &j)
+            })
+            .collect()
     }
 }

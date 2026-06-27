@@ -201,6 +201,17 @@ pub fn run_scf_with_xc<P: IntegralProvider>(
     )
 }
 
+/// A two-stage integration-grid schedule for Kohn–Sham SCF: iterate on a cheap `coarse`
+/// XC grid until the orbital-gradient error falls below `switch_error`, then finish on the
+/// fine grid (the `xc` passed to [`run_scf_multigrid`]). Because convergence is only ever
+/// declared on the fine grid, the converged density and energy are exactly those of a
+/// pure fine-grid run — the coarse stage is a warm-up that removes most of the expensive
+/// fine-grid Fock builds. This is the staged-grid strategy long used by mainstream codes.
+pub struct GridSchedule<'a> {
+    pub coarse: &'a dyn XcContributor,
+    pub switch_error: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_scf_with_env<P: IntegralProvider>(
     provider: &P,
@@ -211,6 +222,58 @@ pub fn run_scf_with_env<P: IntegralProvider>(
     options: &ScfOptions,
     xc: Option<&dyn XcContributor>,
     solvent: Option<&dyn SolventModel>,
+) -> Result<ScfResult, ScfError> {
+    run_scf_core(
+        provider,
+        n_alpha,
+        n_beta,
+        reference,
+        nuclear_repulsion,
+        options,
+        xc,
+        solvent,
+        None,
+    )
+}
+
+/// [`run_scf_with_env`] with a two-stage [`GridSchedule`]: `xc` is the fine-grid
+/// contributor, `schedule.coarse` the cheap warm-up grid. See [`GridSchedule`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_scf_multigrid<P: IntegralProvider>(
+    provider: &P,
+    n_alpha: usize,
+    n_beta: usize,
+    reference: Reference,
+    nuclear_repulsion: f64,
+    options: &ScfOptions,
+    xc: Option<&dyn XcContributor>,
+    solvent: Option<&dyn SolventModel>,
+    schedule: GridSchedule<'_>,
+) -> Result<ScfResult, ScfError> {
+    run_scf_core(
+        provider,
+        n_alpha,
+        n_beta,
+        reference,
+        nuclear_repulsion,
+        options,
+        xc,
+        solvent,
+        Some(schedule),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scf_core<P: IntegralProvider>(
+    provider: &P,
+    n_alpha: usize,
+    n_beta: usize,
+    reference: Reference,
+    nuclear_repulsion: f64,
+    options: &ScfOptions,
+    xc: Option<&dyn XcContributor>,
+    solvent: Option<&dyn SolventModel>,
+    schedule: Option<GridSchedule<'_>>,
 ) -> Result<ScfResult, ScfError> {
     let n = provider.n_basis();
     if n == 0 {
@@ -240,6 +303,12 @@ pub fn run_scf_with_env<P: IntegralProvider>(
         None => xc.map_or(1.0, |x| x.exx_fraction()),
     };
     let incremental_fock = options.incremental_fock && rs.is_none();
+    // Pure (semi-)local functionals report exx_fraction == 0 and carry no range separation,
+    // so K enters neither the Fock build nor the energy (both multiply it by c_x == 0). For
+    // those, skip the exchange build entirely — it is the dominant cost of the density-fitted
+    // J/K (O(naux·n³)) and pure waste here. A non-None range separation forces c_x = 1.0
+    // above, so it is already covered by `c_x != 0.0`; it is named for defensive clarity.
+    let need_k = c_x != 0.0 || rs.is_some();
     let xc_restricted = reference != Reference::Uhf;
 
     let s = mat_to_row_major(&provider.overlap());
@@ -303,8 +372,17 @@ pub fn run_scf_with_env<P: IntegralProvider>(
     let mut iters_since_rebuild = 0usize;
     let rebuild_period = options.fock_rebuild_period.max(1);
 
+    // Two-stage grid schedule: run on the coarse XC grid until the SCF error drops below
+    // the switch threshold, then finish on the fine grid. `on_fine` starts true when no
+    // schedule is set (single-grid SCF). Convergence is only ever tested while `on_fine`,
+    // so a converged result is always a fine-grid result.
+    let xc_coarse = schedule.as_ref().map(|s| s.coarse);
+    let switch_error = schedule.as_ref().map_or(0.0, |s| s.switch_error);
+    let mut on_fine = xc_coarse.is_none();
+
     loop {
         iterations += 1;
+        let active_xc = if on_fine { xc } else { xc_coarse };
 
         let (va, vb): (&[f64], &[f64]) = match reference {
             Reference::Uhf => (&orbitals[0], &orbitals[1]),
@@ -331,34 +409,64 @@ pub fn run_scf_with_env<P: IntegralProvider>(
         db_ao = ao_from_orth(&x, &db_orth, n, m);
 
         if !incremental_fock {
-            let jk =
-                provider.build_jk(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-            ja = mat_to_row_major(&jk.coulomb[0]);
-            jb = mat_to_row_major(&jk.coulomb[1]);
-            ka = mat_to_row_major(&jk.exchange[0]);
-            kb = mat_to_row_major(&jk.exchange[1]);
+            if need_k {
+                let jk = provider
+                    .build_jk(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
+                ja = mat_to_row_major(&jk.coulomb[0]);
+                jb = mat_to_row_major(&jk.coulomb[1]);
+                ka = mat_to_row_major(&jk.exchange[0]);
+                kb = mat_to_row_major(&jk.exchange[1]);
+            } else {
+                let j = provider
+                    .build_j(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
+                ja = mat_to_row_major(&j[0]);
+                jb = mat_to_row_major(&j[1]);
+                // ka/kb stay at their initialized zero: c_x == 0 leaves them unused.
+            }
         } else if iterations == 1 || iters_since_rebuild >= rebuild_period {
-            let jk = provider
-                .build_jk_screened(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-            ja = mat_to_row_major(&jk.coulomb[0]);
-            jb = mat_to_row_major(&jk.coulomb[1]);
-            ka = mat_to_row_major(&jk.exchange[0]);
-            kb = mat_to_row_major(&jk.exchange[1]);
+            if need_k {
+                let jk = provider.build_jk_screened(&[
+                    mat_from_row_major(n, &da_ao),
+                    mat_from_row_major(n, &db_ao),
+                ]);
+                ja = mat_to_row_major(&jk.coulomb[0]);
+                jb = mat_to_row_major(&jk.coulomb[1]);
+                ka = mat_to_row_major(&jk.exchange[0]);
+                kb = mat_to_row_major(&jk.exchange[1]);
+            } else {
+                let j = provider.build_j_screened(&[
+                    mat_from_row_major(n, &da_ao),
+                    mat_from_row_major(n, &db_ao),
+                ]);
+                ja = mat_to_row_major(&j[0]);
+                jb = mat_to_row_major(&j[1]);
+            }
             iters_since_rebuild = 0;
         } else {
             let dda: Vec<f64> = (0..n * n).map(|i| da_ao[i] - da_prev[i]).collect();
             let ddb: Vec<f64> = (0..n * n).map(|i| db_ao[i] - db_prev[i]).collect();
-            let jk = provider
-                .build_jk_screened(&[mat_from_row_major(n, &dda), mat_from_row_major(n, &ddb)]);
-            let dja = mat_to_row_major(&jk.coulomb[0]);
-            let djb = mat_to_row_major(&jk.coulomb[1]);
-            let dka = mat_to_row_major(&jk.exchange[0]);
-            let dkb = mat_to_row_major(&jk.exchange[1]);
-            for i in 0..n * n {
-                ja[i] += dja[i];
-                jb[i] += djb[i];
-                ka[i] += dka[i];
-                kb[i] += dkb[i];
+            if need_k {
+                let jk = provider
+                    .build_jk_screened(&[mat_from_row_major(n, &dda), mat_from_row_major(n, &ddb)]);
+                let dja = mat_to_row_major(&jk.coulomb[0]);
+                let djb = mat_to_row_major(&jk.coulomb[1]);
+                let dka = mat_to_row_major(&jk.exchange[0]);
+                let dkb = mat_to_row_major(&jk.exchange[1]);
+                for i in 0..n * n {
+                    ja[i] += dja[i];
+                    jb[i] += djb[i];
+                    ka[i] += dka[i];
+                    kb[i] += dkb[i];
+                }
+            } else {
+                let j = provider
+                    .build_j_screened(&[mat_from_row_major(n, &dda), mat_from_row_major(n, &ddb)]);
+                let dja = mat_to_row_major(&j[0]);
+                let djb = mat_to_row_major(&j[1]);
+                for i in 0..n * n {
+                    ja[i] += dja[i];
+                    jb[i] += djb[i];
+                }
             }
             iters_since_rebuild += 1;
         }
@@ -380,7 +488,7 @@ pub fn run_scf_with_env<P: IntegralProvider>(
                 kb[i] = rs.alpha * kb[i] + rs.beta * klr_b[i];
             }
         }
-        let xc_contrib = xc.map(|x| x.eval(&da_ao, &db_ao, n, xc_restricted));
+        let xc_contrib = active_xc.map(|x| x.eval(&da_ao, &db_ao, n, xc_restricted));
         if let Some(c) = &xc_contrib {
             last_exc = c.exc;
             last_nelec = c.n_elec_grid;
@@ -479,8 +587,20 @@ pub fn run_scf_with_env<P: IntegralProvider>(
             eps_a.clone()
         };
 
+        // Grid-refinement switch: once the coarse-grid SCF has settled (orbital-gradient
+        // error below the threshold), refine to the fine grid for the remaining iterations
+        // and the converged result. The DIIS subspace is kept across the switch -- the
+        // error vectors are orbital-gradient commutators whose stationary point barely
+        // moves between grids, so retaining them lets the fine stage converge in a couple
+        // of steps instead of rebuilding the subspace from scratch. Convergence is gated on
+        // `on_fine` below, so the SCF can never report a coarse-grid result.
+        if !on_fine && error_norm < switch_error {
+            on_fine = true;
+        }
+
         let free = energy - last_ts.unwrap_or(0.0);
-        if iterations > 1
+        if on_fine
+            && iterations > 1
             && (energy - previous).abs() < options.energy_tol
             && (free - previous_free).abs() < options.energy_tol
             && error_norm < options.error_tol
@@ -507,12 +627,20 @@ pub fn run_scf_with_env<P: IntegralProvider>(
     }
 
     if incremental_fock && iters_since_rebuild > 0 {
-        let jk = provider
-            .build_jk_screened(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-        ja = mat_to_row_major(&jk.coulomb[0]);
-        jb = mat_to_row_major(&jk.coulomb[1]);
-        ka = mat_to_row_major(&jk.exchange[0]);
-        kb = mat_to_row_major(&jk.exchange[1]);
+        if need_k {
+            let jk = provider
+                .build_jk_screened(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
+            ja = mat_to_row_major(&jk.coulomb[0]);
+            jb = mat_to_row_major(&jk.coulomb[1]);
+            ka = mat_to_row_major(&jk.exchange[0]);
+            kb = mat_to_row_major(&jk.exchange[1]);
+        } else {
+            let j = provider
+                .build_j_screened(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
+            ja = mat_to_row_major(&j[0]);
+            jb = mat_to_row_major(&j[1]);
+            // ka/kb stay zero (c_x == 0): the energy/Fock terms below are inert.
+        }
         let electronic = if xc.is_some() || solvent.is_some() {
             let env = if xc.is_some() { last_exc } else { 0.0 }
                 + if solvent.is_some() { last_esolv } else { 0.0 };

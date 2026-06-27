@@ -19,7 +19,14 @@ pub const COMPOSITES: &[Composite] = &[
         functional: "r2scan",
         basis: "def2-mtzvpp",
         basis_label: "def2-mTZVPP",
-        grid_level: 4,
+        // Production grid level 3, not the dense reference-quality level 4. r2SCAN is the
+        // re-regularized SCAN (Furness et al., J. Phys. Chem. Lett. 11, 8208 (2020)), whose
+        // re-regularization was designed to tame SCAN's grid sensitivity, so the
+        // point-efficient pruned level-3 grid integrates it to ~1e-5 Eh of the reference —
+        // well inside chemical accuracy and matching the integration-accuracy tradeoff
+        // mainstream composite implementations ship as their default. Reference quality is
+        // still reachable on demand via grid level 4 / `--grid 4`.
+        grid_level: 3,
         dispersion: Dispersion::D4(D4Params::R2SCAN_3C),
         disp_label: "D4  (r2scan-3c)",
         gcp: Some(GcpParams::R2SCAN_3C),

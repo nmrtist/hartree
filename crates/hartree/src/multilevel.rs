@@ -470,7 +470,7 @@ mod tests {
         assert_eq!(s.opt.label, "r2scan-3c");
         assert_eq!(s.opt.basis, "def2-mtzvpp");
         assert!(s.opt.dispersion.is_some() && s.opt.gcp.is_some());
-        assert_eq!(s.opt.grid_level, 4);
+        assert_eq!(s.opt.grid_level, 3);
         assert!(matches!(s.sp.method, Method::Dft(_)));
         assert_eq!(s.sp.basis, "def2-tzvpp");
     }

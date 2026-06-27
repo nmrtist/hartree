@@ -71,7 +71,7 @@ fn dispersion_suffixes_are_rejected() {
 }
 
 #[test]
-#[ignore = "TZ-class composite run (def2-mTZVPP, grid 4); run with --release -- --ignored"]
+#[ignore = "TZ-class composite run (def2-mTZVPP, grid 3); run with --release -- --ignored"]
 fn composite_runs_without_basis_flag_and_reports_components() {
     let xyz = water();
     let out = hartree(&[xyz.to_str().unwrap(), "--method", "r2scan-3c"]);
@@ -85,7 +85,7 @@ fn composite_runs_without_basis_flag_and_reports_components() {
         stdout.contains("def2-mtzvpp"),
         "implied basis not reported:\n{stdout}"
     );
-    assert!(stdout.contains("grid level 4"), "grid default:\n{stdout}");
+    assert!(stdout.contains("grid level 3"), "grid default:\n{stdout}");
     let scf = grab(&stdout, "E_SCF (r2scan)");
     let d4 = grab(&stdout, "E_D4  (r2scan-3c)");
     let gcp = grab(&stdout, "E_gCP (def2-mTZVPP)");

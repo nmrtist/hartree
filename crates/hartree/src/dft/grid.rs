@@ -25,8 +25,8 @@ const DEFAULT_LEVEL: usize = 3;
 /// Grid levels that apply the five-zone angular pruning: the two production-tier
 /// levels (2 and 3). The coarse presets (levels 0/1 — VV10's non-local grid and
 /// COSX use level 1) and the reference-quality level 4 (the external-reference DFT
-/// oracle and r2scan-3c) keep the full Lebedev order on every radial shell, so they
-/// stay bit-for-bit as pinned.
+/// oracle) keep the full Lebedev order on every radial shell, so they stay
+/// bit-for-bit as pinned.
 fn prunes_angular(level: usize) -> bool {
     level == 2 || level == DEFAULT_LEVEL
 }

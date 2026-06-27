@@ -135,16 +135,20 @@ impl GridXc {
     fn fold_restricted(&self, d_tot: &[f64], want_potential: bool) -> Acc {
         let nao = self.nao;
         let weights = &self.grid.weights;
-        ao::par_blocks_fold(
+        ao::par_blocks_fold_local(
             &self.shells,
-            nao,
             &self.grid.points,
             self.needs_sigma || self.needs_tau,
             || Acc::new(nao, want_potential, false),
-            |mut acc, batch, start| {
+            |mut acc, block, start| {
+                let batch = &block.ao;
+                let m = batch.nao;
                 let np = batch.npts;
                 let w = &weights[start..start + np];
-                let bd = batch_density_tau(batch, d_tot, self.needs_sigma, self.needs_tau);
+                // Gather the density onto this block's significant AOs, run the whole
+                // quadrature at the compacted width m, then scatter the potential back.
+                let d_loc = gather_density(d_tot, &block.loc2glob, nao);
+                let bd = batch_density_tau(batch, &d_loc, self.needs_sigma, self.needs_tau);
 
                 let res = self.eval_xc_unpol(np, &bd.rho, bd.grad.as_slice(), &bd.tau);
 
@@ -155,10 +159,12 @@ impl GridXc {
 
                 if want_potential {
                     let a = self.build_a_restricted(batch, w, &bd.grad, &res);
-                    accumulate_v(&mut acc.v_a, &batch.phi, &a, np, nao);
+                    let mut v_loc = vec![0.0; m * m];
+                    accumulate_v(&mut v_loc, &batch.phi, &a, np, m);
                     if self.needs_tau {
-                        accumulate_v_tau(&mut acc.v_a, batch, w, &res.vtau, 1, 0, nao);
+                        accumulate_v_tau(&mut v_loc, batch, w, &res.vtau, 1, 0, m);
                     }
+                    scatter_v(&mut acc.v_a, &v_loc, &block.loc2glob, nao);
                 }
                 acc
             },
@@ -170,17 +176,20 @@ impl GridXc {
     fn fold_polarized(&self, d_a: &[f64], d_b: &[f64], want_potential: bool) -> Acc {
         let nao = self.nao;
         let weights = &self.grid.weights;
-        ao::par_blocks_fold(
+        ao::par_blocks_fold_local(
             &self.shells,
-            nao,
             &self.grid.points,
             self.needs_sigma || self.needs_tau,
             || Acc::new(nao, want_potential, true),
-            |mut acc, batch, start| {
+            |mut acc, block, start| {
+                let batch = &block.ao;
+                let m = batch.nao;
                 let np = batch.npts;
                 let w = &weights[start..start + np];
-                let bd_a = batch_density_tau(batch, d_a, self.needs_sigma, self.needs_tau);
-                let bd_b = batch_density_tau(batch, d_b, self.needs_sigma, self.needs_tau);
+                let d_a_loc = gather_density(d_a, &block.loc2glob, nao);
+                let d_b_loc = gather_density(d_b, &block.loc2glob, nao);
+                let bd_a = batch_density_tau(batch, &d_a_loc, self.needs_sigma, self.needs_tau);
+                let bd_b = batch_density_tau(batch, &d_b_loc, self.needs_sigma, self.needs_tau);
 
                 let rho = pack_rho_polarized(&bd_a.rho, &bd_b.rho);
                 let res = if self.needs_sigma {
@@ -215,12 +224,16 @@ impl GridXc {
                         self.build_a_polarized(batch, w, &bd_a.grad, &bd_b.grad, &res, Channel::A);
                     let a_b =
                         self.build_a_polarized(batch, w, &bd_a.grad, &bd_b.grad, &res, Channel::B);
-                    accumulate_v(&mut acc.v_a, &batch.phi, &a_a, np, nao);
-                    accumulate_v(&mut acc.v_b, &batch.phi, &a_b, np, nao);
+                    let mut v_a_loc = vec![0.0; m * m];
+                    let mut v_b_loc = vec![0.0; m * m];
+                    accumulate_v(&mut v_a_loc, &batch.phi, &a_a, np, m);
+                    accumulate_v(&mut v_b_loc, &batch.phi, &a_b, np, m);
                     if self.needs_tau {
-                        accumulate_v_tau(&mut acc.v_a, batch, w, &res.vtau, 2, 0, nao);
-                        accumulate_v_tau(&mut acc.v_b, batch, w, &res.vtau, 2, 1, nao);
+                        accumulate_v_tau(&mut v_a_loc, batch, w, &res.vtau, 2, 0, m);
+                        accumulate_v_tau(&mut v_b_loc, batch, w, &res.vtau, 2, 1, m);
                     }
+                    scatter_v(&mut acc.v_a, &v_a_loc, &block.loc2glob, nao);
+                    scatter_v(&mut acc.v_b, &v_b_loc, &block.loc2glob, nao);
                 }
                 acc
             },
@@ -262,7 +275,9 @@ impl GridXc {
         grad: &[[f64; 3]],
         res: &XcResult,
     ) -> Vec<f64> {
-        let nao = self.nao;
+        // Width is the batch's own column count: `nao` for a dense batch, or the
+        // locally-significant count `m` for a block-sparse one.
+        let nao = batch.nao;
         let np = batch.npts;
         let mut a = vec![0.0; np * nao];
         for p in 0..np {
@@ -295,7 +310,7 @@ impl GridXc {
         res: &XcResult,
         chan: Channel,
     ) -> Vec<f64> {
-        let nao = self.nao;
+        let nao = batch.nao;
         let np = batch.npts;
         let mut a = vec![0.0; np * nao];
         for p in 0..np {
@@ -389,6 +404,34 @@ impl AoBatch {
 
 fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
     a.iter().zip(b).map(|(x, y)| x + y).collect()
+}
+
+/// Gather the `m × m` sub-block of the global `nao × nao` density addressed by the block's
+/// significant AOs (`loc2glob`). O(m²), negligible beside the O(np·m²) contractions it feeds.
+fn gather_density(d: &[f64], loc2glob: &[usize], nao: usize) -> Vec<f64> {
+    let m = loc2glob.len();
+    let mut dl = vec![0.0; m * m];
+    for (i, &gi) in loc2glob.iter().enumerate() {
+        let grow = gi * nao;
+        let lrow = i * m;
+        for (j, &gj) in loc2glob.iter().enumerate() {
+            dl[lrow + j] = d[grow + gj];
+        }
+    }
+    dl
+}
+
+/// Scatter a block's `m × m` local potential back into the global `nao × nao` matrix,
+/// accumulating into the rows/columns named by `loc2glob`. The inverse of [`gather_density`].
+fn scatter_v(v: &mut [f64], v_loc: &[f64], loc2glob: &[usize], nao: usize) {
+    let m = loc2glob.len();
+    for (i, &gi) in loc2glob.iter().enumerate() {
+        let grow = gi * nao;
+        let lrow = i * m;
+        for (j, &gj) in loc2glob.iter().enumerate() {
+            v[grow + gj] += v_loc[lrow + j];
+        }
+    }
 }
 
 fn transpose_rowmajor(src: &[f64], rows: usize, cols: usize) -> Vec<f64> {

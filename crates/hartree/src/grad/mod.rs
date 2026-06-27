@@ -89,14 +89,34 @@ where
     }
 
     let hcore = mat_to_row_major(&provider.core_hamiltonian());
-    let jk = provider.build_jk(&[
-        mat_from_row_major(n, density_alpha),
-        mat_from_row_major(n, density_beta),
-    ]);
-    let ja = mat_to_row_major(&jk.coulomb[0]);
-    let jb = mat_to_row_major(&jk.coulomb[1]);
-    let mut ka = mat_to_row_major(&jk.exchange[0]);
-    let mut kb = mat_to_row_major(&jk.exchange[1]);
+    // Pure (semi-)local functionals (c_x == 0, no range separation) need no exchange: K
+    // enters the energy-weighted-density Fock below only as `c_x_fock * K = 0`, and the
+    // two-particle density that drives the ERI-derivative term already drops its exchange
+    // part at c_x == 0. So skip the K build entirely, mirroring the SCF Fock build.
+    let need_k = c_x != 0.0 || rs.is_some();
+    let (ja, jb, mut ka, mut kb) = if need_k {
+        let jk = provider.build_jk(&[
+            mat_from_row_major(n, density_alpha),
+            mat_from_row_major(n, density_beta),
+        ]);
+        (
+            mat_to_row_major(&jk.coulomb[0]),
+            mat_to_row_major(&jk.coulomb[1]),
+            mat_to_row_major(&jk.exchange[0]),
+            mat_to_row_major(&jk.exchange[1]),
+        )
+    } else {
+        let j = provider.build_j(&[
+            mat_from_row_major(n, density_alpha),
+            mat_from_row_major(n, density_beta),
+        ]);
+        (
+            mat_to_row_major(&j[0]),
+            mat_to_row_major(&j[1]),
+            vec![0.0; nn],
+            vec![0.0; nn],
+        )
+    };
     let c_x_fock = match &rs {
         Some(rs) => {
             debug_assert!(
