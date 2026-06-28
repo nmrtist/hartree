@@ -27,7 +27,7 @@ use crate::props::hessian::numerical_hessian;
 use crate::props::population::{PopulationAnalysis, population_analysis};
 use crate::props::thermo::{ThermoResult, rrho_thermochemistry_w0};
 use crate::scf::{
-    GridSchedule, Reference, ScfOptions, ScfResult, Smearing, SolventModel, XcContributor,
+    GridSchedule, Guess, Reference, ScfOptions, ScfResult, Smearing, SolventModel, XcContributor,
     run_scf_multigrid, run_scf_with_env,
 };
 use crate::solv::Cpcm;
@@ -149,6 +149,36 @@ fn run_scf_staged<P: IntegralProvider>(
             xc,
             solvent,
         ),
+    }
+}
+
+/// Assemble the SCF initial guess: a superposition of atomic densities when one can be built
+/// for every atom, otherwise the extended-Hückel (GWH) guess. Returns the guess tag and, for
+/// SAD, the spin-resolved first-iteration AO density. A density guess slashes the iteration
+/// count on larger/conjugated systems where GWH is weak, and falls back transparently — so a
+/// previously converging job keeps its exact converged energy.
+fn sad_initial_guess(
+    mol: &Molecule,
+    ao: &crate::basis::AoBasis,
+    basis: &str,
+    method: &Method,
+    grid_level: usize,
+    reference: Reference,
+) -> (Guess, Option<(Vec<f64>, Vec<f64>)>) {
+    // Restricted open-shell references keep the Hückel guess: the spin-summed SAD density
+    // (α = β) is a poor seed for ROHF's distinct closed/open spaces and could steer a
+    // multiple-solution open-shell system to a different (valid) root.
+    if reference == Reference::Rohf {
+        return (Guess::Gwh, None);
+    }
+    match crate::sad::sad_guess_density(mol, ao, basis, method, grid_level) {
+        // Spin-unpolarized seed: split the total atomic density equally between channels and
+        // let the SCF develop any spin polarization.
+        Some(total) => {
+            let half: Vec<f64> = total.iter().map(|v| 0.5 * v).collect();
+            (Guess::Sad, Some((half.clone(), half)))
+        }
+        None => (Guess::Gwh, None),
     }
 }
 
@@ -2313,6 +2343,19 @@ impl Job {
             smearing,
             ..base_opts
         };
+        let (guess, initial_density) = sad_initial_guess(
+            mol,
+            &ao,
+            &self.basis,
+            &self.method,
+            opts.grid_level,
+            reference,
+        );
+        let base_opts = ScfOptions {
+            guess,
+            initial_density,
+            ..base_opts
+        };
         let hcore_override = opts
             .x2c
             .then(|| x2c_hcore_override(&ao, &setup.charges, base_opts.lindep_thresh))
@@ -2429,6 +2472,19 @@ impl Job {
             smearing,
             ..base_opts
         };
+        let (guess, initial_density) = sad_initial_guess(
+            mol,
+            &ao,
+            &self.basis,
+            &self.method,
+            opts.grid_level,
+            reference,
+        );
+        let base_opts = ScfOptions {
+            guess,
+            initial_density,
+            ..base_opts
+        };
         let hcore_override = opts
             .x2c
             .then(|| x2c_hcore_override(&ao, &setup.charges, base_opts.lindep_thresh))
@@ -2493,6 +2549,19 @@ impl Job {
         };
         let base_opts = ScfOptions {
             smearing,
+            ..base_opts
+        };
+        let (guess, initial_density) = sad_initial_guess(
+            mol,
+            &ao,
+            &self.basis,
+            &self.method,
+            opts.grid_level,
+            reference,
+        );
+        let base_opts = ScfOptions {
+            guess,
+            initial_density,
             ..base_opts
         };
         let hcore_override = opts

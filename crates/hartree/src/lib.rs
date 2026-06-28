@@ -46,6 +46,7 @@ pub mod guardrails;
 mod job;
 pub mod multilevel;
 mod periodic_job;
+mod sad;
 mod surface;
 pub mod w1;
 

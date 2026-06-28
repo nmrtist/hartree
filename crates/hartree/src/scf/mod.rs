@@ -15,7 +15,7 @@ use thiserror::Error;
 use diis::Diis;
 use scf_math::{
     ao_from_orth, canonical_orthogonalizer, commutator, eigh, max_abs, mul, orth_frac_density,
-    orth_occ_density, transpose, vtav, xtax,
+    orth_from_ao, orth_occ_density, transpose, vtav, xtax,
 };
 use smearing::{entropy_sum, fermi_occupations};
 
@@ -32,8 +32,16 @@ pub enum Reference {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Guess {
+    /// Bare core Hamiltonian (no electron–electron screening); the weakest guess.
     Core,
+    /// Generalized Wolfsberg–Helmholz extended-Hückel guess.
     Gwh,
+    /// Superposition of atomic densities: the first Fock is built from a guess *density*
+    /// (provided in [`ScfOptions::initial_density`]) rather than a guess Fock. The density
+    /// is assembled by the caller from per-element atomic densities. If the field is left
+    /// empty this degrades to [`Guess::Gwh`]. (Van Lenthe, Zwaans, van Dam, Guest,
+    /// J. Comput. Chem. 27 (2006) 926.)
+    Sad,
 }
 
 #[derive(Debug, Error)]
@@ -76,6 +84,11 @@ pub struct ScfOptions {
     pub fock_rebuild_period: usize,
     pub smearing: Option<Smearing>,
     pub hcore_override: Option<Vec<f64>>,
+    /// First-iteration AO density `(alpha, beta)`, each row-major `n_basis²`, consumed only
+    /// when [`guess`](Self::guess) is [`Guess::Sad`]. Seeds the SCF from a guess density
+    /// instead of a guess Fock; ignored (and the run falls back to the guess Fock) when
+    /// `None`.
+    pub initial_density: Option<(Vec<f64>, Vec<f64>)>,
 }
 
 impl Default for ScfOptions {
@@ -92,6 +105,7 @@ impl Default for ScfOptions {
             fock_rebuild_period: 10,
             smearing: None,
             hcore_override: None,
+            initial_density: None,
         }
     }
 }
@@ -337,13 +351,24 @@ fn run_scf_core<P: IntegralProvider>(
     let nc = n_beta; // closed (doubly occupied) for ROHF
     let no = n_alpha - n_beta; // open (singly occupied α) for ROHF
 
+    // For a density guess (`Sad`) the guess Fock only seeds the initial orbitals, which are
+    // overwritten after the first iteration diagonalizes the Fock built from the supplied
+    // density; the extended-Hückel form is a harmless, well-conditioned fallback (and is the
+    // actual guess when no density was supplied).
     let guess_ao = match options.guess {
         Guess::Core => hcore.clone(),
-        Guess::Gwh => gwh_matrix(&hcore, &s, n),
+        Guess::Gwh | Guess::Sad => gwh_matrix(&hcore, &s, n),
     };
     let (eps0, v0) = eigh(&xtax(&guess_ao, &x, n, m), m);
     let mut orbitals: Vec<Vec<f64>> = vec![v0; n_sets];
     let mut orb_eps: Vec<Vec<f64>> = vec![eps0; n_sets];
+
+    // SAD payload, consumed on the first iteration only (see the loop below). Carried only by
+    // the `Sad` guess; any other guess leaves this `None` and starts from the orbitals above.
+    let mut initial_density = match options.guess {
+        Guess::Sad => options.initial_density.clone(),
+        _ => None,
+    };
 
     let mut diis = Diis::new(options.diis_dim);
     let mut energy;
@@ -384,26 +409,41 @@ fn run_scf_core<P: IntegralProvider>(
         iterations += 1;
         let active_xc = if on_fine { xc } else { xc_coarse };
 
-        let (va, vb): (&[f64], &[f64]) = match reference {
-            Reference::Uhf => (&orbitals[0], &orbitals[1]),
-            _ => (&orbitals[0], &orbitals[0]),
-        };
-        if let Some((t, kt)) = smear_t_kt {
-            let fa = fermi_occupations(&orb_eps[0], n_alpha as f64, kt);
-            let fb = if n_sets == 2 {
-                fermi_occupations(&orb_eps[1], n_beta as f64, kt)
-            } else {
-                fa.clone()
+        // First iteration of a superposition-of-atomic-densities run: seed from the supplied
+        // AO density instead of the guess-Fock orbitals. Projecting it through the
+        // orthonormalizer (Xᵀ S D S X) makes it exactly representable in the working basis and
+        // keeps it consistent with the orbital-gradient error vector formed below. Every later
+        // iteration takes the orbital-derived density, so the density guess only sets the
+        // SCF's starting point — the fixed point is unchanged.
+        let (da_orth, db_orth) = if let Some((sad_a, sad_b)) =
+            (iterations == 1).then(|| initial_density.take()).flatten()
+        {
+            (
+                orth_from_ao(&sad_a, &s, &x, n, m),
+                orth_from_ao(&sad_b, &s, &x, n, m),
+            )
+        } else {
+            let (va, vb): (&[f64], &[f64]) = match reference {
+                Reference::Uhf => (&orbitals[0], &orbitals[1]),
+                _ => (&orbitals[0], &orbitals[0]),
             };
-            last_ts = Some(t * BOLTZMANN_HT * (entropy_sum(&fa) + entropy_sum(&fb)));
-            last_occ = Some((fa, fb));
-        }
-        let (da_orth, db_orth) = match &last_occ {
-            Some((fa, fb)) => (orth_frac_density(va, m, fa), orth_frac_density(vb, m, fb)),
-            None => (
-                orth_occ_density(va, m, n_alpha),
-                orth_occ_density(vb, m, n_beta),
-            ),
+            if let Some((t, kt)) = smear_t_kt {
+                let fa = fermi_occupations(&orb_eps[0], n_alpha as f64, kt);
+                let fb = if n_sets == 2 {
+                    fermi_occupations(&orb_eps[1], n_beta as f64, kt)
+                } else {
+                    fa.clone()
+                };
+                last_ts = Some(t * BOLTZMANN_HT * (entropy_sum(&fa) + entropy_sum(&fb)));
+                last_occ = Some((fa, fb));
+            }
+            match &last_occ {
+                Some((fa, fb)) => (orth_frac_density(va, m, fa), orth_frac_density(vb, m, fb)),
+                None => (
+                    orth_occ_density(va, m, n_alpha),
+                    orth_occ_density(vb, m, n_beta),
+                ),
+            }
         };
         da_ao = ao_from_orth(&x, &da_orth, n, m);
         db_ao = ao_from_orth(&x, &db_orth, n, m);

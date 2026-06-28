@@ -102,6 +102,17 @@ pub(crate) fn ao_from_orth(x: &[f64], d_orth: &[f64], n: usize, m: usize) -> Vec
     mul(&xd, &xt, n, m, n) // n×n
 }
 
+/// Project an AO-basis density `d_ao` (n×n, row-major) into the orthonormal working basis
+/// defined by the canonical orthogonalizer `x` (n×m): returns Xᵀ S D S X (m×m). This is
+/// the inverse of [`ao_from_orth`]: for a full-rank basis the round trip
+/// `ao_from_orth(x, orth_from_ao(d, s, x))` reproduces `d`; when `x` has dropped linearly
+/// dependent combinations it yields the component of `d` representable in the kept subspace.
+pub(crate) fn orth_from_ao(d_ao: &[f64], s: &[f64], x: &[f64], n: usize, m: usize) -> Vec<f64> {
+    let sd = mul(s, d_ao, n, n, n); // S D
+    let sds = mul(&sd, s, n, n, n); // S D S
+    xtax(&sds, x, n, m) // Xᵀ (S D S) X
+}
+
 pub(crate) fn canonical_orthogonalizer(s: &[f64], n: usize, thresh: f64) -> (Vec<f64>, usize) {
     let (values, u) = eigh(s, n); // u: n×n, eigenvector `col` is u[·*n + col]
     let kept: Vec<usize> = (0..n).filter(|&i| values[i] > thresh).collect();
