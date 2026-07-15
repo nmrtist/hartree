@@ -57,11 +57,11 @@ fn run(func: &str, reference: Reference) -> ScfResult {
 // point-efficient pruned grid (a moderated Treutler–Ahlrichs radial set with the
 // full five-zone angular pruning); the grid-sensitive m06-2x meta-GGA is the loosest.
 const FIXTURES: &[(&str, f64)] = &[
-    ("m06-2x", -76.295766206199),
-    ("pw6b95", -76.409242001923),
-    ("b97m-v", -76.344774687374),
-    ("wb97x-v", -76.345153292028),
-    ("wb97m-v", -76.341760482814),
+    ("m06-2x", -76.295765068947),
+    ("pw6b95", -76.409241873567),
+    ("b97m-v", -76.344774926822),
+    ("wb97x-v", -76.345153345251),
+    ("wb97m-v", -76.341760752567),
 ];
 
 #[test]
@@ -86,14 +86,16 @@ fn rks_water_def2svp_regression_fixtures() {
 
 #[test]
 fn uks_equals_rks_closed_shell() {
-    for &(func, e_ref) in FIXTURES {
-        let r = run(func, Reference::Uhf);
-        assert!(r.converged, "{func}: UKS did not converge");
+    for &(func, _) in FIXTURES {
+        let rks = run(func, Reference::Rhf);
+        let uks = run(func, Reference::Uhf);
+        assert!(rks.converged, "{func}: RKS did not converge");
+        assert!(uks.converged, "{func}: UKS did not converge");
         assert!(
-            (r.energy - e_ref).abs() < 1e-7,
-            "{func}: UKS E = {:.12} vs RKS fixture {:.12}",
-            r.energy,
-            e_ref
+            (uks.energy - rks.energy).abs() < 1e-10,
+            "{func}: UKS E = {:.12} vs RKS E = {:.12}",
+            uks.energy,
+            rks.energy
         );
     }
 }

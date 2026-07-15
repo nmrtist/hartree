@@ -89,7 +89,7 @@ fn tau_integrates_to_kinetic_energy_water_631g() {
     let (d_tot, t, ao) = rhf_setup(&mol, "6-31g");
     let n = ao.n_ao();
     let t_analytic: f64 = (0..n * n).map(|i| d_tot[i] * t[i]).sum();
-    let acc = tau_sweep(&mol, &d_tot, &ao, 3);
+    let acc = tau_sweep(&mol, &d_tot, &ao, 4);
     println!(
         "∫τ = {:.10}  Tr(D·T) = {:.10}  Δ = {:+.2e}  worst vW violation = {:+.2e}",
         acc.integral,

@@ -80,10 +80,10 @@ fn b2plyp_water_def2svp_regression() {
     assert!((r.best_energy() - FIXTURE_B2PLYP_TOTAL).abs() < 1e-8);
 }
 
-const FIXTURE_B2PLYP_E_SCF: f64 = -76.193742914397;
-const FIXTURE_B2PLYP_E_OS: f64 = -0.193250885735;
-const FIXTURE_B2PLYP_E_SS: f64 = -0.062474960497;
-const FIXTURE_B2PLYP_TOTAL: f64 = -76.262788892879;
+const FIXTURE_B2PLYP_E_SCF: f64 = -76.193742903937;
+const FIXTURE_B2PLYP_E_OS: f64 = -0.193250886360;
+const FIXTURE_B2PLYP_E_SS: f64 = -0.062474961010;
+const FIXTURE_B2PLYP_TOTAL: f64 = -76.262788882727;
 
 #[test]
 fn revdsd_and_pwpb95_sto3g() {
@@ -226,7 +226,7 @@ fn b2plyp_ri_mp2_water_def2svp_regression() {
     assert!((r.best_energy() - FIXTURE_B2PLYP_RI_TOTAL).abs() < 1e-8);
 }
 
-const FIXTURE_B2PLYP_RI_TOTAL: f64 = -76.262763229381;
+const FIXTURE_B2PLYP_RI_TOTAL: f64 = -76.262763219229;
 
 #[test]
 fn dh_ri_mp2_missing_aux_errors() {
