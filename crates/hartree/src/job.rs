@@ -569,6 +569,10 @@ pub struct JobResult {
     /// `mem_budget_bytes`. The job still ran (a report, not a block); `None`
     /// means no budget-driven downgrade happened. See [`BackendDowngrade`].
     pub backend_downgrade: Option<BackendDowngrade>,
+    /// Integral backend actually used by the SCF execution path.
+    pub resolved_backend: crate::EstimateBackend,
+    /// Why [`Self::resolved_backend`] was selected.
+    pub backend_selection_reason: crate::BackendSelectionReason,
 }
 
 impl JobResult {
@@ -640,6 +644,8 @@ impl Job {
                 report.to,
             ));
             result.backend_downgrade = Some(report);
+            result.resolved_backend = crate::EstimateBackend::Direct;
+            result.backend_selection_reason = crate::BackendSelectionReason::MemoryBudget;
         }
         Ok(result)
     }
@@ -659,7 +665,9 @@ impl Job {
         if estimate.peak_bytes <= budget {
             return Ok((std::borrow::Cow::Borrowed(self), None));
         }
-        if self.direct_downgrade_eligible() {
+        if estimate.backend == crate::EstimateBackend::Conventional
+            && self.direct_downgrade_eligible()
+        {
             let mut downgraded = self.clone();
             downgraded.options.direct = true;
             // Clear the budget on the clone so its own run does not re-plan.
@@ -692,37 +700,14 @@ impl Job {
     /// doubt it returns `false`, so the budget path refuses rather than silently
     /// running an unsupported combination.
     fn direct_downgrade_eligible(&self) -> bool {
-        let o = &self.options;
-        // Only the conventional path downgrades; --ri/--direct already chose.
-        if o.ri || o.direct {
-            return false;
-        }
-        // The integral-direct backend supports SCF-level single points only.
-        if o.optimize_geometry
-            || o.transition_state
-            || o.compute_properties
-            || o.compute_frequencies
-            || o.fod
-            || o.cosx
-            || o.cosmo_file.is_some()
-        {
-            return false;
-        }
-        if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
-            return false;
-        }
-        // Double hybrids, range-separated (CAM), and VV10 functionals all need a
-        // backend that stores its integrals.
-        if let Method::Dft(spec) = &self.method
-            && (spec.double_hybrid().is_some() || spec.cam().is_some() || spec.vv10().is_some())
-        {
-            return false;
-        }
-        true
+        !self.options.ri && !self.options.direct && crate::estimate::direct_backend_eligible(self)
     }
 
     fn run_core(&self) -> Result<JobResult, String> {
+        let resolution = crate::estimate::resolve_backend(self)?;
         let mut result = self.run_inner()?;
+        result.resolved_backend = resolution.backend;
+        result.backend_selection_reason = resolution.reason;
         result.method_warnings = crate::guardrails::assess_job(self);
         if let Some(name) = &self.options.smd
             && result.converged()
@@ -909,6 +894,8 @@ impl Job {
         Ok(JobResult {
             method_warnings: Vec::new(),
             backend_downgrade: None,
+            resolved_backend: crate::EstimateBackend::Conventional,
+            backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
             scf,
             optimized_geometry: None,
             transition_state: None,
@@ -933,6 +920,7 @@ impl Job {
     fn run_inner(&self) -> Result<JobResult, String> {
         let mol = &self.molecule;
         let opts = &self.options;
+        let backend = crate::estimate::resolve_backend(self)?.backend;
         let n_solv = [
             opts.solvent_eps.is_some(),
             opts.smd.is_some(),
@@ -1203,7 +1191,7 @@ impl Job {
                 );
             }
         }
-        if opts.ri {
+        if backend == crate::EstimateBackend::Ri {
             if opts.direct {
                 return Err(
                     "--ri and --direct are contradictory: density fitting builds and stores \
@@ -1228,7 +1216,7 @@ impl Job {
                 return Err("the RI-JK backend does not support properties or frequencies".into());
             }
         }
-        if opts.direct {
+        if backend == crate::EstimateBackend::Direct {
             if opts.optimize_geometry {
                 return Err(
                     "integral-direct backend does not support geometry optimization".into(),
@@ -1519,6 +1507,8 @@ impl Job {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
+                resolved_backend: crate::EstimateBackend::Conventional,
+                backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
                 scf,
                 optimized_geometry: Some(opt),
                 transition_state: None,
@@ -1767,6 +1757,8 @@ impl Job {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
+                resolved_backend: crate::EstimateBackend::Conventional,
+                backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
                 scf,
                 optimized_geometry: None,
                 transition_state: Some(ts),
@@ -1792,7 +1784,7 @@ impl Job {
         let gcp_energy = opts.gcp.map(|p| crate::disp::gcp_energy(mol, &p));
         let srb_energy = opts.srb.map(|p| crate::disp::srb_energy(mol, &p));
 
-        if opts.ri {
+        if backend == crate::EstimateBackend::Ri {
             let (scf, ri_diag, dft_diag, cosx_diag, vv10_energy) =
                 self.run_ri(mol, n_alpha, n_beta, reference, smearing)?;
             let post_hf = if opts.ri_mp2 && scf.converged {
@@ -1803,6 +1795,8 @@ impl Job {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
+                resolved_backend: crate::EstimateBackend::Ri,
+                backend_selection_reason: crate::BackendSelectionReason::Explicit,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -1824,11 +1818,13 @@ impl Job {
             });
         }
 
-        if opts.direct {
-            let scf = self.run_direct(mol, n_alpha, n_beta, reference, smearing)?;
+        if backend == crate::EstimateBackend::Direct {
+            let (scf, dft_diag) = self.run_direct(mol, n_alpha, n_beta, reference, smearing)?;
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
+                resolved_backend: crate::EstimateBackend::Direct,
+                backend_selection_reason: crate::BackendSelectionReason::Explicit,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -1836,7 +1832,7 @@ impl Job {
                 post_hf: None,
                 properties: None,
                 frequencies: None,
-                dft: None,
+                dft: dft_diag,
                 ri: None,
                 cosx: None,
                 dispersion_energy,
@@ -1857,6 +1853,8 @@ impl Job {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
+                resolved_backend: crate::EstimateBackend::Conventional,
+                backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -2030,6 +2028,8 @@ impl Job {
         Ok(JobResult {
             method_warnings: Vec::new(),
             backend_downgrade: None,
+            resolved_backend: crate::EstimateBackend::Conventional,
+            backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
             scf,
             optimized_geometry: None,
             transition_state: None,
@@ -2182,6 +2182,8 @@ impl Job {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
+                resolved_backend: crate::EstimateBackend::Conventional,
+                backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
                 scf,
                 optimized_geometry: None,
                 transition_state: None,
@@ -2278,6 +2280,8 @@ impl Job {
         Ok(JobResult {
             method_warnings: Vec::new(),
             backend_downgrade: None,
+            resolved_backend: crate::EstimateBackend::Conventional,
+            backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
             scf,
             optimized_geometry: None,
             transition_state: None,
@@ -2447,7 +2451,7 @@ impl Job {
         n_beta: usize,
         reference: Reference,
         smearing: Option<Smearing>,
-    ) -> Result<ScfResult, String> {
+    ) -> Result<(ScfResult, Option<DftDiagnostics>), String> {
         let opts = &self.options;
         let ao = BasisSet::load(&self.basis)
             .map_err(|e| e.to_string())?
@@ -2459,6 +2463,12 @@ impl Job {
         } else {
             None
         };
+        let dft_diag = grid_xc.as_ref().map(|g| DftDiagnostics {
+            functional_name: g.name().to_string(),
+            grid_level: g.level(),
+            n_grid_points: g.n_points(),
+            exx_fraction: g.exx_fraction(),
+        });
         let base_opts = if grid_xc.is_some() {
             ScfOptions {
                 energy_tol: 1e-9,
@@ -2497,7 +2507,7 @@ impl Job {
         let provider = DirectProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
         let cpcm = self.build_cpcm(&provider, mol)?;
         let solv_ref = cpcm.as_ref().map(|c| c as &dyn SolventModel);
-        run_scf_with_env(
+        let scf = run_scf_with_env(
             &provider,
             n_alpha,
             n_beta,
@@ -2510,7 +2520,8 @@ impl Job {
             xc_ref,
             solv_ref,
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+        Ok((scf, dft_diag))
     }
 
     fn run_conventional(

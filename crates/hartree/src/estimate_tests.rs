@@ -187,3 +187,22 @@ fn estimate_is_serde_round_trippable() {
     let back: MemoryEstimate = serde_json::from_str(&json).unwrap();
     assert_eq!(est, back);
 }
+
+#[test]
+fn automatic_backend_model_applies_margin_and_capability_gate() {
+    let eligible = job(Method::Rhf, JobOptions::default());
+    let small = resolve_backend_for_size(&eligible, 20, 10);
+    assert_eq!(small.backend, EstimateBackend::Conventional);
+    assert_eq!(small.reason, BackendSelectionReason::Performance);
+    let large = resolve_backend_for_size(&eligible, 100, 45);
+    assert_eq!(large.backend, EstimateBackend::Direct);
+    assert_eq!(large.reason, BackendSelectionReason::Performance);
+
+    let required = job(Method::Mp2, JobOptions::default());
+    let resolution = resolve_backend_for_size(&required, 100, 45);
+    assert_eq!(resolution.backend, EstimateBackend::Conventional);
+    assert_eq!(
+        resolution.reason,
+        BackendSelectionReason::RequiredCapability
+    );
+}

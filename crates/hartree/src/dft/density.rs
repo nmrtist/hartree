@@ -1,6 +1,6 @@
 use crate::dft::ao::AoBatch;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BatchDensity {
     pub rho: Vec<f64>,
     pub grad: Vec<[f64; 3]>,
@@ -12,6 +12,26 @@ pub fn batch_density(ao: &AoBatch, d: &[f64], with_grad: bool) -> BatchDensity {
 }
 
 pub fn batch_density_tau(ao: &AoBatch, d: &[f64], with_grad: bool, with_tau: bool) -> BatchDensity {
+    let mut out = BatchDensity {
+        rho: Vec::new(),
+        grad: Vec::new(),
+        tau: Vec::new(),
+    };
+    let mut t = Vec::new();
+    let mut tk = Vec::new();
+    batch_density_tau_into(ao, d, with_grad, with_tau, &mut out, &mut t, &mut tk);
+    out
+}
+
+pub fn batch_density_tau_into(
+    ao: &AoBatch,
+    d: &[f64],
+    with_grad: bool,
+    with_tau: bool,
+    out: &mut BatchDensity,
+    t: &mut Vec<f64>,
+    tk: &mut Vec<f64>,
+) {
     let npts = ao.npts;
     let nao = ao.nao;
     assert_eq!(d.len(), nao * nao, "density must be nao×nao");
@@ -20,22 +40,25 @@ pub fn batch_density_tau(ao: &AoBatch, d: &[f64], with_grad: bool, with_tau: boo
         "gradients requested but AO batch has none"
     );
 
-    let t = crate::linalg::gemm(&ao.phi, npts, nao, d, nao);
+    crate::linalg::gemm_into(&ao.phi, npts, nao, d, nao, t);
 
-    let mut rho = vec![0.0; npts];
-    let mut grad = if with_grad {
-        vec![[0.0; 3]; npts]
+    out.rho.resize(npts, 0.0);
+    out.rho.fill(0.0);
+    if with_grad {
+        out.grad.resize(npts, [0.0; 3]);
+        out.grad.fill([0.0; 3]);
     } else {
-        Vec::new()
-    };
-    let mut tau = if with_tau {
-        vec![0.0; npts]
+        out.grad.clear();
+    }
+    if with_tau {
+        out.tau.resize(npts, 0.0);
+        out.tau.fill(0.0);
     } else {
-        Vec::new()
-    };
+        out.tau.clear();
+    }
     if with_tau {
         for dk in &ao.dphi {
-            let tk = crate::linalg::gemm(dk, npts, nao, d, nao);
+            crate::linalg::gemm_into(dk, npts, nao, d, nao, tk);
             for p in 0..npts {
                 let trow = &tk[p * nao..p * nao + nao];
                 let drow = &dk[p * nao..p * nao + nao];
@@ -43,7 +66,7 @@ pub fn batch_density_tau(ao: &AoBatch, d: &[f64], with_grad: bool, with_tau: boo
                 for mu in 0..nao {
                     s += trow[mu] * drow[mu];
                 }
-                tau[p] += 0.5 * s;
+                out.tau[p] += 0.5 * s;
             }
         }
     }
@@ -55,7 +78,7 @@ pub fn batch_density_tau(ao: &AoBatch, d: &[f64], with_grad: bool, with_tau: boo
         for mu in 0..nao {
             r += trow[mu] * prow[mu];
         }
-        rho[p] = r;
+        out.rho[p] = r;
 
         if with_grad {
             let mut g = [0.0; 3];
@@ -67,11 +90,9 @@ pub fn batch_density_tau(ao: &AoBatch, d: &[f64], with_grad: bool, with_tau: boo
                 }
                 *gk = 2.0 * s;
             }
-            grad[p] = g;
+            out.grad[p] = g;
         }
     }
-
-    BatchDensity { rho, grad, tau }
 }
 
 pub fn sigma_dot(g_sigma: &[[f64; 3]], g_tau: &[[f64; 3]]) -> Vec<f64> {

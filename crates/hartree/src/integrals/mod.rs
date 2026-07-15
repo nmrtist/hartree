@@ -247,7 +247,13 @@ impl ConventionalProvider {
     }
 
     fn eri_tensor(&self) -> &[f64] {
-        self.eri.get_or_init(|| build_eri_parallel(&self.basis))
+        self.eri.get_or_init(|| {
+            if rayon::current_num_threads() == 1 {
+                self.basis.eri()
+            } else {
+                build_eri_parallel(&self.basis)
+            }
+        })
     }
 
     fn eri_lr_tensor(&self, omega: f64) -> &[f64] {
@@ -523,9 +529,7 @@ pub struct DirectProvider {
     charges: Vec<([f64; 3], f64)>,
     ecps: Vec<integral::Ecp>,
     n_basis: usize,
-    shell_nfunc: Vec<usize>,
-    shell_offset: Vec<usize>,
-    schwarz: Vec<f64>,
+    contractor: integral::DirectContractor,
     tau: f64,
 }
 
@@ -536,22 +540,13 @@ impl DirectProvider {
 
     pub fn with_screening(basis: integral::Basis, charges: Vec<([f64; 3], f64)>, tau: f64) -> Self {
         let n_basis = basis.nao();
-        let shell_nfunc: Vec<usize> = basis.shells().iter().map(|s| s.n_func()).collect();
-        let mut shell_offset = Vec::with_capacity(shell_nfunc.len());
-        let mut acc = 0;
-        for &nf in &shell_nfunc {
-            shell_offset.push(acc);
-            acc += nf;
-        }
-        let schwarz = basis.schwarz_bounds();
+        let contractor = basis.direct_contractor();
         Self {
             basis,
             charges,
             ecps: Vec::new(),
             n_basis,
-            shell_nfunc,
-            shell_offset,
-            schwarz,
+            contractor,
             tau,
         }
     }
@@ -566,165 +561,59 @@ impl DirectProvider {
         self.tau
     }
 
-    fn jk_for_density(
+    fn contract_densities(
         &self,
-        d: &[f64],
-        dmax: Option<&[f64]>,
+        densities: &[Vec<f64>],
         want_k: bool,
-    ) -> (Vec<f64>, Vec<f64>) {
+    ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
         let n = self.n_basis;
-        let nsh = self.shell_nfunc.len();
-        let q = &self.schwarz;
-
-        let bra_pairs: Vec<(usize, usize)> = (0..nsh)
-            .flat_map(|sa| (0..=sa).map(move |sb| (sa, sb)))
-            .filter(|&(sa, sb)| q[sa * nsh + sb] != 0.0)
-            .collect();
-
-        let zero = || (vec![0.0; n * n], vec![0.0; n * n]);
-        bra_pairs
+        let drefs: Vec<&[f64]> = densities.iter().map(Vec::as_slice).collect();
+        let bounds = self.contractor.density_shell_bounds(&drefs);
+        let brefs: Vec<&[f64]> = bounds.iter().map(Vec::as_slice).collect();
+        let nd = densities.len();
+        let zero = || {
+            (
+                integral::DirectWorkspace::new(),
+                vec![vec![0.0; n * n]; nd],
+                vec![vec![0.0; n * n]; nd],
+            )
+        };
+        let (_, j, k) = self
+            .contractor
+            .bra_pairs()
             .par_iter()
-            .fold(zero, |(mut j, mut k), &(sa, sb)| {
-                self.accumulate_bra_pair(sa, sb, d, dmax, &mut j, &mut k, want_k);
-                (j, k)
+            .fold(zero, |(mut workspace, mut j, mut k), &bra| {
+                let mut outputs: Vec<integral::DirectBuffers<'_>> = j
+                    .iter_mut()
+                    .zip(k.iter_mut())
+                    .map(|(coulomb, exchange)| integral::DirectBuffers {
+                        coulomb,
+                        exchange: want_k.then_some(exchange.as_mut_slice()),
+                    })
+                    .collect();
+                self.contractor.accumulate_bra_pair(
+                    &mut workspace,
+                    bra,
+                    &drefs,
+                    &brefs,
+                    self.tau,
+                    want_k,
+                    &mut outputs,
+                );
+                (workspace, j, k)
             })
-            .reduce(zero, |(mut ja, mut ka), (jb, kb)| {
-                for i in 0..ja.len() {
-                    ja[i] += jb[i];
-                    if want_k {
-                        ka[i] += kb[i];
-                    }
-                }
-                (ja, ka)
-            })
-    }
-
-    fn shell_pair_dmax(&self, d: &[f64]) -> Vec<f64> {
-        let n = self.n_basis;
-        let nf = &self.shell_nfunc;
-        let off = &self.shell_offset;
-        let nsh = nf.len();
-        let mut dmax = vec![0.0; nsh * nsh];
-        for si in 0..nsh {
-            for sj in 0..nsh {
-                let mut m = 0.0_f64;
-                for a in 0..nf[si] {
-                    let row = (off[si] + a) * n + off[sj];
-                    for b in 0..nf[sj] {
-                        m = m.max(d[row + b].abs());
-                    }
-                }
-                dmax[si * nsh + sj] = m;
-            }
-        }
-        dmax
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn accumulate_bra_pair(
-        &self,
-        sa: usize,
-        sb: usize,
-        d: &[f64],
-        dmax: Option<&[f64]>,
-        j: &mut [f64],
-        k: &mut [f64],
-        want_k: bool,
-    ) {
-        let n = self.n_basis;
-        let nf = &self.shell_nfunc;
-        let off = &self.shell_offset;
-        let q = &self.schwarz;
-        let nsh = nf.len();
-        let qab = q[sa * nsh + sb];
-
-        for sc in 0..=sa {
-            let sd_max = if sc == sa { sb } else { sc };
-            for sd in 0..=sd_max {
-                let pair_bound = qab * q[sc * nsh + sd];
-                if pair_bound < self.tau {
-                    continue;
-                }
-                if let Some(dm) = dmax {
-                    let dbound = dm[sa * nsh + sb]
-                        .max(dm[sc * nsh + sd])
-                        .max(dm[sa * nsh + sc])
-                        .max(dm[sa * nsh + sd])
-                        .max(dm[sb * nsh + sc])
-                        .max(dm[sb * nsh + sd]);
-                    if pair_bound * dbound < self.tau {
-                        continue;
-                    }
-                }
-
-                let block = self.basis.eri_block(sa, sb, sc, sd);
-                let (na, nb, nc, nd) = (nf[sa], nf[sb], nf[sc], nf[sd]);
-                let (oa, ob, oc, od) = (off[sa], off[sb], off[sc], off[sd]);
-                let bra_eq = sa == sb;
-                let ket_eq = sc == sd;
-                let braket_eq = sa == sc && sb == sd;
-
-                for a in 0..na {
-                    let mu = oa + a;
-                    let b_hi = if bra_eq { a + 1 } else { nb };
-                    for b in 0..b_hi {
-                        let nu = ob + b;
-                        for c in 0..nc {
-                            let lam = oc + c;
-                            let d_hi = if ket_eq { c + 1 } else { nd };
-                            let base = ((a * nb + b) * nc + c) * nd;
-                            for e in 0..d_hi {
-                                let sig = od + e;
-                                if braket_eq && (mu * n + nu) < (lam * n + sig) {
-                                    continue;
-                                }
-                                let g = block[base + e];
-                                scatter_eri(j, k, d, n, g, mu, nu, lam, sig, want_k);
-                            }
+            .reduce(zero, |(workspace, mut ja, mut ka), (_, jb, kb)| {
+                for density in 0..nd {
+                    for i in 0..ja[density].len() {
+                        ja[density][i] += jb[density][i];
+                        if want_k {
+                            ka[density][i] += kb[density][i];
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn scatter_eri(
-    j: &mut [f64],
-    k: &mut [f64],
-    d: &[f64],
-    n: usize,
-    g: f64,
-    mu: usize,
-    nu: usize,
-    lam: usize,
-    sig: usize,
-    want_k: bool,
-) {
-    let perms = [
-        (mu, nu, lam, sig),
-        (nu, mu, lam, sig),
-        (mu, nu, sig, lam),
-        (nu, mu, sig, lam),
-        (lam, sig, mu, nu),
-        (sig, lam, mu, nu),
-        (lam, sig, nu, mu),
-        (sig, lam, nu, mu),
-    ];
-    for i in 0..8 {
-        let (a, b, c, e) = perms[i];
-        if perms[..i].iter().any(|&p| p == perms[i]) {
-            continue;
-        }
-        j[a * n + b] += g * d[c * n + e];
-        // A pure (semi-)local functional needs no exchange matrix; the K scatter (half the
-        // per-integral work here) is skipped, and the Fock build multiplies the zeroed K by
-        // c_x = 0 regardless.
-        if want_k {
-            k[a * n + c] += g * d[b * n + e];
-        }
+                (workspace, ja, ka)
+            });
+        (j, k)
     }
 }
 
@@ -1014,53 +903,39 @@ impl IntegralProvider for DirectProvider {
 
     fn build_jk(&self, densities: &[Mat]) -> JkResult {
         let n = self.n_basis;
-        let mut coulomb = Vec::with_capacity(densities.len());
-        let mut exchange = Vec::with_capacity(densities.len());
-        for density in densities {
-            let d = mat_to_row_major(density);
-            let (j, k) = self.jk_for_density(&d, None, true);
-            coulomb.push(mat_from_row_major(n, &j));
-            exchange.push(mat_from_row_major(n, &k));
-        }
+        let densities: Vec<Vec<f64>> = densities.iter().map(mat_to_row_major).collect();
+        let (j, k) = self.contract_densities(&densities, true);
+        let coulomb = j.iter().map(|m| mat_from_row_major(n, m)).collect();
+        let exchange = k.iter().map(|m| mat_from_row_major(n, m)).collect();
         JkResult { coulomb, exchange }
     }
 
     fn build_jk_screened(&self, densities: &[Mat]) -> JkResult {
         let n = self.n_basis;
-        let mut coulomb = Vec::with_capacity(densities.len());
-        let mut exchange = Vec::with_capacity(densities.len());
-        for density in densities {
-            let d = mat_to_row_major(density);
-            let dmax = self.shell_pair_dmax(&d);
-            let (j, k) = self.jk_for_density(&d, Some(&dmax), true);
-            coulomb.push(mat_from_row_major(n, &j));
-            exchange.push(mat_from_row_major(n, &k));
-        }
+        let densities: Vec<Vec<f64>> = densities.iter().map(mat_to_row_major).collect();
+        let (j, k) = self.contract_densities(&densities, true);
+        let coulomb = j.iter().map(|m| mat_from_row_major(n, m)).collect();
+        let exchange = k.iter().map(|m| mat_from_row_major(n, m)).collect();
         JkResult { coulomb, exchange }
     }
 
     fn build_j(&self, densities: &[Mat]) -> Vec<Mat> {
         let n = self.n_basis;
-        densities
+        let densities: Vec<Vec<f64>> = densities.iter().map(mat_to_row_major).collect();
+        self.contract_densities(&densities, false)
+            .0
             .iter()
-            .map(|density| {
-                let d = mat_to_row_major(density);
-                let (j, _) = self.jk_for_density(&d, None, false);
-                mat_from_row_major(n, &j)
-            })
+            .map(|j| mat_from_row_major(n, j))
             .collect()
     }
 
     fn build_j_screened(&self, densities: &[Mat]) -> Vec<Mat> {
         let n = self.n_basis;
-        densities
+        let densities: Vec<Vec<f64>> = densities.iter().map(mat_to_row_major).collect();
+        self.contract_densities(&densities, false)
+            .0
             .iter()
-            .map(|density| {
-                let d = mat_to_row_major(density);
-                let dmax = self.shell_pair_dmax(&d);
-                let (j, _) = self.jk_for_density(&d, Some(&dmax), false);
-                mat_from_row_major(n, &j)
-            })
+            .map(|j| mat_from_row_major(n, j))
             .collect()
     }
 }

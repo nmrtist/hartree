@@ -13,7 +13,45 @@ pub const MAX_L: usize = 6;
 
 pub const SCREEN_TOL: f64 = 1e-12;
 
-#[derive(Debug, Clone)]
+/// Immutable AO metadata cached by [`crate::dft::GridXc`].
+pub struct AoPlan {
+    offsets: Vec<usize>,
+    normalized_coeffs: Vec<Vec<f64>>,
+    components: Vec<Vec<[usize; 3]>>,
+    transforms: Vec<Option<Vec<f64>>>,
+}
+
+impl AoPlan {
+    pub fn new(shells: &[ShellData]) -> Self {
+        Self {
+            offsets: shell_offsets(shells),
+            normalized_coeffs: shells
+                .iter()
+                .map(|s| {
+                    let l = s.l as usize;
+                    s.exponents
+                        .iter()
+                        .zip(&s.coefficients)
+                        .map(|(&a, &c)| c * harmonics::shell_norm(a, l))
+                        .collect()
+                })
+                .collect(),
+            components: shells
+                .iter()
+                .map(|s| harmonics::cart_components(s.l as usize))
+                .collect(),
+            transforms: shells
+                .iter()
+                .map(|s| {
+                    s.spherical
+                        .then(|| harmonics::shell_transform(s.l as usize))
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct AoBatch {
     pub npts: usize,
     pub nao: usize,
@@ -96,6 +134,10 @@ pub fn eval_ao_batch_full(
             eval_shell_block(
                 s,
                 &cn,
+                &harmonics::cart_components(s.l as usize),
+                s.spherical
+                    .then(|| harmonics::shell_transform(s.l as usize))
+                    .as_deref(),
                 offsets[si],
                 nao,
                 points,
@@ -127,6 +169,7 @@ pub fn eval_ao_batch_full(
 /// would otherwise be exact zeros), contractions run at width `m` reproduce the dense
 /// result to round-off while costing O(np·m²) instead of O(np·nao²) — the standard
 /// block-sparse XC quadrature (asymptotically linear-scaling for large systems).
+#[derive(Default)]
 pub struct AoBlock {
     pub ao: AoBatch,
     pub loc2glob: Vec<usize>,
@@ -141,70 +184,95 @@ pub fn eval_ao_block(
     with_grad: bool,
     with_hess: bool,
 ) -> AoBlock {
+    let mut out = AoBlock::default();
+    eval_ao_block_into(shells, points, with_grad, with_hess, &mut out);
+    out
+}
+
+/// Allocation-reusing variant of [`eval_ao_block`]. Large AO/gradient/Hessian
+/// arrays grow only when the next block needs more capacity.
+pub fn eval_ao_block_into(
+    shells: &[ShellData],
+    points: &[[f64; 3]],
+    with_grad: bool,
+    with_hess: bool,
+    out: &mut AoBlock,
+) {
+    let plan = AoPlan::new(shells);
+    eval_ao_block_plan_into(shells, &plan, points, with_grad, with_hess, out);
+}
+
+pub fn eval_ao_block_plan_into(
+    shells: &[ShellData],
+    plan: &AoPlan,
+    points: &[[f64; 3]],
+    with_grad: bool,
+    with_hess: bool,
+    out: &mut AoBlock,
+) {
     let with_grad = with_grad || with_hess;
     let npts = points.len();
-    let offsets = shell_offsets(shells);
+    let offsets = &plan.offsets;
 
     // Pass 1: pick out the significant shells (same screen as the dense path), assign each a
     // contiguous local column range, and build the local→global AO map.
-    let mut sig: Vec<(usize, Vec<f64>, usize)> = Vec::new(); // (shell index, cn, local offset)
-    let mut loc2glob: Vec<usize> = Vec::new();
+    let mut sig: Vec<(usize, usize)> = Vec::new(); // (shell index, local offset)
+    out.loc2glob.clear();
     let mut m = 0usize;
     for (si, s) in shells.iter().enumerate() {
-        if let Some(cn) = shell_significant(s, points) {
+        if shell_significant_prepared(s, &plan.normalized_coeffs[si], points) {
             let nf = n_func(s.l as usize, s.spherical);
-            sig.push((si, cn, m));
+            sig.push((si, m));
             for f in 0..nf {
-                loc2glob.push(offsets[si] + f);
+                out.loc2glob.push(offsets[si] + f);
             }
             m += nf;
         }
     }
 
-    let mut phi = vec![0.0; npts * m];
-    let mut dphi = if with_grad {
-        [
-            vec![0.0; npts * m],
-            vec![0.0; npts * m],
-            vec![0.0; npts * m],
-        ]
-    } else {
-        [Vec::new(), Vec::new(), Vec::new()]
-    };
-    let mut hess = if with_hess {
-        std::array::from_fn(|_| vec![0.0; npts * m])
-    } else {
-        std::array::from_fn(|_| Vec::new())
-    };
+    let active = npts * m;
+    resize_zero(&mut out.ao.phi, active);
+    for buf in &mut out.ao.dphi {
+        if with_grad {
+            resize_zero(buf, active);
+        } else {
+            buf.clear();
+        }
+    }
+    for buf in &mut out.ao.hess {
+        if with_hess {
+            resize_zero(buf, active);
+        } else {
+            buf.clear();
+        }
+    }
 
     // Pass 2: evaluate the significant shells into the compacted (np × m) layout.
-    for (si, cn, loff) in &sig {
+    for (si, loff) in &sig {
         eval_shell_block(
             &shells[*si],
-            cn,
+            &plan.normalized_coeffs[*si],
+            &plan.components[*si],
+            plan.transforms[*si].as_deref(),
             *loff,
             m,
             points,
             with_grad,
             with_hess,
-            &mut phi,
-            &mut dphi,
-            &mut hess,
+            &mut out.ao.phi,
+            &mut out.ao.dphi,
+            &mut out.ao.hess,
         );
     }
+    out.ao.npts = npts;
+    out.ao.nao = m;
+    out.ao.with_grad = with_grad;
+    out.ao.with_hess = with_hess;
+}
 
-    AoBlock {
-        ao: AoBatch {
-            npts,
-            nao: m,
-            phi,
-            dphi,
-            hess,
-            with_grad,
-            with_hess,
-        },
-        loc2glob,
-    }
+fn resize_zero(buffer: &mut Vec<f64>, len: usize) {
+    buffer.resize(len, 0.0);
+    buffer.fill(0.0);
 }
 
 /// The per-block significance screen: returns the normalized contracted coefficients `cn`
@@ -214,7 +282,6 @@ pub fn eval_ao_block(
 fn shell_significant(s: &ShellData, points: &[[f64; 3]]) -> Option<Vec<f64>> {
     let l = s.l as usize;
     debug_assert!(l <= MAX_L);
-    let [cx, cy, cz] = s.center;
     let cn: Vec<f64> = s
         .exponents
         .iter()
@@ -222,6 +289,12 @@ fn shell_significant(s: &ShellData, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         .map(|(&a, &c)| c * harmonics::shell_norm(a, l))
         .collect();
 
+    shell_significant_prepared(s, &cn, points).then_some(cn)
+}
+
+fn shell_significant_prepared(s: &ShellData, cn: &[f64], points: &[[f64; 3]]) -> bool {
+    let l = s.l as usize;
+    let [cx, cy, cz] = s.center;
     let (mut dmin2, mut dmax2) = (f64::INFINITY, 0.0_f64);
     for p in points {
         let dx = p[0] - cx;
@@ -237,11 +310,7 @@ fn shell_significant(s: &ShellData, points: &[[f64; 3]]) -> Option<Vec<f64>> {
         .map(|(&c, &a)| c.abs() * (-a * dmin2).exp())
         .sum();
     let mono_cap = dmax2.powf(l as f64 / 2.0); // (dmax)^l
-    if radial_cap * mono_cap < SCREEN_TOL && !*NO_SCREEN {
-        None
-    } else {
-        Some(cn)
-    }
+    radial_cap * mono_cap >= SCREEN_TOL || *NO_SCREEN
 }
 
 /// Escape hatch: when set, the block-sparse path keeps every shell (no screening), so its
@@ -260,6 +329,8 @@ static NO_SCREEN: std::sync::LazyLock<bool> =
 fn eval_shell_block(
     s: &ShellData,
     cn: &[f64],
+    comps: &[[usize; 3]],
+    transform: Option<&[f64]>,
     off: usize,
     stride: usize,
     points: &[[f64; 3]],
@@ -271,23 +342,18 @@ fn eval_shell_block(
 ) {
     let l = s.l as usize;
     let [cx, cy, cz] = s.center;
-    let comps = harmonics::cart_components(l);
     let ncart = comps.len();
-    let transform = if s.spherical {
-        Some(harmonics::shell_transform(l)) // (2l+1) × ncart, row-major
-    } else {
-        None
-    };
     let nf = n_func(l, s.spherical);
 
-    let mut vcart = vec![0.0; ncart];
-    let mut gxcart = vec![0.0; ncart];
-    let mut gycart = vec![0.0; ncart];
-    let mut gzcart = vec![0.0; ncart];
-    let mut hcart: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; ncart]);
-    let mut px = vec![0.0; l + 1];
-    let mut py = vec![0.0; l + 1];
-    let mut pz = vec![0.0; l + 1];
+    const MAX_CART: usize = (MAX_L + 1) * (MAX_L + 2) / 2;
+    let mut vcart = [0.0; MAX_CART];
+    let mut gxcart = [0.0; MAX_CART];
+    let mut gycart = [0.0; MAX_CART];
+    let mut gzcart = [0.0; MAX_CART];
+    let mut hcart = [[0.0; MAX_CART]; 6];
+    let mut px = [0.0; MAX_L + 1];
+    let mut py = [0.0; MAX_L + 1];
+    let mut pz = [0.0; MAX_L + 1];
 
     for (pi, p) in points.iter().enumerate() {
         let dx = p[0] - cx;
@@ -390,7 +456,7 @@ fn eval_shell_block(
         }
 
         let base = pi * stride + off;
-        match &transform {
+        match transform {
             None => {
                 phi[base..base + nf].copy_from_slice(&vcart[..nf]);
                 if with_grad {
@@ -499,6 +565,7 @@ where
 /// bit-for-bit cross-checks of the compaction machinery.
 pub fn par_blocks_fold_local<T, Id, Fold, Red>(
     shells: &[ShellData],
+    plan: &AoPlan,
     points: &[[f64; 3]],
     with_grad: bool,
     identity: Id,
@@ -513,18 +580,32 @@ where
 {
     ensure_supported(shells)?;
     let n = points.len();
-    let acc = (0..n)
+    let (acc, _) = (0..n)
         .into_par_iter()
         .step_by(BLOCK_SIZE)
-        .fold(&identity, |acc, start| {
-            let end = (start + BLOCK_SIZE).min(n);
-            let block = eval_ao_block(shells, &points[start..end], with_grad, false);
-            if block.ao.nao == 0 {
-                return acc;
-            }
-            fold(acc, &block, start)
-        })
-        .reduce(&identity, &reduce);
+        .fold(
+            || (identity(), AoBlock::default()),
+            |(acc, mut block), start| {
+                let end = (start + BLOCK_SIZE).min(n);
+                eval_ao_block_plan_into(
+                    shells,
+                    plan,
+                    &points[start..end],
+                    with_grad,
+                    false,
+                    &mut block,
+                );
+                if block.ao.nao == 0 {
+                    return (acc, block);
+                }
+                let acc = fold(acc, &block, start);
+                (acc, block)
+            },
+        )
+        .reduce(
+            || (identity(), AoBlock::default()),
+            |(a, block), (b, _)| (reduce(a, b), block),
+        );
     Ok(acc)
 }
 

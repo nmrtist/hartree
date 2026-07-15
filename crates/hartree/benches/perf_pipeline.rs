@@ -55,6 +55,17 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+fn peak_rss_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 struct Args {
     mol: String,
     basis: String,
@@ -216,6 +227,26 @@ fn main() {
             iters,
             e_ks
         );
+        println!(
+            "RESULT_JSON {}",
+            serde_json::json!({
+                "molecule": args.mol,
+                "basis": args.basis,
+                "method": args.method,
+                "backend": "conventional",
+                "threads": threads,
+                "basis_functions": n,
+                "grid_points": npts,
+                "iterations": iters,
+                "peak_rss_kib": peak_rss_kib(),
+                "stage_ms": {
+                    "basis": ms(t_basis),
+                    "grid": ms(t_grid),
+                    "scf": ms(t_ks),
+                },
+                "energy": e_ks,
+            })
+        );
         return;
     }
 
@@ -269,6 +300,10 @@ fn main() {
         ms(t_scf),
         scf_iters
     );
+    let mut stages = serde_json::Map::new();
+    stages.insert("basis".into(), serde_json::json!(ms(t_basis)));
+    stages.insert("eri".into(), serde_json::json!(ms(t_eri)));
+    stages.insert("scf".into(), serde_json::json!(ms(t_scf)));
     println!("----------------------------------------------------------------");
     println!("E(SCF)  = {:.12} Eh", e_scf);
 
@@ -296,6 +331,7 @@ fn main() {
             n_frozen
         );
         summary += &format!("\ttransform_ovov_ms={:.3}", ms(t_tr));
+        stages.insert("transform_ovov".into(), serde_json::json!(ms(t_tr)));
 
         let mut e_mp2 = 0.0;
         let (t_mp2, _) = time_reps(args.reps, || {
@@ -306,6 +342,7 @@ fn main() {
         println!("MP2 (post-SCF)        {:>10.3} ms", ms(t_mp2));
         println!("  E(corr,MP2) = {:.12} Eh", e_mp2);
         summary += &format!("\tmp2_ms={:.3}\tEcorr_mp2={:.12}", ms(t_mp2), e_mp2);
+        stages.insert("mp2".into(), serde_json::json!(ms(t_mp2)));
 
         if matches!(
             args.method.as_str(),
@@ -332,6 +369,7 @@ fn main() {
                 cc_iters,
                 e_ccsd
             );
+            stages.insert("ccsd".into(), serde_json::json!(ms(t_ccsd)));
 
             if matches!(args.method.as_str(), "ccsdt" | "ccsd-t" | "ccsd(t)") {
                 let mut e_t = 0.0;
@@ -354,10 +392,27 @@ fn main() {
                     ms(t_ccsdt),
                     e_t
                 );
+                stages.insert("triples".into(), serde_json::json!(ms(t_triples)));
             }
         }
     }
 
     println!("----------------------------------------------------------------");
     println!("{summary}");
+    println!(
+        "RESULT_JSON {}",
+        serde_json::json!({
+            "molecule": args.mol,
+            "basis": args.basis,
+            "method": args.method,
+            "backend": "conventional",
+            "threads": threads,
+            "basis_functions": n,
+            "grid_points": 0,
+            "iterations": scf_iters,
+            "peak_rss_kib": peak_rss_kib(),
+            "stage_ms": stages,
+            "energy": e_scf,
+        })
+    );
 }

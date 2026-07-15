@@ -4,9 +4,7 @@ use crate::scf::{RangeSeparation, XcContribution, XcContributor};
 use xcx::{CamParams, Functional, Spin, Vv10Params, XcInput, XcResult};
 
 use crate::dft::ao::{self, AoBatch};
-use crate::dft::density::{
-    batch_density_tau, pack_rho_polarized, pack_sigma_polarized, pack_tau_polarized, sigma_dot,
-};
+use crate::dft::density::{BatchDensity, batch_density_tau_into};
 use crate::dft::error::Result;
 use crate::dft::functional::FunctionalSpec;
 use crate::dft::grid::MolecularGrid;
@@ -14,6 +12,7 @@ use crate::dft::grid::MolecularGrid;
 pub struct GridXc {
     grid: MolecularGrid,
     shells: Vec<ShellData>,
+    ao_plan: ao::AoPlan,
     nao: usize,
     pub(crate) partition: crate::dft::grid::BeckePartition,
     pub(crate) ao_atom: Vec<usize>,
@@ -37,15 +36,40 @@ struct Acc {
     v_b: Vec<f64>,
 }
 
+#[derive(Default)]
+struct XcWorkspace {
+    d_a: Vec<f64>,
+    d_b: Vec<f64>,
+    bd_a: BatchDensity,
+    bd_b: BatchDensity,
+    density_gemm: Vec<f64>,
+    density_gemm_grad: Vec<f64>,
+    rho: Vec<f64>,
+    sigma: Vec<f64>,
+    tau: Vec<f64>,
+    a_a: Vec<f64>,
+    a_b: Vec<f64>,
+    v_a: Vec<f64>,
+    v_b: Vec<f64>,
+    potential_gemm: Vec<f64>,
+}
+
+struct XcFold {
+    acc: Acc,
+    workspace: XcWorkspace,
+}
+
 impl GridXc {
     pub fn new(mol: &Molecule, ao: &AoBasis, spec: &FunctionalSpec, level: usize) -> Result<Self> {
         let grid = MolecularGrid::build(mol, level)?;
         let shells = ao.shells().to_vec();
         ao::ensure_supported(&shells)?;
+        let ao_plan = ao::AoPlan::new(&shells);
         let ao_atom = crate::dft::gradient::ao_atom_map(&shells, mol)?;
         Ok(Self {
             grid,
             shells,
+            ao_plan,
             nao: ao.n_ao(),
             partition: crate::dft::grid::BeckePartition::new(mol),
             ao_atom,
@@ -137,40 +161,85 @@ impl GridXc {
         let weights = &self.grid.weights;
         ao::par_blocks_fold_local(
             &self.shells,
+            &self.ao_plan,
             &self.grid.points,
             self.needs_sigma || self.needs_tau,
-            || Acc::new(nao, want_potential, false),
-            |mut acc, block, start| {
+            || XcFold::new(nao, want_potential, false),
+            |mut state, block, start| {
                 let batch = &block.ao;
                 let m = batch.nao;
                 let np = batch.npts;
                 let w = &weights[start..start + np];
                 // Gather the density onto this block's significant AOs, run the whole
                 // quadrature at the compacted width m, then scatter the potential back.
-                let d_loc = gather_density(d_tot, &block.loc2glob, nao);
-                let bd = batch_density_tau(batch, &d_loc, self.needs_sigma, self.needs_tau);
+                gather_density_into(d_tot, &block.loc2glob, nao, &mut state.workspace.d_a);
+                batch_density_tau_into(
+                    batch,
+                    &state.workspace.d_a,
+                    self.needs_sigma,
+                    self.needs_tau,
+                    &mut state.workspace.bd_a,
+                    &mut state.workspace.density_gemm,
+                    &mut state.workspace.density_gemm_grad,
+                );
+                let bd = &state.workspace.bd_a;
 
-                let res = self.eval_xc_unpol(np, &bd.rho, bd.grad.as_slice(), &bd.tau);
+                let res = self.eval_xc_unpol_reuse(
+                    np,
+                    &bd.rho,
+                    bd.grad.as_slice(),
+                    &bd.tau,
+                    &mut state.workspace.sigma,
+                );
 
                 for ((&wp, &n_tot), &ex) in w.iter().zip(&bd.rho).zip(&res.exc) {
-                    acc.exc += wp * n_tot * ex;
-                    acc.nelec += wp * n_tot;
+                    state.acc.exc += wp * n_tot * ex;
+                    state.acc.nelec += wp * n_tot;
                 }
 
                 if want_potential {
-                    let a = self.build_a_restricted(batch, w, &bd.grad, &res);
-                    let mut v_loc = vec![0.0; m * m];
-                    accumulate_v(&mut v_loc, &batch.phi, &a, np, m);
+                    self.build_a_restricted_into(
+                        batch,
+                        w,
+                        &bd.grad,
+                        &res,
+                        &mut state.workspace.a_a,
+                    );
+                    resize_zero(&mut state.workspace.v_a, m * m);
+                    accumulate_v_into(
+                        &mut state.workspace.v_a,
+                        &batch.phi,
+                        &state.workspace.a_a,
+                        np,
+                        m,
+                        &mut state.workspace.potential_gemm,
+                    );
                     if self.needs_tau {
-                        accumulate_v_tau(&mut v_loc, batch, w, &res.vtau, 1, 0, m);
+                        accumulate_v_tau_into(
+                            &mut state.workspace.v_a,
+                            batch,
+                            w,
+                            &res.vtau,
+                            1,
+                            0,
+                            m,
+                            &mut state.workspace.a_a,
+                            &mut state.workspace.potential_gemm,
+                        );
                     }
-                    scatter_v(&mut acc.v_a, &v_loc, &block.loc2glob, nao);
+                    scatter_v(
+                        &mut state.acc.v_a,
+                        &state.workspace.v_a,
+                        &block.loc2glob,
+                        nao,
+                    );
                 }
-                acc
+                state
             },
-            Acc::reduce,
+            XcFold::reduce,
         )
         .expect("shells validated in GridXc::new")
+        .acc
     }
 
     fn fold_polarized(&self, d_a: &[f64], d_b: &[f64], want_potential: bool) -> Acc {
@@ -178,27 +247,49 @@ impl GridXc {
         let weights = &self.grid.weights;
         ao::par_blocks_fold_local(
             &self.shells,
+            &self.ao_plan,
             &self.grid.points,
             self.needs_sigma || self.needs_tau,
-            || Acc::new(nao, want_potential, true),
-            |mut acc, block, start| {
+            || XcFold::new(nao, want_potential, true),
+            |mut state, block, start| {
                 let batch = &block.ao;
                 let m = batch.nao;
                 let np = batch.npts;
                 let w = &weights[start..start + np];
-                let d_a_loc = gather_density(d_a, &block.loc2glob, nao);
-                let d_b_loc = gather_density(d_b, &block.loc2glob, nao);
-                let bd_a = batch_density_tau(batch, &d_a_loc, self.needs_sigma, self.needs_tau);
-                let bd_b = batch_density_tau(batch, &d_b_loc, self.needs_sigma, self.needs_tau);
+                gather_density_into(d_a, &block.loc2glob, nao, &mut state.workspace.d_a);
+                gather_density_into(d_b, &block.loc2glob, nao, &mut state.workspace.d_b);
+                batch_density_tau_into(
+                    batch,
+                    &state.workspace.d_a,
+                    self.needs_sigma,
+                    self.needs_tau,
+                    &mut state.workspace.bd_a,
+                    &mut state.workspace.density_gemm,
+                    &mut state.workspace.density_gemm_grad,
+                );
+                batch_density_tau_into(
+                    batch,
+                    &state.workspace.d_b,
+                    self.needs_sigma,
+                    self.needs_tau,
+                    &mut state.workspace.bd_b,
+                    &mut state.workspace.density_gemm,
+                    &mut state.workspace.density_gemm_grad,
+                );
+                let bd_a = &state.workspace.bd_a;
+                let bd_b = &state.workspace.bd_b;
 
-                let rho = pack_rho_polarized(&bd_a.rho, &bd_b.rho);
+                pack_pair_into(&bd_a.rho, &bd_b.rho, &mut state.workspace.rho);
+                let rho = &state.workspace.rho;
                 let res = if self.needs_sigma {
-                    let sigma = pack_sigma_polarized(&bd_a.grad, &bd_b.grad);
-                    let input = XcInput::gga(&rho, &sigma);
+                    pack_sigma_into(&bd_a.grad, &bd_b.grad, &mut state.workspace.sigma);
+                    let sigma = &state.workspace.sigma;
+                    let input = XcInput::gga(rho, sigma);
                     if self.needs_tau {
-                        let tau = pack_tau_polarized(&bd_a.tau, &bd_b.tau);
+                        pack_pair_into(&bd_a.tau, &bd_b.tau, &mut state.workspace.tau);
+                        let tau = &state.workspace.tau;
                         self.func_pol
-                            .eval(np, &input.with_tau(&tau))
+                            .eval(np, &input.with_tau(tau))
                             .expect("xcx polarized meta-GGA eval")
                     } else {
                         self.func_pol
@@ -207,7 +298,7 @@ impl GridXc {
                     }
                 } else {
                     self.func_pol
-                        .eval(np, &XcInput::lda(&rho))
+                        .eval(np, &XcInput::lda(rho))
                         .expect("xcx polarized LDA eval")
                 };
 
@@ -215,31 +306,90 @@ impl GridXc {
                     w.iter().zip(bd_a.rho.iter().zip(&bd_b.rho)).zip(&res.exc)
                 {
                     let n_tot = ra + rb;
-                    acc.exc += wp * n_tot * ex;
-                    acc.nelec += wp * n_tot;
+                    state.acc.exc += wp * n_tot * ex;
+                    state.acc.nelec += wp * n_tot;
                 }
 
                 if want_potential {
-                    let a_a =
-                        self.build_a_polarized(batch, w, &bd_a.grad, &bd_b.grad, &res, Channel::A);
-                    let a_b =
-                        self.build_a_polarized(batch, w, &bd_a.grad, &bd_b.grad, &res, Channel::B);
-                    let mut v_a_loc = vec![0.0; m * m];
-                    let mut v_b_loc = vec![0.0; m * m];
-                    accumulate_v(&mut v_a_loc, &batch.phi, &a_a, np, m);
-                    accumulate_v(&mut v_b_loc, &batch.phi, &a_b, np, m);
+                    self.build_a_polarized_into(
+                        batch,
+                        w,
+                        &bd_a.grad,
+                        &bd_b.grad,
+                        &res,
+                        Channel::A,
+                        &mut state.workspace.a_a,
+                    );
+                    self.build_a_polarized_into(
+                        batch,
+                        w,
+                        &bd_a.grad,
+                        &bd_b.grad,
+                        &res,
+                        Channel::B,
+                        &mut state.workspace.a_b,
+                    );
+                    resize_zero(&mut state.workspace.v_a, m * m);
+                    resize_zero(&mut state.workspace.v_b, m * m);
+                    accumulate_v_into(
+                        &mut state.workspace.v_a,
+                        &batch.phi,
+                        &state.workspace.a_a,
+                        np,
+                        m,
+                        &mut state.workspace.potential_gemm,
+                    );
+                    accumulate_v_into(
+                        &mut state.workspace.v_b,
+                        &batch.phi,
+                        &state.workspace.a_b,
+                        np,
+                        m,
+                        &mut state.workspace.potential_gemm,
+                    );
                     if self.needs_tau {
-                        accumulate_v_tau(&mut v_a_loc, batch, w, &res.vtau, 2, 0, m);
-                        accumulate_v_tau(&mut v_b_loc, batch, w, &res.vtau, 2, 1, m);
+                        accumulate_v_tau_into(
+                            &mut state.workspace.v_a,
+                            batch,
+                            w,
+                            &res.vtau,
+                            2,
+                            0,
+                            m,
+                            &mut state.workspace.a_a,
+                            &mut state.workspace.potential_gemm,
+                        );
+                        accumulate_v_tau_into(
+                            &mut state.workspace.v_b,
+                            batch,
+                            w,
+                            &res.vtau,
+                            2,
+                            1,
+                            m,
+                            &mut state.workspace.a_b,
+                            &mut state.workspace.potential_gemm,
+                        );
                     }
-                    scatter_v(&mut acc.v_a, &v_a_loc, &block.loc2glob, nao);
-                    scatter_v(&mut acc.v_b, &v_b_loc, &block.loc2glob, nao);
+                    scatter_v(
+                        &mut state.acc.v_a,
+                        &state.workspace.v_a,
+                        &block.loc2glob,
+                        nao,
+                    );
+                    scatter_v(
+                        &mut state.acc.v_b,
+                        &state.workspace.v_b,
+                        &block.loc2glob,
+                        nao,
+                    );
                 }
-                acc
+                state
             },
-            Acc::reduce,
+            XcFold::reduce,
         )
         .expect("shells validated in GridXc::new")
+        .acc
     }
 
     pub(crate) fn eval_xc_unpol(
@@ -249,9 +399,24 @@ impl GridXc {
         grad: &[[f64; 3]],
         tau: &[f64],
     ) -> XcResult {
+        let mut sigma = Vec::new();
+        self.eval_xc_unpol_reuse(np, rho, grad, tau, &mut sigma)
+    }
+
+    fn eval_xc_unpol_reuse(
+        &self,
+        np: usize,
+        rho: &[f64],
+        grad: &[[f64; 3]],
+        tau: &[f64],
+        sigma: &mut Vec<f64>,
+    ) -> XcResult {
         if self.needs_sigma {
-            let sigma = sigma_dot(grad, grad);
-            let input = XcInput::gga(rho, &sigma);
+            sigma.resize(grad.len(), 0.0);
+            for (dst, g) in sigma.iter_mut().zip(grad) {
+                *dst = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+            }
+            let input = XcInput::gga(rho, sigma);
             if self.needs_tau {
                 self.func_unpol
                     .eval(np, &input.with_tau(tau))
@@ -268,18 +433,19 @@ impl GridXc {
         }
     }
 
-    fn build_a_restricted(
+    fn build_a_restricted_into(
         &self,
         batch: &AoBatch,
         w: &[f64],
         grad: &[[f64; 3]],
         res: &XcResult,
-    ) -> Vec<f64> {
+        a: &mut Vec<f64>,
+    ) {
         // Width is the batch's own column count: `nao` for a dense batch, or the
         // locally-significant count `m` for a block-sparse one.
         let nao = batch.nao;
         let np = batch.npts;
-        let mut a = vec![0.0; np * nao];
+        a.resize(np * nao, 0.0);
         for p in 0..np {
             let half_vrho = 0.5 * w[p] * res.vrho[p];
             let phi = &batch.phi[p * nao..p * nao + nao];
@@ -298,10 +464,10 @@ impl GridXc {
                 }
             }
         }
-        a
     }
 
-    fn build_a_polarized(
+    #[allow(clippy::too_many_arguments)]
+    fn build_a_polarized_into(
         &self,
         batch: &AoBatch,
         w: &[f64],
@@ -309,10 +475,11 @@ impl GridXc {
         grad_b: &[[f64; 3]],
         res: &XcResult,
         chan: Channel,
-    ) -> Vec<f64> {
+        a: &mut Vec<f64>,
+    ) {
         let nao = batch.nao;
         let np = batch.npts;
-        let mut a = vec![0.0; np * nao];
+        a.resize(np * nao, 0.0);
         for p in 0..np {
             let vrho = match chan {
                 Channel::A => res.vrho[2 * p],
@@ -347,7 +514,6 @@ impl GridXc {
                 }
             }
         }
-        a
     }
 }
 
@@ -390,6 +556,20 @@ impl Acc {
     }
 }
 
+impl XcFold {
+    fn new(nao: usize, want_potential: bool, polarized: bool) -> Self {
+        Self {
+            acc: Acc::new(nao, want_potential, polarized),
+            workspace: XcWorkspace::default(),
+        }
+    }
+
+    fn reduce(mut a: Self, b: Self) -> Self {
+        a.acc = Acc::reduce(a.acc, b.acc);
+        a
+    }
+}
+
 impl AoBatch {
     fn dphi_rows(&self, p: usize) -> (&[f64], &[f64], &[f64]) {
         let lo = p * self.nao;
@@ -408,9 +588,9 @@ fn add(a: &[f64], b: &[f64]) -> Vec<f64> {
 
 /// Gather the `m × m` sub-block of the global `nao × nao` density addressed by the block's
 /// significant AOs (`loc2glob`). O(m²), negligible beside the O(np·m²) contractions it feeds.
-fn gather_density(d: &[f64], loc2glob: &[usize], nao: usize) -> Vec<f64> {
+fn gather_density_into(d: &[f64], loc2glob: &[usize], nao: usize, dl: &mut Vec<f64>) {
     let m = loc2glob.len();
-    let mut dl = vec![0.0; m * m];
+    dl.resize(m * m, 0.0);
     for (i, &gi) in loc2glob.iter().enumerate() {
         let grow = gi * nao;
         let lrow = i * m;
@@ -418,7 +598,6 @@ fn gather_density(d: &[f64], loc2glob: &[usize], nao: usize) -> Vec<f64> {
             dl[lrow + j] = d[grow + gj];
         }
     }
-    dl
 }
 
 /// Scatter a block's `m × m` local potential back into the global `nao × nao` matrix,
@@ -434,19 +613,20 @@ fn scatter_v(v: &mut [f64], v_loc: &[f64], loc2glob: &[usize], nao: usize) {
     }
 }
 
-fn transpose_rowmajor(src: &[f64], rows: usize, cols: usize) -> Vec<f64> {
-    let mut out = vec![0.0; rows * cols];
-    for i in 0..rows {
-        for j in 0..cols {
-            out[j * rows + i] = src[i * cols + j];
-        }
-    }
-    out
+fn resize_zero(v: &mut Vec<f64>, len: usize) {
+    v.resize(len, 0.0);
+    v.fill(0.0);
 }
 
-fn accumulate_v(v: &mut [f64], phi: &[f64], a: &[f64], np: usize, nao: usize) {
-    let phit = transpose_rowmajor(phi, np, nao);
-    let g = crate::linalg::gemm(&phit, nao, np, a, nao);
+fn accumulate_v_into(
+    v: &mut [f64],
+    phi: &[f64],
+    a: &[f64],
+    np: usize,
+    nao: usize,
+    g: &mut Vec<f64>,
+) {
+    crate::linalg::gemm_tn_into(phi, a, np, nao, g);
     for mu in 0..nao {
         for nu in 0..nao {
             v[mu * nao + nu] += g[mu * nao + nu] + g[nu * nao + mu];
@@ -454,7 +634,8 @@ fn accumulate_v(v: &mut [f64], phi: &[f64], a: &[f64], np: usize, nao: usize) {
     }
 }
 
-fn accumulate_v_tau(
+#[allow(clippy::too_many_arguments)]
+fn accumulate_v_tau_into(
     v: &mut [f64],
     batch: &AoBatch,
     w: &[f64],
@@ -462,10 +643,13 @@ fn accumulate_v_tau(
     stride: usize,
     offset: usize,
     nao: usize,
+    a: &mut Vec<f64>,
+    g: &mut Vec<f64>,
 ) {
     let np = batch.npts;
-    let mut a = vec![0.0; np * nao];
+    a.resize(np * nao, 0.0);
     for dk in &batch.dphi {
+        a.fill(0.0);
         for p in 0..np {
             let c = 0.25 * w[p] * vtau[stride * p + offset];
             let drow = &dk[p * nao..p * nao + nao];
@@ -474,7 +658,26 @@ fn accumulate_v_tau(
                 arow[mu] = c * drow[mu];
             }
         }
-        accumulate_v(v, dk, &a, np, nao);
+        accumulate_v_into(v, dk, a, np, nao, g);
+    }
+}
+
+fn pack_pair_into(a: &[f64], b: &[f64], out: &mut Vec<f64>) {
+    assert_eq!(a.len(), b.len());
+    out.resize(2 * a.len(), 0.0);
+    for p in 0..a.len() {
+        out[2 * p] = a[p];
+        out[2 * p + 1] = b[p];
+    }
+}
+
+fn pack_sigma_into(a: &[[f64; 3]], b: &[[f64; 3]], out: &mut Vec<f64>) {
+    assert_eq!(a.len(), b.len());
+    out.resize(3 * a.len(), 0.0);
+    for p in 0..a.len() {
+        out[3 * p] = a[p][0] * a[p][0] + a[p][1] * a[p][1] + a[p][2] * a[p][2];
+        out[3 * p + 1] = a[p][0] * b[p][0] + a[p][1] * b[p][1] + a[p][2] * b[p][2];
+        out[3 * p + 2] = b[p][0] * b[p][0] + b[p][1] * b[p][1] + b[p][2] * b[p][2];
     }
 }
 

@@ -886,6 +886,10 @@ fn run() -> Result<bool, String> {
     }
 
     let result = job.run()?;
+    println!(
+        "integral backend: {} ({})",
+        result.resolved_backend, result.backend_selection_reason
+    );
 
     let ecp_atoms = hartree::BasisSet::load(&basis)
         .map(|set| hartree::ecp_summary(&molecule, &set))
@@ -2588,7 +2592,10 @@ fn print_usage() {
          \x20                           (TS runs raise the SCF cap to 400 and add a 0.3 level\n\
          \x20                           shift for small-gap stability)\n\
          \x20                           (the --ts-* knobs take effect only with --ts)\n\
-         \x20   --direct                integral-direct SCF: recompute ERIs each iteration\n\
+         \x20                           exact SCF single points automatically choose conventional\n\
+         \x20                           or direct using a fixed calibrated cost model; direct is\n\
+         \x20                           chosen only with at least a 15% estimated advantage\n\
+         \x20   --direct                force integral-direct SCF: recompute ERIs each iteration\n\
          \x20                           instead of storing the nao^4 tensor (rhf/uhf/rohf\n\
          \x20                           single points; reaches larger systems, slower)\n\
          \x20   --ri                    density-fitted (RI-JK) SCF: J/K from 3-center integrals\n\

@@ -73,6 +73,27 @@ pub fn gemm(a: &[f64], m: usize, k: usize, b: &[f64], n: usize) -> Vec<f64> {
     out
 }
 
+pub fn gemm_into(a: &[f64], m: usize, k: usize, b: &[f64], n: usize, out: &mut Vec<f64>) {
+    assert_eq!(a.len(), m * k, "lhs must be {m}×{k}");
+    assert_eq!(b.len(), k * n, "rhs must be {k}×{n}");
+    out.resize(m * n, 0.0);
+    let am = faer::MatRef::from_row_major_slice(a, m, k);
+    let bm = faer::MatRef::from_row_major_slice(b, k, n);
+    let cm = faer::MatMut::from_row_major_slice_mut(out, m, n);
+    faer::linalg::matmul::matmul(cm, faer::Accum::Replace, am, bm, 1.0, faer::Par::Seq);
+}
+
+/// `out = aᵀ b` for row-major `a,b` shaped `rows × cols`.
+pub fn gemm_tn_into(a: &[f64], b: &[f64], rows: usize, cols: usize, out: &mut Vec<f64>) {
+    assert_eq!(a.len(), rows * cols);
+    assert_eq!(b.len(), rows * cols);
+    out.resize(cols * cols, 0.0);
+    let am = faer::MatRef::from_row_major_slice(a, rows, cols).transpose();
+    let bm = faer::MatRef::from_row_major_slice(b, rows, cols);
+    let cm = faer::MatMut::from_row_major_slice_mut(out, cols, cols);
+    faer::linalg::matmul::matmul(cm, faer::Accum::Replace, am, bm, 1.0, faer::Par::Seq);
+}
+
 pub fn cholesky_lower(a: &Mat) -> Option<Mat> {
     a.llt(faer::Side::Lower).ok().map(|f| f.L().to_owned())
 }

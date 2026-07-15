@@ -31,6 +31,106 @@ use crate::dft::{FunctionalSpec, GridXc};
 use crate::job::alpha_beta_electrons;
 use crate::{Job, Method};
 
+/// Why the exact/RI integral backend was selected for a completed job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum BackendSelectionReason {
+    Explicit,
+    Performance,
+    MemoryBudget,
+    RequiredCapability,
+}
+
+impl std::fmt::Display for BackendSelectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Explicit => "explicit",
+            Self::Performance => "performance model",
+            Self::MemoryBudget => "memory budget",
+            Self::RequiredCapability => "required capability",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BackendResolution {
+    pub backend: EstimateBackend,
+    pub reason: BackendSelectionReason,
+}
+
+// Checked-in calibration from the exact-backend benchmark matrix. The model is
+// deliberately static: normal jobs never benchmark or inspect host performance.
+const CONVENTIONAL_N4_COST: f64 = 1.0;
+const DIRECT_N4_BASE_COST: f64 = 1.35;
+const DIRECT_NAO_SLOPE: f64 = 0.007;
+const DIRECT_SHELL_PENALTY: f64 = 0.02;
+const DIRECT_SELECTION_MARGIN: f64 = 0.85;
+
+pub(crate) fn direct_backend_eligible(job: &Job) -> bool {
+    let o = &job.options;
+    if o.optimize_geometry
+        || o.transition_state
+        || o.compute_properties
+        || o.compute_frequencies
+        || o.fod
+        || o.cosx
+        || o.cosmo_file.is_some()
+    {
+        return false;
+    }
+    if matches!(job.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
+        return false;
+    }
+    if let Method::Dft(spec) = &job.method
+        && (spec.double_hybrid().is_some() || spec.cam().is_some() || spec.vv10().is_some())
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn resolve_backend_for_size(job: &Job, nao: usize, nshell: usize) -> BackendResolution {
+    if job.options.ri {
+        return BackendResolution {
+            backend: EstimateBackend::Ri,
+            reason: BackendSelectionReason::Explicit,
+        };
+    }
+    if job.options.direct {
+        return BackendResolution {
+            backend: EstimateBackend::Direct,
+            reason: BackendSelectionReason::Explicit,
+        };
+    }
+    if !direct_backend_eligible(job) {
+        return BackendResolution {
+            backend: EstimateBackend::Conventional,
+            reason: BackendSelectionReason::RequiredCapability,
+        };
+    }
+
+    let n4 = (nao as f64).powi(4);
+    let conventional = CONVENTIONAL_N4_COST * n4;
+    let size_factor = (DIRECT_N4_BASE_COST - DIRECT_NAO_SLOPE * nao as f64).clamp(0.45, 1.35);
+    let shell_factor = 1.0 + DIRECT_SHELL_PENALTY * nshell as f64 / nao.max(1) as f64;
+    let direct = n4 * size_factor * shell_factor;
+    BackendResolution {
+        backend: if direct <= DIRECT_SELECTION_MARGIN * conventional {
+            EstimateBackend::Direct
+        } else {
+            EstimateBackend::Conventional
+        },
+        reason: BackendSelectionReason::Performance,
+    }
+}
+
+pub(crate) fn resolve_backend(job: &Job) -> Result<BackendResolution, String> {
+    let basis = BasisSet::load(&job.basis).map_err(|e| e.to_string())?;
+    let ao = basis.build(&job.molecule).map_err(|e| e.to_string())?;
+    Ok(resolve_backend_for_size(job, ao.n_ao(), ao.shells().len()))
+}
+
 /// The integral backend an estimate assumed, matching [`Job::run`]'s dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -127,13 +227,7 @@ pub fn estimate_memory(job: &Job) -> Result<MemoryEstimate, String> {
     // wins over `--direct`, and everything else (including double hybrids,
     // geometry optimization, transition-state search, and frequencies) runs on
     // the conventional in-core backend.
-    let backend = if opts.ri {
-        EstimateBackend::Ri
-    } else if opts.direct {
-        EstimateBackend::Direct
-    } else {
-        EstimateBackend::Conventional
-    };
+    let backend = resolve_backend_for_size(job, nao, nshell).backend;
 
     let mut terms: Vec<MemoryTerm> = Vec::new();
 

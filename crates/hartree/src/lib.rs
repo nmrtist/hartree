@@ -51,7 +51,9 @@ mod surface;
 pub mod w1;
 
 pub use cp::{CpFragments, CpResult, counterpoise};
-pub use estimate::{EstimateBackend, MemoryEstimate, MemoryTerm, estimate_memory};
+pub use estimate::{
+    BackendSelectionReason, EstimateBackend, MemoryEstimate, MemoryTerm, estimate_memory,
+};
 pub use job::{
     BackendDowngrade, CoordScanSpec, CosxDiagnostics, DftDiagnostics, FrequencyData, GbsaData, Job,
     JobOptions, JobResult, Method, PostHfResult, PropertiesResult, RiDiagnostics, SmdData,

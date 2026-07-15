@@ -1,0 +1,52 @@
+{
+  "policy": {
+    "warmup_runs": 1,
+    "measured_runs": 7,
+    "outer_rounds": 3,
+    "statistic": "median of per-round medians",
+    "thread_counts": [1, 2, 4, 8],
+    "cpu_affinity": "distinct physical cores: 0,2,4,...",
+    "dense_single_thread_target_improvement": 0.25,
+    "parallel_eri_geomean_target_improvement": 0.08,
+    "maximum_case_regression": 0.05
+  },
+  "cases": [
+    {"molecule": "benzene", "basis": "6-31g", "method": "rhf", "backend": "auto"},
+    {"molecule": "naphthalene", "basis": "sto-3g", "method": "rhf", "backend": "auto"},
+    {"molecule": "naphthalene", "basis": "sto-3g", "method": "pbe", "backend": "direct"},
+    {"molecule": "naphthalene", "basis": "sto-3g", "method": "pbe", "backend": "ri"},
+    {"molecule": "water", "basis": "cc-pvdz", "method": "rhf", "backend": "auto"}
+  ],
+  "historical_reference_ms": {
+    "benzene_6-31g_rhf_1_thread": {"eri": 887.0, "scf": 286.0, "total": 1173.0}
+  },
+  "local_release_median_ms": {
+    "date": "2026-07-15",
+    "benzene_6-31g_rhf": {
+      "1": {"eri": 491.543, "scf": 263.040, "total": 754.583},
+      "2": {"eri": 413.497, "scf": 175.313, "total": 588.810},
+      "4": {"eri": 243.883, "scf": 140.779, "total": 384.662},
+      "8": {"eri": 156.203, "scf": 143.955, "total": 300.158}
+    }
+  },
+  "worktree_comparison": {
+    "before": {
+      "hartree_commit": "8ff3df4fce82631fb5f6ccb2db8d2b045225bc04",
+      "integral_version": "0.4.1",
+      "benzene_6-31g_rhf": {
+        "1": {"eri": 846.366, "scf": 264.931, "total": 1111.297},
+        "2": {"eri": 487.119, "scf": 179.105, "total": 666.224},
+        "4": {"eri": 276.397, "scf": 142.879, "total": 419.276},
+        "8": {"eri": 175.665, "scf": 161.571, "total": 337.236}
+      }
+    },
+    "eri_time_reduction_percent": {
+      "1": 41.923,
+      "2": 15.114,
+      "4": 11.764,
+      "8": 11.079
+    },
+    "parallel_eri_geomean_speedup": 1.145083,
+    "parallel_eri_geomean_time_reduction_percent": 12.670
+  }
+}

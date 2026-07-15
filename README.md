@@ -124,11 +124,24 @@ The validated CP2K reference for this 8-atom Gamma-point setup is
 
 Run `hartree --help` for the full CLI surface.
 
+### Exact integral backend selection
+
+For eligible SCF single points, the default exact backend is selected from the
+conventional in-core and integral-direct implementations by a fixed, calibrated
+cost model. Direct is selected for performance only when its estimated cost is
+at least 15% lower; methods that require stored ERIs remain conventional.
+`--direct` and `--ri` are explicit, authoritative choices, and RI is never
+selected automatically because it changes the approximation. Every CLI run
+prints the resolved backend and selection reason. Library callers can inspect
+`JobResult::resolved_backend` and `JobResult::backend_selection_reason`.
+
 ## Library Surface
 
 The `hartree` crate is the main entry point for library users.
 
-- `Job` / `JobResult` drive molecular workflows.
+- `Job` / `JobResult` drive molecular workflows; results include the resolved
+  integral backend and whether it was explicit, performance-selected,
+  memory-budget-selected, or required by method capability.
 - `PeriodicJob` / `run_periodic` drive periodic GPW workflows.
 - Public submodules expose the major subsystems: `core`, `basis`, `integrals`, `scf`, `grad`, `cc`, `dft`, `disp`, `solv`, `periodic`, and others.
 

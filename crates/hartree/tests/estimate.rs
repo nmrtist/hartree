@@ -4,7 +4,10 @@
 //! a safe integral-direct downgrade).
 
 use hartree::dft::FunctionalSpec;
-use hartree::{Atom, Element, EstimateBackend, Job, JobOptions, Method, Molecule, estimate_memory};
+use hartree::{
+    Atom, BackendSelectionReason, Element, EstimateBackend, Job, JobOptions, Method, Molecule,
+    estimate_memory,
+};
 
 fn dft(name: &str) -> Method {
     Method::Dft(FunctionalSpec::parse(name).unwrap())
@@ -393,5 +396,37 @@ fn unsatisfiable_budget_is_refused() {
     assert!(
         err.contains("exceeds") && err.contains("budget"),
         "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn backend_selection_reason_serialization_is_stable() {
+    assert_eq!(
+        serde_json::to_string(&BackendSelectionReason::MemoryBudget).unwrap(),
+        "\"memory_budget\""
+    );
+    assert_eq!(
+        serde_json::from_str::<BackendSelectionReason>("\"required_capability\"").unwrap(),
+        BackendSelectionReason::RequiredCapability
+    );
+}
+
+#[test]
+fn job_result_reports_explicit_backend() {
+    let result = job(
+        hydrogen(),
+        "sto-3g",
+        Method::Rhf,
+        JobOptions {
+            direct: true,
+            ..JobOptions::default()
+        },
+    )
+    .run()
+    .unwrap();
+    assert_eq!(result.resolved_backend, EstimateBackend::Direct);
+    assert_eq!(
+        result.backend_selection_reason,
+        BackendSelectionReason::Explicit
     );
 }

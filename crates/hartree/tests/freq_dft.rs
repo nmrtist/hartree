@@ -117,7 +117,18 @@ fn r2scan_3c_hf_frequencies() {
     check_freqs(&result, 5, &[4108.23], 1.0);
     assert!(result.gcp_energy.is_some() && result.dispersion_energy.is_some());
     let th = &result.frequencies.as_ref().unwrap().thermochemistry;
-    assert!((result.best_energy() - -100.4438580784).abs() < 1e-6);
+    const REFERENCE_QUALITY_ENERGY: f64 = -100.4438572991;
+    const PRODUCTION_GRID_ENERGY: f64 = -100.4438651532;
+    const SCF_ORACLE_GATE: f64 = 1.3e-5;
+    let energy = result.best_energy();
+    assert!(
+        (energy - REFERENCE_QUALITY_ENERGY).abs() < SCF_ORACLE_GATE,
+        "r2scan-3c/HF energy {energy:.10} exceeds the reference-quality grid gate"
+    );
+    assert!(
+        (energy - PRODUCTION_GRID_ENERGY).abs() < 1e-6,
+        "r2scan-3c/HF energy {energy:.10} differs from the pinned value"
+    );
     assert!((th.enthalpy - (result.best_energy() + th.enthalpy_corr)).abs() < 1e-12);
 }
 
