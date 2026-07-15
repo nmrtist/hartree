@@ -11,7 +11,7 @@
 //! Guest, "Starting SCF calculations by superposition of atomic densities",
 //! J. Comput. Chem. 27 (2006) 926.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use crate::basis::{AoBasis, BasisSet};
 use crate::core::{Atom, Element, Molecule};
@@ -56,8 +56,8 @@ pub(crate) fn sad_guess_density(
             continue; // basis-only center: no nucleus, no electrons — its block stays zero
         }
         let z = atom.element.z();
-        if !cache.contains_key(&z) {
-            cache.insert(z, atomic_density(&set, z, spec, grid_level)?);
+        if let Entry::Vacant(entry) = cache.entry(z) {
+            entry.insert(atomic_density(&set, z, spec, grid_level)?);
         }
         let block = &cache[&z];
         let sz = sizes[a];

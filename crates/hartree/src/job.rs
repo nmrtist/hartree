@@ -157,6 +157,8 @@ fn run_scf_staged<P: IntegralProvider>(
 /// SAD, the spin-resolved first-iteration AO density. A density guess slashes the iteration
 /// count on larger/conjugated systems where GWH is weak, and falls back transparently — so a
 /// previously converging job keeps its exact converged energy.
+type SpinDensity = (Vec<f64>, Vec<f64>);
+
 fn sad_initial_guess(
     mol: &Molecule,
     ao: &crate::basis::AoBasis,
@@ -164,7 +166,7 @@ fn sad_initial_guess(
     method: &Method,
     grid_level: usize,
     reference: Reference,
-) -> (Guess, Option<(Vec<f64>, Vec<f64>)>) {
+) -> (Guess, Option<SpinDensity>) {
     // Restricted open-shell references keep the Hückel guess: the spin-summed SAD density
     // (α = β) is a poor seed for ROHF's distinct closed/open spaces and could steer a
     // multiple-solution open-shell system to a different (valid) root.
