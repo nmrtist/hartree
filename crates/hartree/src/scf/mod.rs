@@ -277,6 +277,72 @@ pub fn run_scf_multigrid<P: IntegralProvider>(
     )
 }
 
+/// Reuse the alpha result when a restricted reference has identical spin densities.
+/// ROHF must not use this path because its alpha and beta occupations differ.
+fn build_spin_jk<P: IntegralProvider>(
+    provider: &P,
+    da: &[f64],
+    db: &[f64],
+    n: usize,
+    restricted: bool,
+    screened: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let da_mat = mat_from_row_major(n, da);
+    if restricted {
+        debug_assert_eq!(da, db);
+        let jk = if screened {
+            provider.build_jk_screened(&[da_mat])
+        } else {
+            provider.build_jk(&[da_mat])
+        };
+        let ja = mat_to_row_major(&jk.coulomb[0]);
+        let ka = mat_to_row_major(&jk.exchange[0]);
+        return (ja.clone(), ja, ka.clone(), ka);
+    }
+
+    let db_mat = mat_from_row_major(n, db);
+    let jk = if screened {
+        provider.build_jk_screened(&[da_mat, db_mat])
+    } else {
+        provider.build_jk(&[da_mat, db_mat])
+    };
+    (
+        mat_to_row_major(&jk.coulomb[0]),
+        mat_to_row_major(&jk.coulomb[1]),
+        mat_to_row_major(&jk.exchange[0]),
+        mat_to_row_major(&jk.exchange[1]),
+    )
+}
+
+fn build_spin_j<P: IntegralProvider>(
+    provider: &P,
+    da: &[f64],
+    db: &[f64],
+    n: usize,
+    restricted: bool,
+    screened: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    let da_mat = mat_from_row_major(n, da);
+    if restricted {
+        debug_assert_eq!(da, db);
+        let j = if screened {
+            provider.build_j_screened(&[da_mat])
+        } else {
+            provider.build_j(&[da_mat])
+        };
+        let ja = mat_to_row_major(&j[0]);
+        return (ja.clone(), ja);
+    }
+
+    let db_mat = mat_from_row_major(n, db);
+    let j = if screened {
+        provider.build_j_screened(&[da_mat, db_mat])
+    } else {
+        provider.build_j(&[da_mat, db_mat])
+    };
+    (mat_to_row_major(&j[0]), mat_to_row_major(&j[1]))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_scf_core<P: IntegralProvider>(
     provider: &P,
@@ -324,6 +390,7 @@ fn run_scf_core<P: IntegralProvider>(
     // above, so it is already covered by `c_x != 0.0`; it is named for defensive clarity.
     let need_k = c_x != 0.0 || rs.is_some();
     let xc_restricted = reference != Reference::Uhf;
+    let identical_spin_densities = reference == Reference::Rhf;
 
     let s = mat_to_row_major(&provider.overlap());
     let hcore = match &options.hcore_override {
@@ -450,48 +517,28 @@ fn run_scf_core<P: IntegralProvider>(
 
         if !incremental_fock {
             if need_k {
-                let jk = provider
-                    .build_jk(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-                ja = mat_to_row_major(&jk.coulomb[0]);
-                jb = mat_to_row_major(&jk.coulomb[1]);
-                ka = mat_to_row_major(&jk.exchange[0]);
-                kb = mat_to_row_major(&jk.exchange[1]);
+                (ja, jb, ka, kb) =
+                    build_spin_jk(provider, &da_ao, &db_ao, n, identical_spin_densities, false);
             } else {
-                let j = provider
-                    .build_j(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-                ja = mat_to_row_major(&j[0]);
-                jb = mat_to_row_major(&j[1]);
+                (ja, jb) =
+                    build_spin_j(provider, &da_ao, &db_ao, n, identical_spin_densities, false);
                 // ka/kb stay at their initialized zero: c_x == 0 leaves them unused.
             }
         } else if iterations == 1 || iters_since_rebuild >= rebuild_period {
             if need_k {
-                let jk = provider.build_jk_screened(&[
-                    mat_from_row_major(n, &da_ao),
-                    mat_from_row_major(n, &db_ao),
-                ]);
-                ja = mat_to_row_major(&jk.coulomb[0]);
-                jb = mat_to_row_major(&jk.coulomb[1]);
-                ka = mat_to_row_major(&jk.exchange[0]);
-                kb = mat_to_row_major(&jk.exchange[1]);
+                (ja, jb, ka, kb) =
+                    build_spin_jk(provider, &da_ao, &db_ao, n, identical_spin_densities, true);
             } else {
-                let j = provider.build_j_screened(&[
-                    mat_from_row_major(n, &da_ao),
-                    mat_from_row_major(n, &db_ao),
-                ]);
-                ja = mat_to_row_major(&j[0]);
-                jb = mat_to_row_major(&j[1]);
+                (ja, jb) =
+                    build_spin_j(provider, &da_ao, &db_ao, n, identical_spin_densities, true);
             }
             iters_since_rebuild = 0;
         } else {
             let dda: Vec<f64> = (0..n * n).map(|i| da_ao[i] - da_prev[i]).collect();
             let ddb: Vec<f64> = (0..n * n).map(|i| db_ao[i] - db_prev[i]).collect();
             if need_k {
-                let jk = provider
-                    .build_jk_screened(&[mat_from_row_major(n, &dda), mat_from_row_major(n, &ddb)]);
-                let dja = mat_to_row_major(&jk.coulomb[0]);
-                let djb = mat_to_row_major(&jk.coulomb[1]);
-                let dka = mat_to_row_major(&jk.exchange[0]);
-                let dkb = mat_to_row_major(&jk.exchange[1]);
+                let (dja, djb, dka, dkb) =
+                    build_spin_jk(provider, &dda, &ddb, n, identical_spin_densities, true);
                 for i in 0..n * n {
                     ja[i] += dja[i];
                     jb[i] += djb[i];
@@ -499,10 +546,8 @@ fn run_scf_core<P: IntegralProvider>(
                     kb[i] += dkb[i];
                 }
             } else {
-                let j = provider
-                    .build_j_screened(&[mat_from_row_major(n, &dda), mat_from_row_major(n, &ddb)]);
-                let dja = mat_to_row_major(&j[0]);
-                let djb = mat_to_row_major(&j[1]);
+                let (dja, djb) =
+                    build_spin_j(provider, &dda, &ddb, n, identical_spin_densities, true);
                 for i in 0..n * n {
                     ja[i] += dja[i];
                     jb[i] += djb[i];
@@ -668,17 +713,10 @@ fn run_scf_core<P: IntegralProvider>(
 
     if incremental_fock && iters_since_rebuild > 0 {
         if need_k {
-            let jk = provider
-                .build_jk_screened(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-            ja = mat_to_row_major(&jk.coulomb[0]);
-            jb = mat_to_row_major(&jk.coulomb[1]);
-            ka = mat_to_row_major(&jk.exchange[0]);
-            kb = mat_to_row_major(&jk.exchange[1]);
+            (ja, jb, ka, kb) =
+                build_spin_jk(provider, &da_ao, &db_ao, n, identical_spin_densities, true);
         } else {
-            let j = provider
-                .build_j_screened(&[mat_from_row_major(n, &da_ao), mat_from_row_major(n, &db_ao)]);
-            ja = mat_to_row_major(&j[0]);
-            jb = mat_to_row_major(&j[1]);
+            (ja, jb) = build_spin_j(provider, &da_ao, &db_ao, n, identical_spin_densities, true);
             // ka/kb stay zero (c_x == 0): the energy/Fock terms below are inert.
         }
         let electronic = if xc.is_some() || solvent.is_some() {
