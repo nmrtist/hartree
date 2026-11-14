@@ -3,7 +3,7 @@ use crate::core::{Atom, Element, Molecule};
 use crate::dft::{FunctionalSpec, GridXc};
 use crate::disp::Dispersion;
 use crate::grad::{hf_gradient, ks_gradient};
-use crate::integrals::ConventionalProvider;
+use crate::integrals::{ConventionalProvider, DirectProvider, GradientProvider, IntegralProvider};
 use crate::opt::{OptError, Surface};
 use crate::scf::{Reference, ScfOptions, ScfResult, SolventModel, XcContributor, run_scf_with_env};
 use crate::solv::Cpcm;
@@ -23,12 +23,43 @@ pub struct HfSurface {
     smd: Option<crate::solv::SmdSolvent>,
     gcp: Option<crate::disp::GcpParams>,
     srb: Option<crate::disp::SrbParams>,
+    direct: bool,
     cache: Option<CachedPoint>,
+}
+
+enum SurfaceProvider {
+    Conventional(ConventionalProvider),
+    Direct(DirectProvider),
+}
+
+impl SurfaceProvider {
+    fn new(
+        basis: crate::integrals::integral::Basis,
+        charges: Vec<([f64; 3], f64)>,
+        ecps: Vec<crate::integrals::integral::Ecp>,
+        direct: bool,
+    ) -> Self {
+        if direct {
+            Self::Direct(DirectProvider::new(basis, charges).with_ecps(ecps))
+        } else {
+            Self::Conventional(ConventionalProvider::new(basis, charges).with_ecps(ecps))
+        }
+    }
+}
+
+/// Run `$body` with `$p` bound to the concrete provider of either backend.
+macro_rules! with_provider {
+    ($provider:expr, |$p:ident| $body:expr) => {
+        match $provider {
+            SurfaceProvider::Conventional($p) => $body,
+            SurfaceProvider::Direct($p) => $body,
+        }
+    };
 }
 
 struct CachedPoint {
     positions: Vec<[f64; 3]>,
-    provider: ConventionalProvider,
+    provider: SurfaceProvider,
     molecule: Molecule,
     scf: ScfResult,
     xc: Option<GridXc>,
@@ -74,6 +105,7 @@ impl HfSurface {
             smd: None,
             gcp: None,
             srb: None,
+            direct: false,
             cache: None,
         })
     }
@@ -109,6 +141,13 @@ impl HfSurface {
 
     pub fn set_smd(&mut self, solvent: crate::solv::SmdSolvent) {
         self.smd = Some(solvent);
+    }
+
+    /// Evaluate energies and gradients on the integral-direct backend (no stored
+    /// ERI tensor) instead of the in-core one.
+    pub fn set_direct(&mut self, direct: bool) {
+        self.direct = direct;
+        self.cache = None;
     }
 
     /// Raise the SCF iteration limit (default 128).
@@ -162,48 +201,13 @@ impl HfSurface {
                 None => None,
             };
             let provider =
-                ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
-            let cpcm = if let Some(s) = &self.smd {
-                let zs: Vec<usize> = molecule
-                    .atoms
-                    .iter()
-                    .map(|a| a.element.z() as usize)
-                    .collect();
-                let radii = crate::solv::smd_coulomb_radii(&zs, s.alpha)
-                    .map_err(|e| OptError::Evaluation(e.to_string()))?;
-                Some(
-                    Cpcm::with_radii(
-                        &provider,
-                        &molecule,
-                        s.epsilon,
-                        crate::solv::DEFAULT_GRID,
-                        &radii,
-                    )
-                    .map_err(|e| OptError::Evaluation(e.to_string()))?,
-                )
-            } else {
-                self.solvent_eps
-                    .map(|eps| Cpcm::new(&provider, &molecule, eps, crate::solv::DEFAULT_GRID))
-                    .transpose()
-                    .map_err(|e| OptError::Evaluation(e.to_string()))?
-            };
-            let scf = run_scf_with_env(
-                &provider,
-                self.n_alpha,
-                self.n_beta,
-                self.reference,
+                SurfaceProvider::new(ao.into_integral(), setup.charges, setup.ecps, self.direct);
+            let scf = with_provider!(&provider, |p| self.solve_scf(
+                p,
+                &molecule,
                 setup.nuclear_repulsion,
-                &self.scf_options,
-                xc.as_ref().map(|x| x as &dyn XcContributor),
-                cpcm.as_ref().map(|c| c as &dyn SolventModel),
-            )
-            .map_err(|e| OptError::Evaluation(e.to_string()))?;
-            drop(cpcm);
-            if !scf.converged {
-                return Err(OptError::ScfNotConverged {
-                    iterations: scf.iterations,
-                });
-            }
+                xc.as_ref()
+            ))?;
             self.cache = Some(CachedPoint {
                 positions: positions.to_vec(),
                 provider,
@@ -213,6 +217,56 @@ impl HfSurface {
             });
         }
         Ok(self.cache.as_ref().unwrap())
+    }
+
+    fn solve_scf<P: IntegralProvider>(
+        &self,
+        provider: &P,
+        molecule: &Molecule,
+        nuclear_repulsion: f64,
+        xc: Option<&GridXc>,
+    ) -> Result<ScfResult, OptError> {
+        let cpcm = if let Some(s) = &self.smd {
+            let zs: Vec<usize> = molecule
+                .atoms
+                .iter()
+                .map(|a| a.element.z() as usize)
+                .collect();
+            let radii = crate::solv::smd_coulomb_radii(&zs, s.alpha)
+                .map_err(|e| OptError::Evaluation(e.to_string()))?;
+            Some(
+                Cpcm::with_radii(
+                    provider,
+                    molecule,
+                    s.epsilon,
+                    crate::solv::DEFAULT_GRID,
+                    &radii,
+                )
+                .map_err(|e| OptError::Evaluation(e.to_string()))?,
+            )
+        } else {
+            self.solvent_eps
+                .map(|eps| Cpcm::new(provider, molecule, eps, crate::solv::DEFAULT_GRID))
+                .transpose()
+                .map_err(|e| OptError::Evaluation(e.to_string()))?
+        };
+        let scf = run_scf_with_env(
+            provider,
+            self.n_alpha,
+            self.n_beta,
+            self.reference,
+            nuclear_repulsion,
+            &self.scf_options,
+            xc.map(|x| x as &dyn XcContributor),
+            cpcm.as_ref().map(|c| c as &dyn SolventModel),
+        )
+        .map_err(|e| OptError::Evaluation(e.to_string()))?;
+        if !scf.converged {
+            return Err(OptError::ScfNotConverged {
+                iterations: scf.iterations,
+            });
+        }
+        Ok(scf)
     }
 
     /// Cartesian finite-difference Hessian with the `2·ndof` displaced-gradient
@@ -240,6 +294,7 @@ impl HfSurface {
         let dispersion = self.dispersion;
         let gcp = self.gcp;
         let srb = self.srb;
+        let direct = self.direct;
 
         let evals: Vec<(usize, f64)> = (0..ndof)
             .flat_map(|dof| [(dof, fd_step), (dof, -fd_step)])
@@ -263,6 +318,7 @@ impl HfSurface {
                     dispersion,
                     gcp,
                     srb,
+                    direct,
                     &x,
                 )
             })
@@ -307,6 +363,7 @@ fn gradient_at(
     dispersion: Option<Dispersion>,
     gcp: Option<crate::disp::GcpParams>,
     srb: Option<crate::disp::SrbParams>,
+    direct: bool,
     positions: &[[f64; 3]],
 ) -> Result<Vec<[f64; 3]>, OptError> {
     let atoms = elements
@@ -327,39 +384,27 @@ fn gradient_at(
         ),
         None => None,
     };
-    let provider =
-        ConventionalProvider::new(ao.into_integral(), setup.charges).with_ecps(setup.ecps);
-    let scf = run_scf_with_env(
-        &provider,
-        n_alpha,
-        n_beta,
-        reference,
-        setup.nuclear_repulsion,
-        scf_options,
-        xc.as_ref().map(|x| x as &dyn XcContributor),
-        None,
-    )
-    .map_err(|e| OptError::Evaluation(e.to_string()))?;
-    if !scf.converged {
-        return Err(OptError::ScfNotConverged {
-            iterations: scf.iterations,
-        });
-    }
-
+    let provider = SurfaceProvider::new(ao.into_integral(), setup.charges, setup.ecps, direct);
     let restricted = reference == Reference::Rhf;
-    let mut grad = match &xc {
-        None => hf_gradient(&provider, &molecule, &scf.density_alpha, &scf.density_beta)
-            .map_err(|e| OptError::Evaluation(e.to_string()))?,
-        Some(xc) => ks_gradient(
-            &provider,
-            &molecule,
-            xc as &dyn XcContributor,
-            &scf.density_alpha,
-            &scf.density_beta,
-            restricted,
+    let mut grad = with_provider!(&provider, |p| {
+        let scf = run_scf_with_env(
+            p,
+            n_alpha,
+            n_beta,
+            reference,
+            setup.nuclear_repulsion,
+            scf_options,
+            xc.as_ref().map(|x| x as &dyn XcContributor),
+            None,
         )
-        .map_err(|e| OptError::Evaluation(e.to_string()))?,
-    };
+        .map_err(|e| OptError::Evaluation(e.to_string()))?;
+        if !scf.converged {
+            return Err(OptError::ScfNotConverged {
+                iterations: scf.iterations,
+            });
+        }
+        electronic_gradient(p, &molecule, &scf, xc.as_ref(), restricted)
+    })?;
     if let Some(disp) = dispersion {
         let (_, disp_grad) = disp.energy_gradient(&molecule);
         for (g, d) in grad.iter_mut().zip(&disp_grad) {
@@ -385,6 +430,27 @@ fn gradient_at(
         }
     }
     Ok(grad)
+}
+
+fn electronic_gradient<P: IntegralProvider + GradientProvider>(
+    provider: &P,
+    molecule: &Molecule,
+    scf: &ScfResult,
+    xc: Option<&GridXc>,
+    restricted: bool,
+) -> Result<Vec<[f64; 3]>, OptError> {
+    match xc {
+        None => hf_gradient(provider, molecule, &scf.density_alpha, &scf.density_beta),
+        Some(xc) => ks_gradient(
+            provider,
+            molecule,
+            xc as &dyn XcContributor,
+            &scf.density_alpha,
+            &scf.density_beta,
+            restricted,
+        ),
+    }
+    .map_err(|e| OptError::Evaluation(e.to_string()))
 }
 
 impl Surface for HfSurface {
@@ -444,24 +510,13 @@ impl Surface for HfSurface {
         // through `and_then` unchanged. Only the gradient build below adds further
         // `OptError::Evaluation` failures.
         let result = self.eval(positions).and_then(|point| {
-            let mut grad = match &point.xc {
-                None => hf_gradient(
-                    &point.provider,
-                    &point.molecule,
-                    &point.scf.density_alpha,
-                    &point.scf.density_beta,
-                )
-                .map_err(|e| OptError::Evaluation(e.to_string()))?,
-                Some(xc) => ks_gradient(
-                    &point.provider,
-                    &point.molecule,
-                    xc as &dyn XcContributor,
-                    &point.scf.density_alpha,
-                    &point.scf.density_beta,
-                    restricted,
-                )
-                .map_err(|e| OptError::Evaluation(e.to_string()))?,
-            };
+            let mut grad = with_provider!(&point.provider, |p| electronic_gradient(
+                p,
+                &point.molecule,
+                &point.scf,
+                point.xc.as_ref(),
+                restricted
+            ))?;
             if let Some(disp) = dispersion {
                 let (_, disp_grad) = disp.energy_gradient(&point.molecule);
                 for (g, d) in grad.iter_mut().zip(&disp_grad) {

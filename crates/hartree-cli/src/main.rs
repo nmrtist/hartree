@@ -2596,8 +2596,8 @@ fn print_usage() {
          \x20                           or direct using a fixed calibrated cost model; direct is\n\
          \x20                           chosen only with at least a 15% estimated advantage\n\
          \x20   --direct                force integral-direct SCF: recompute ERIs each iteration\n\
-         \x20                           instead of storing the nao^4 tensor (rhf/uhf/rohf\n\
-         \x20                           single points; reaches larger systems, slower)\n\
+         \x20                           instead of storing the nao^4 tensor (single points\n\
+         \x20                           and --opt; reaches larger systems, slower)\n\
          \x20   --ri                    density-fitted (RI-JK) SCF: J/K from 3-center integrals\n\
          \x20                           over the def2-universal-jkfit auxiliary set (hf and all\n\
          \x20                           DFT functionals, single points; small fitting error\n\

@@ -209,8 +209,7 @@ where
         }
     }
 
-    let gamma = two_particle_density(&p, density_alpha, density_beta, n, c_x);
-    let g2e = provider.eri_gradient_contract(&gamma)?;
+    let g2e = provider.eri_gradient(density_alpha, density_beta, c_x)?;
     for (atom, g_atom) in grad.iter_mut().enumerate() {
         for axis in 0..3 {
             g_atom[axis] += g2e[atom][axis];
@@ -218,13 +217,12 @@ where
     }
 
     if let Some(rs) = &rs {
-        let gamma_lr = exchange_density(density_alpha, density_beta, n, rs.beta);
         let g_lr = provider
-            .eri_gradient_contract_erf(&gamma_lr, rs.omega)?
+            .eri_gradient_erf(density_alpha, density_beta, rs.beta, rs.omega)?
             .ok_or_else(|| {
                 GradientError::Backend(
                     "range-separated gradient: the integral backend has no erf-attenuated \
-                     ERI derivative (eri_gradient_contract_erf declined)"
+                     ERI derivative (eri_gradient_erf declined)"
                         .to_string(),
                 )
             })?;
@@ -251,43 +249,6 @@ where
     }
 
     Ok(grad)
-}
-
-fn two_particle_density(p: &[f64], da: &[f64], db: &[f64], n: usize, c_x: f64) -> Vec<f64> {
-    let mut gamma = vec![0.0; n * n * n * n];
-    for pi in 0..n {
-        for q in 0..n {
-            let pq = p[pi * n + q];
-            for r in 0..n {
-                let da_pr = da[pi * n + r];
-                let db_pr = db[pi * n + r];
-                let base = ((pi * n + q) * n + r) * n;
-                for s in 0..n {
-                    gamma[base + s] = 0.5 * pq * p[r * n + s]
-                        - c_x * (0.5 * da_pr * da[q * n + s] + 0.5 * db_pr * db[q * n + s]);
-                }
-            }
-        }
-    }
-    gamma
-}
-
-fn exchange_density(da: &[f64], db: &[f64], n: usize, c: f64) -> Vec<f64> {
-    let mut gamma = vec![0.0; n * n * n * n];
-    for pi in 0..n {
-        for q in 0..n {
-            for r in 0..n {
-                let da_pr = da[pi * n + r];
-                let db_pr = db[pi * n + r];
-                let base = ((pi * n + q) * n + r) * n;
-                for s in 0..n {
-                    gamma[base + s] =
-                        -c * (0.5 * da_pr * da[q * n + s] + 0.5 * db_pr * db[q * n + s]);
-                }
-            }
-        }
-    }
-    gamma
 }
 
 fn nuclear_repulsion_gradient(mol: &Molecule, charges: &[f64]) -> Gradient {

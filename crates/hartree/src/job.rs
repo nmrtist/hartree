@@ -1219,11 +1219,6 @@ impl Job {
             }
         }
         if backend == crate::EstimateBackend::Direct {
-            if opts.optimize_geometry {
-                return Err(
-                    "integral-direct backend does not support geometry optimization".into(),
-                );
-            }
             if matches!(self.method, Method::Mp2 | Method::Ccsd | Method::CcsdT) {
                 return Err(
                     "integral-direct backend does not support post-HF methods (needs in-core ERI)"
@@ -1467,6 +1462,7 @@ impl Job {
             } else {
                 HfSurface::new(mol, &self.basis, reference)?
             };
+            surface.set_direct(backend == crate::EstimateBackend::Direct);
             if let Some(disp) = opts.dispersion {
                 surface.set_dispersion(disp);
             }
@@ -1509,7 +1505,7 @@ impl Job {
             return Ok(JobResult {
                 method_warnings: Vec::new(),
                 backend_downgrade: None,
-                resolved_backend: crate::EstimateBackend::Conventional,
+                resolved_backend: backend,
                 backend_selection_reason: crate::BackendSelectionReason::RequiredCapability,
                 scf,
                 optimized_geometry: Some(opt),
