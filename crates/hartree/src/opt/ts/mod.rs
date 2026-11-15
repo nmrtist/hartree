@@ -56,7 +56,7 @@ mod frame;
 mod internal_frame;
 mod irc;
 mod neb;
-mod numerics;
+pub(in crate::opt) mod numerics;
 mod options;
 mod prfo;
 mod step;

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use internals::Internal;
+use ts::numerics::projected_force_norms;
 
 // `#[non_exhaustive]` (matching `TsError`) so future surface-failure modes can be
 // added non-breakingly; the only matches on `OptError` (the job error flatteners)
@@ -129,6 +130,10 @@ pub fn optimize<S: Surface>(
     let ndof = 3 * natom;
     let nq = defs.len();
 
+    // Unit masses: the internal-coordinate gradient vanishes exactly when the
+    // Cartesian gradient lies in the Euclidean span of the rigid-body motions.
+    let unit_masses = vec![1.0; natom];
+
     let mut x: Vec<[f64; 3]> = molecule.atoms.iter().map(|a| a.position).collect();
     let mut energy = surface.energy(&x)?;
     let mut gx = eval_gradient(surface, &x, options)?;
@@ -147,6 +152,11 @@ pub fn optimize<S: Surface>(
     for iter in 1..=options.max_iter {
         iterations = iter;
         let (max_force, rms_force) = force_norms(&gx);
+        // Internal-coordinate steps cannot remove a net force or torque, and a DFT
+        // gradient carries one (the atom-centred quadrature grid is not rotationally
+        // invariant), so the force thresholds are applied to the trans/rot-projected
+        // gradient; the history keeps the raw force, as in the saddle search.
+        let (conv_force, conv_rms) = projected_force_norms(&gx, &unit_masses, &x);
         let (max_disp, rms_disp) = match &x_prev {
             Some(xp) => disp_norms(&x, xp),
             None => (0.0, 0.0),
@@ -160,8 +170,8 @@ pub fn optimize<S: Surface>(
             rms_disp,
         });
 
-        if max_force < options.max_force
-            && rms_force < options.rms_force
+        if conv_force < options.max_force
+            && conv_rms < options.rms_force
             && max_disp < options.max_disp
             && rms_disp < options.rms_disp
         {
