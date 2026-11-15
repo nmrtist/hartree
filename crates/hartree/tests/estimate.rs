@@ -256,7 +256,8 @@ fn dft_estimate_includes_grid_term() {
 
 #[test]
 fn range_separated_functional_adds_long_range_tensor() {
-    // wb97x-v is range-separated (CAM): a second nao⁴ erf-attenuated tensor.
+    // wb97x-v is range-separated (CAM): a dense nao⁴ erf-attenuated tensor beside
+    // the packed Coulomb store.
     let est = estimate_memory(&job(
         water(),
         "sto-3g",
@@ -274,7 +275,8 @@ fn range_separated_functional_adds_long_range_tensor() {
         .iter()
         .find(|t| t.label == "eri_long_range")
         .expect("range-separated functional should add eri_long_range");
-    assert_eq!(eri.bytes, lr.bytes);
+    assert_eq!(lr.bytes, 7u64.pow(4) * 8);
+    assert!(eri.bytes < lr.bytes);
 }
 
 #[test]

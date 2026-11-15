@@ -59,13 +59,17 @@ pub(crate) struct BackendResolution {
     pub reason: BackendSelectionReason,
 }
 
-// Checked-in calibration from the exact-backend benchmark matrix. The model is
-// deliberately static: normal jobs never benchmark or inspect host performance.
-const CONVENTIONAL_N4_COST: f64 = 1.0;
-const DIRECT_N4_BASE_COST: f64 = 1.35;
-const DIRECT_NAO_SLOPE: f64 = 0.007;
-const DIRECT_SHELL_PENALTY: f64 = 0.02;
-const DIRECT_SELECTION_MARGIN: f64 = 0.85;
+/// Largest packed in-core ERI store the automatic selection will allocate. The
+/// model is deliberately static: normal jobs never benchmark or inspect the host.
+/// A conventional SCF evaluates each unique integral once and a direct SCF once
+/// per iteration, so in-core wins whenever the store fits.
+const AUTO_IN_CORE_ERI_LIMIT_BYTES: u128 = 4 << 30;
+
+/// Doubles in the symmetry-unique in-core ERI store (integrals `PackedEri`).
+fn packed_eri_elems(nao: u128) -> u128 {
+    let npair = nao * (nao + 1) / 2;
+    npair * (npair + 1) / 2
+}
 
 pub(crate) fn direct_backend_eligible(job: &Job) -> bool {
     let o = &job.options;
@@ -89,7 +93,7 @@ pub(crate) fn direct_backend_eligible(job: &Job) -> bool {
     true
 }
 
-pub(crate) fn resolve_backend_for_size(job: &Job, nao: usize, nshell: usize) -> BackendResolution {
+pub(crate) fn resolve_backend_for_size(job: &Job, nao: usize) -> BackendResolution {
     if job.options.ri {
         return BackendResolution {
             backend: EstimateBackend::Ri,
@@ -109,16 +113,11 @@ pub(crate) fn resolve_backend_for_size(job: &Job, nao: usize, nshell: usize) -> 
         };
     }
 
-    let n4 = (nao as f64).powi(4);
-    let conventional = CONVENTIONAL_N4_COST * n4;
-    let size_factor = (DIRECT_N4_BASE_COST - DIRECT_NAO_SLOPE * nao as f64).clamp(0.45, 1.35);
-    let shell_factor = 1.0 + DIRECT_SHELL_PENALTY * nshell as f64 / nao.max(1) as f64;
-    let direct = n4 * size_factor * shell_factor;
     BackendResolution {
-        backend: if direct <= DIRECT_SELECTION_MARGIN * conventional {
-            EstimateBackend::Direct
-        } else {
+        backend: if 8 * packed_eri_elems(nao as u128) <= AUTO_IN_CORE_ERI_LIMIT_BYTES {
             EstimateBackend::Conventional
+        } else {
+            EstimateBackend::Direct
         },
         reason: BackendSelectionReason::Performance,
     }
@@ -127,7 +126,7 @@ pub(crate) fn resolve_backend_for_size(job: &Job, nao: usize, nshell: usize) -> 
 pub(crate) fn resolve_backend(job: &Job) -> Result<BackendResolution, String> {
     let basis = BasisSet::load(&job.basis).map_err(|e| e.to_string())?;
     let ao = basis.build(&job.molecule).map_err(|e| e.to_string())?;
-    Ok(resolve_backend_for_size(job, ao.n_ao(), ao.shells().len()))
+    Ok(resolve_backend_for_size(job, ao.n_ao()))
 }
 
 /// The integral backend an estimate assumed, matching [`Job::run`]'s dispatch.
@@ -226,14 +225,19 @@ pub fn estimate_memory(job: &Job) -> Result<MemoryEstimate, String> {
     // wins over `--direct`, and everything else (including double hybrids,
     // transition-state search, and frequencies) runs on the conventional
     // in-core backend.
-    let backend = resolve_backend_for_size(job, nao, nshell).backend;
+    let backend = resolve_backend_for_size(job, nao).backend;
 
     let mut terms: Vec<MemoryTerm> = Vec::new();
 
     match backend {
         EstimateBackend::Conventional => {
-            // Dense rank-4 ERI: nao⁴ doubles (integrals::build_eri_parallel).
-            terms.extend(term("eri_in_core", n * n * n * n));
+            // Symmetry-unique ERI store the SCF contracts (integrals PackedEri).
+            terms.extend(term("eri_in_core", packed_eri_elems(n)));
+            // Post-HF consumers index the dense nao⁴ tensor, expanded from the
+            // packed store while it is still alive (ConventionalProvider::eri_tensor).
+            if needs_dense_eri(job) {
+                terms.extend(term("eri_dense", n * n * n * n));
+            }
             // Range-separated (CAM) functionals build a second nao⁴ erf-attenuated
             // tensor for long-range exchange (ConventionalProvider::eri_lr_tensor).
             if dft_spec.is_some_and(|s| s.cam().is_some()) {
@@ -304,6 +308,16 @@ pub fn estimate_memory(job: &Job) -> Result<MemoryEstimate, String> {
         backend,
         breakdown: terms,
     })
+}
+
+/// Whether the job reads the dense AO ERI tensor after the SCF.
+fn needs_dense_eri(job: &Job) -> bool {
+    match &job.method {
+        Method::Mp2 => !job.options.ri_mp2,
+        Method::Ccsd | Method::CcsdT => true,
+        Method::Dft(spec) => spec.double_hybrid().is_some() && !job.options.ri_mp2,
+        _ => false,
+    }
 }
 
 /// MP2 / RI-MP2 correlation working set (cc::mp2, cc::ri_mp2, cc::transform).
