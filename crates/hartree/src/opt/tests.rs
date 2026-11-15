@@ -117,6 +117,104 @@ fn triatomic_harmonic_fd() {
     assert!((th - 1.823).abs() < 1e-4, "theta = {th}");
 }
 
+/// Harmonic water whose gradient carries a constant net torque that no internal
+/// step can remove, like the XC-grid torque of a DFT gradient.
+struct TorquedWater {
+    inner: HarmonicWater,
+    torque: [f64; 3],
+}
+impl Surface for TorquedWater {
+    fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
+        self.inner.energy(x)
+    }
+    fn analytic_gradient(&mut self, x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
+        let mut g = match fd::central_difference(&mut self.inner, x, 1e-4) {
+            Ok(g) => g,
+            Err(e) => return Some(Err(e)),
+        };
+        let n = x.len() as f64;
+        let c: [f64; 3] = std::array::from_fn(|k| x.iter().map(|p| p[k]).sum::<f64>() / n);
+        let t = self.torque;
+        for (gi, p) in g.iter_mut().zip(x) {
+            let r = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+            gi[0] += t[1] * r[2] - t[2] * r[1];
+            gi[1] += t[2] * r[0] - t[0] * r[2];
+            gi[2] += t[0] * r[1] - t[1] * r[0];
+        }
+        Some(Ok(g))
+    }
+    fn is_rigid_body_invariant(&self) -> bool {
+        true
+    }
+}
+
+/// `E = x₁ + x₂`: a real external force along a pure translation.
+struct UniformField;
+impl Surface for UniformField {
+    fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
+        Ok(x[0][0] + x[1][0])
+    }
+    fn analytic_gradient(&mut self, _x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
+        Some(Ok(vec![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]))
+    }
+}
+
+#[test]
+fn external_force_is_not_reported_converged() {
+    let mol = Molecule::new(
+        vec![
+            Atom::new(Element::from_z(1).unwrap(), [0.0, 0.0, 0.0]),
+            Atom::new(Element::from_z(1).unwrap(), [0.0, 0.0, 1.40]),
+        ],
+        0,
+        1,
+    );
+    let options = OptOptions {
+        max_iter: 5,
+        ..OptOptions::default()
+    };
+    let result = optimize(&mol, &mut UniformField, &options).unwrap();
+    assert!(
+        !result.converged,
+        "a surface with a net external force must not converge"
+    );
+}
+
+#[test]
+fn converges_despite_rigid_body_gradient_residue() {
+    let mol = Molecule::new(
+        vec![
+            Atom::new(Element::from_z(8).unwrap(), [0.0, 0.0, 0.0]),
+            Atom::new(Element::from_z(1).unwrap(), [1.70, 0.0, 0.0]),
+            Atom::new(Element::from_z(1).unwrap(), [-0.45, 1.70, 0.0]),
+        ],
+        0,
+        1,
+    );
+    let mut surf = TorquedWater {
+        inner: HarmonicWater {
+            kb: 0.5,
+            b0: 1.81,
+            ka: 0.2,
+            a0: 1.823,
+        },
+        torque: [2.0e-5, -1.0e-5, 3.0e-5],
+    };
+    let result = optimize(&mol, &mut surf, &OptOptions::default()).unwrap();
+    assert!(
+        result.converged,
+        "did not converge in {} steps",
+        result.iterations
+    );
+    let raw_max = result.history.last().unwrap().max_force;
+    assert!(
+        raw_max > OptOptions::default().max_force,
+        "the raw force {raw_max} should still carry the torque"
+    );
+    let r01 = dist(result.positions[0], result.positions[1]);
+    assert!((r01 - 1.81).abs() < 1e-4, "r01 = {r01}");
+}
+
 /// A SCF non-convergence on the real `HfSurface` propagates out of `optimize`
 /// as the typed `OptError::ScfNotConverged` (via the first `surface.energy`
 /// call), not a prose `Evaluation` string. Water/sto-3g cannot converge in one

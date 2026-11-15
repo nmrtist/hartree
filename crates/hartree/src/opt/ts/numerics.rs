@@ -163,7 +163,11 @@ pub(super) fn project_trans_rot(g: &[[f64; 3]], masses: &[f64], x: &[[f64; 3]]) 
 /// `force_norms` of the gradient with rigid-body contamination projected out — the
 /// quantity the saddle search applies its force thresholds to (the step is taken in
 /// the same projected frame, so the convergence test and the step now agree).
-pub(super) fn projected_force_norms(g: &[[f64; 3]], masses: &[f64], x: &[[f64; 3]]) -> (f64, f64) {
+pub(in crate::opt) fn projected_force_norms(
+    g: &[[f64; 3]],
+    masses: &[f64],
+    x: &[[f64; 3]],
+) -> (f64, f64) {
     force_norms(&project_trans_rot(g, masses, x))
 }
 

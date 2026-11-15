@@ -1559,6 +1559,8 @@ fn report_optimization(
             step.iteration, step.energy, step.max_force, step.rms_force, step.max_disp
         );
     }
+    println!("forces are the raw Cartesian gradient; convergence is tested on the");
+    println!("gradient with net translation and rotation projected out");
     println!();
 
     if result.converged {
