@@ -415,6 +415,10 @@ impl Surface for HfSurface {
         Ok(point.scf.energy + e_disp + e_gcp + e_srb + e_cds)
     }
 
+    fn is_rigid_body_invariant(&self) -> bool {
+        true
+    }
+
     fn fd_hessian(
         &mut self,
         positions: &[[f64; 3]],

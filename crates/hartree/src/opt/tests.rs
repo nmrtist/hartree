@@ -143,6 +143,41 @@ impl Surface for TorquedWater {
         }
         Some(Ok(g))
     }
+    fn is_rigid_body_invariant(&self) -> bool {
+        true
+    }
+}
+
+/// `E = x₁ + x₂`: a real external force along a pure translation.
+struct UniformField;
+impl Surface for UniformField {
+    fn energy(&mut self, x: &[[f64; 3]]) -> Result<f64, OptError> {
+        Ok(x[0][0] + x[1][0])
+    }
+    fn analytic_gradient(&mut self, _x: &[[f64; 3]]) -> Option<Result<Vec<[f64; 3]>, OptError>> {
+        Some(Ok(vec![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]))
+    }
+}
+
+#[test]
+fn external_force_is_not_reported_converged() {
+    let mol = Molecule::new(
+        vec![
+            Atom::new(Element::from_z(1).unwrap(), [0.0, 0.0, 0.0]),
+            Atom::new(Element::from_z(1).unwrap(), [0.0, 0.0, 1.40]),
+        ],
+        0,
+        1,
+    );
+    let options = OptOptions {
+        max_iter: 5,
+        ..OptOptions::default()
+    };
+    let result = optimize(&mol, &mut UniformField, &options).unwrap();
+    assert!(
+        !result.converged,
+        "a surface with a net external force must not converge"
+    );
 }
 
 #[test]

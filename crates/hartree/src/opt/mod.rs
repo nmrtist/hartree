@@ -43,6 +43,17 @@ pub trait Surface {
         positions: &[[f64; 3]],
     ) -> Option<Result<Vec<[f64; 3]>, OptError>>;
 
+    /// Whether the energy is unchanged by rigidly translating or rotating all atoms
+    /// (an isolated molecule with no external field). When `true`, [`optimize`] treats
+    /// a net force or torque in the gradient as numerical residue (e.g. from a
+    /// quadrature grid of fixed orientation) and tests convergence on the gradient
+    /// with those components projected out. The default `false` keeps the raw
+    /// gradient, so a surface with a real external force is never reported converged
+    /// while that force remains.
+    fn is_rigid_body_invariant(&self) -> bool {
+        false
+    }
+
     /// Optional fast Cartesian finite-difference Hessian (row-major, symmetrized);
     /// an implementation may run the `2·ndof` independent gradient evaluations in
     /// parallel. `None` (the default) selects the driver's serial finite difference.
@@ -154,9 +165,14 @@ pub fn optimize<S: Surface>(
         let (max_force, rms_force) = force_norms(&gx);
         // Internal-coordinate steps cannot remove a net force or torque, and a DFT
         // gradient carries one (the atom-centred quadrature grid is not rotationally
-        // invariant), so the force thresholds are applied to the trans/rot-projected
-        // gradient; the history keeps the raw force, as in the saddle search.
-        let (conv_force, conv_rms) = projected_force_norms(&gx, &unit_masses, &x);
+        // invariant), so on a rigid-body-invariant surface the force thresholds are
+        // applied to the trans/rot-projected gradient; the history keeps the raw
+        // force, as in the saddle search.
+        let (conv_force, conv_rms) = if surface.is_rigid_body_invariant() {
+            projected_force_norms(&gx, &unit_masses, &x)
+        } else {
+            (max_force, rms_force)
+        };
         let (max_disp, rms_disp) = match &x_prev {
             Some(xp) => disp_norms(&x, xp),
             None => (0.0, 0.0),
