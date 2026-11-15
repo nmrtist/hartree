@@ -157,9 +157,9 @@ fn run_scf_staged<P: IntegralProvider>(
 /// SAD, the spin-resolved first-iteration AO density. A density guess slashes the iteration
 /// count on larger/conjugated systems where GWH is weak, and falls back transparently — so a
 /// previously converging job keeps its exact converged energy.
-type SpinDensity = (Vec<f64>, Vec<f64>);
+pub(crate) type SpinDensity = (Vec<f64>, Vec<f64>);
 
-fn sad_initial_guess(
+pub(crate) fn sad_initial_guess(
     mol: &Molecule,
     ao: &crate::basis::AoBasis,
     basis: &str,

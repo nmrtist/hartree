@@ -4,8 +4,11 @@ use crate::dft::{FunctionalSpec, GridXc};
 use crate::disp::Dispersion;
 use crate::grad::{hf_gradient, ks_gradient};
 use crate::integrals::{ConventionalProvider, DirectProvider, GradientProvider, IntegralProvider};
+use crate::job::SpinDensity;
 use crate::opt::{OptError, Surface};
-use crate::scf::{Reference, ScfOptions, ScfResult, SolventModel, XcContributor, run_scf_with_env};
+use crate::scf::{
+    Guess, Reference, ScfOptions, ScfResult, SolventModel, XcContributor, run_scf_with_env,
+};
 use crate::solv::Cpcm;
 
 pub struct HfSurface {
@@ -147,6 +150,7 @@ impl HfSurface {
     /// ERI tensor) instead of the in-core one.
     pub fn set_direct(&mut self, direct: bool) {
         self.direct = direct;
+        self.scf_options.incremental_fock = direct;
         self.cache = None;
     }
 
@@ -181,6 +185,44 @@ impl HfSurface {
         Molecule::new(atoms, self.charge, self.multiplicity)
     }
 
+    /// SCF options seeded for a new geometry: from the last converged point's
+    /// density when there is one, else from the superposition of atomic densities.
+    fn seeded_scf_options(&self, molecule: &Molecule, ao: &crate::basis::AoBasis) -> ScfOptions {
+        let (guess, initial_density) = match self.previous_density() {
+            Some(density) => (Guess::Sad, Some(density)),
+            None => {
+                let (method, grid_level) = match &self.functional {
+                    Some((spec, level)) => (crate::Method::Dft(spec.clone()), *level),
+                    None => (crate::Method::Rhf, 0),
+                };
+                crate::job::sad_initial_guess(
+                    molecule,
+                    ao,
+                    &self.basis,
+                    &method,
+                    grid_level,
+                    self.reference,
+                )
+            }
+        };
+        ScfOptions {
+            guess,
+            initial_density,
+            ..self.scf_options.clone()
+        }
+    }
+
+    /// The cached point's spin densities. ROHF keeps its orbital guess, as it
+    /// does for single points (see `job::sad_initial_guess`).
+    fn previous_density(&self) -> Option<SpinDensity> {
+        if self.reference == Reference::Rohf {
+            return None;
+        }
+        self.cache
+            .as_ref()
+            .map(|c| (c.scf.density_alpha.clone(), c.scf.density_beta.clone()))
+    }
+
     fn eval(&mut self, positions: &[[f64; 3]]) -> Result<&CachedPoint, OptError> {
         let hit = self
             .cache
@@ -200,12 +242,16 @@ impl HfSurface {
                 ),
                 None => None,
             };
+            let scf_options = self.seeded_scf_options(&molecule, &ao);
+            // Release the previous point's stored integrals before building this one's.
+            self.cache = None;
             let provider =
                 SurfaceProvider::new(ao.into_integral(), setup.charges, setup.ecps, self.direct);
             let scf = with_provider!(&provider, |p| self.solve_scf(
                 p,
                 &molecule,
                 setup.nuclear_repulsion,
+                &scf_options,
                 xc.as_ref()
             ))?;
             self.cache = Some(CachedPoint {
@@ -224,6 +270,7 @@ impl HfSurface {
         provider: &P,
         molecule: &Molecule,
         nuclear_repulsion: f64,
+        scf_options: &ScfOptions,
         xc: Option<&GridXc>,
     ) -> Result<ScfResult, OptError> {
         let cpcm = if let Some(s) = &self.smd {
@@ -250,23 +297,16 @@ impl HfSurface {
                 .transpose()
                 .map_err(|e| OptError::Evaluation(e.to_string()))?
         };
-        let scf = run_scf_with_env(
+        converge_scf(
             provider,
             self.n_alpha,
             self.n_beta,
             self.reference,
             nuclear_repulsion,
-            &self.scf_options,
+            scf_options,
             xc.map(|x| x as &dyn XcContributor),
             cpcm.as_ref().map(|c| c as &dyn SolventModel),
         )
-        .map_err(|e| OptError::Evaluation(e.to_string()))?;
-        if !scf.converged {
-            return Err(OptError::ScfNotConverged {
-                iterations: scf.iterations,
-            });
-        }
-        Ok(scf)
     }
 
     /// Cartesian finite-difference Hessian with the `2·ndof` displaced-gradient
@@ -289,7 +329,11 @@ impl HfSurface {
         let reference = self.reference;
         let n_alpha = self.n_alpha;
         let n_beta = self.n_beta;
-        let scf_options = self.scf_options.clone();
+        let mut scf_options = self.scf_options.clone();
+        if let Some(density) = self.previous_density() {
+            scf_options.guess = Guess::Sad;
+            scf_options.initial_density = Some(density);
+        }
         let functional = self.functional.clone();
         let dispersion = self.dispersion;
         let gcp = self.gcp;
@@ -347,6 +391,48 @@ impl HfSurface {
     }
 }
 
+/// Run the SCF to convergence. A seed density that fails to converge (a previous
+/// geometry's density after a large step) is retried once from the default guess.
+#[allow(clippy::too_many_arguments)]
+fn converge_scf<P: IntegralProvider>(
+    provider: &P,
+    n_alpha: usize,
+    n_beta: usize,
+    reference: Reference,
+    nuclear_repulsion: f64,
+    options: &ScfOptions,
+    xc: Option<&dyn XcContributor>,
+    solvent: Option<&dyn SolventModel>,
+) -> Result<ScfResult, OptError> {
+    let run = |options: &ScfOptions| {
+        run_scf_with_env(
+            provider,
+            n_alpha,
+            n_beta,
+            reference,
+            nuclear_repulsion,
+            options,
+            xc,
+            solvent,
+        )
+        .map_err(|e| OptError::Evaluation(e.to_string()))
+    };
+    let mut scf = run(options)?;
+    if !scf.converged && options.initial_density.is_some() {
+        scf = run(&ScfOptions {
+            guess: Guess::Gwh,
+            initial_density: None,
+            ..options.clone()
+        })?;
+    }
+    if !scf.converged {
+        return Err(OptError::ScfNotConverged {
+            iterations: scf.iterations,
+        });
+    }
+    Ok(scf)
+}
+
 /// Stateless SCF + analytic gradient at one geometry (no `&mut` cache), so
 /// [`HfSurface::fd_hessian_parallel`] can evaluate displaced geometries concurrently.
 #[allow(clippy::too_many_arguments)]
@@ -387,7 +473,7 @@ fn gradient_at(
     let provider = SurfaceProvider::new(ao.into_integral(), setup.charges, setup.ecps, direct);
     let restricted = reference == Reference::Rhf;
     let mut grad = with_provider!(&provider, |p| {
-        let scf = run_scf_with_env(
+        let scf = converge_scf(
             p,
             n_alpha,
             n_beta,
@@ -396,13 +482,7 @@ fn gradient_at(
             scf_options,
             xc.as_ref().map(|x| x as &dyn XcContributor),
             None,
-        )
-        .map_err(|e| OptError::Evaluation(e.to_string()))?;
-        if !scf.converged {
-            return Err(OptError::ScfNotConverged {
-                iterations: scf.iterations,
-            });
-        }
+        )?;
         electronic_gradient(p, &molecule, &scf, xc.as_ref(), restricted)
     })?;
     if let Some(disp) = dispersion {
