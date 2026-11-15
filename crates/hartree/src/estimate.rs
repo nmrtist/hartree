@@ -69,8 +69,7 @@ const DIRECT_SELECTION_MARGIN: f64 = 0.85;
 
 pub(crate) fn direct_backend_eligible(job: &Job) -> bool {
     let o = &job.options;
-    if o.optimize_geometry
-        || o.transition_state
+    if o.transition_state
         || o.compute_properties
         || o.compute_frequencies
         || o.fod
@@ -136,8 +135,8 @@ pub(crate) fn resolve_backend(job: &Job) -> Result<BackendResolution, String> {
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum EstimateBackend {
-    /// Conventional in-core ERI tensor (also: double hybrids, optimization,
-    /// transition-state search, and frequencies).
+    /// Conventional in-core ERI tensor (also: double hybrids, transition-state
+    /// search, and frequencies).
     Conventional,
     /// Integral-direct: ERIs recomputed on the fly, O(nao²) resident.
     Direct,
@@ -225,8 +224,8 @@ pub fn estimate_memory(job: &Job) -> Result<MemoryEstimate, String> {
 
     // Backend dispatch — identical priority order to `Job::run_inner`: `--ri`
     // wins over `--direct`, and everything else (including double hybrids,
-    // geometry optimization, transition-state search, and frequencies) runs on
-    // the conventional in-core backend.
+    // transition-state search, and frequencies) runs on the conventional
+    // in-core backend.
     let backend = resolve_backend_for_size(job, nao, nshell).backend;
 
     let mut terms: Vec<MemoryTerm> = Vec::new();
