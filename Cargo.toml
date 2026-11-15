@@ -16,7 +16,7 @@ repository = "https://github.com/nmrtist/hartree"
 [workspace.dependencies]
 hartree = { path = "crates/hartree", version = "0.2.3" }
 
-integral = "0.4.2"
+integral = "0.4.3"
 # latx: periodic-systems foundation (cells, reciprocal lattices, k-points).
 latx = "0.1.0"
 faer = "0.24"
@@ -45,6 +45,3 @@ codegen-units = 1
 inherits = "release"
 lto = false
 codegen-units = 256
-
-[patch.crates-io]
-integral = { git = "https://github.com/Limdongcheng/integral", branch = "feat/packed-eri" }
