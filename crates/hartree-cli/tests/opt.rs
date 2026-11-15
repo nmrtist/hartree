@@ -193,6 +193,27 @@ fn fd_driven_optimization_matches_orca() {
 }
 
 #[test]
+fn direct_backend_optimization_matches_conventional() {
+    let geoms: Geometries = serde_json::from_str(GEOMETRIES_JSON).unwrap();
+    let start = start_molecule(&geoms.molecules["water"]);
+    let reference = references()
+        .into_iter()
+        .find(|e| e.molecule == "water" && e.basis == "sto-3g")
+        .unwrap();
+
+    let mut surface = HfSurface::new(&start, "sto-3g", Reference::Rhf).unwrap();
+    surface.set_direct(true);
+    let result = optimize(&start, &mut surface, &OptOptions::default()).unwrap();
+    assert!(result.converged, "direct-backend opt did not converge");
+    assert!(
+        (result.energy - reference.energy).abs() < 1e-6,
+        "direct-backend energy {:.9} vs ORCA {:.9}",
+        result.energy,
+        reference.energy
+    );
+}
+
+#[test]
 fn rohf_surface_has_no_analytic_gradient() {
     let oh = Molecule::new(
         vec![
@@ -218,7 +239,6 @@ fn rohf_surface_has_no_analytic_gradient() {
 }
 
 #[test]
-#[ignore = "slow (many min): toy-size cc-pVDZ eri_grad per step; run with --ignored"]
 fn optimizes_water_ccpvdz_flagship() {
     let entry = references()
         .into_iter()

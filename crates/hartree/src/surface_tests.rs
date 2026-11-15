@@ -104,3 +104,28 @@ fn fd_hessian_parallel_matches_serial_central_difference() {
         "parallel vs serial FD Hessian disagree: max abs diff {max_diff}"
     );
 }
+
+/// A point reached from a converged neighbour starts from that neighbour's density:
+/// it converges to the energy a fresh surface finds there, in fewer iterations.
+#[test]
+fn displaced_point_reuses_previous_density() {
+    let mol = water();
+    let pos: Vec<[f64; 3]> = mol.atoms.iter().map(|a| a.position).collect();
+    let mut displaced = pos.clone();
+    displaced[1][1] += 0.02;
+
+    let mut fresh = HfSurface::new(&mol, "6-31g", Reference::Rhf).unwrap();
+    let e_fresh = fresh.energy(&displaced).unwrap();
+    let fresh_iterations = fresh.last_scf().unwrap().iterations;
+
+    let mut seeded = HfSurface::new(&mol, "6-31g", Reference::Rhf).unwrap();
+    seeded.energy(&pos).unwrap();
+    let e_seeded = seeded.energy(&displaced).unwrap();
+    let seeded_iterations = seeded.last_scf().unwrap().iterations;
+
+    assert!((e_seeded - e_fresh).abs() < 1e-9, "{e_seeded} vs {e_fresh}");
+    assert!(
+        seeded_iterations < fresh_iterations,
+        "seeded {seeded_iterations} vs fresh {fresh_iterations} iterations"
+    );
+}

@@ -46,7 +46,7 @@ fn term_drops_zero() {
 
 #[test]
 fn conventional_hf_dominated_by_eri() {
-    // Water/STO-3G has 7 AOs: the ERI tensor is 7⁴·8 bytes.
+    // Water/STO-3G has 7 AOs, so 28 AO pairs: the packed ERI is 28·29/2 doubles.
     let est = estimate_memory(&job(Method::Rhf, JobOptions::default())).unwrap();
     assert_eq!(est.backend, EstimateBackend::Conventional);
     let eri = est
@@ -54,7 +54,8 @@ fn conventional_hf_dominated_by_eri() {
         .iter()
         .find(|t| t.label == "eri_in_core")
         .unwrap();
-    assert_eq!(eri.bytes, 7u64.pow(4) * 8);
+    assert_eq!(eri.bytes, 28 * 29 / 2 * 8);
+    assert!(!est.breakdown.iter().any(|t| t.label == "eri_dense"));
     // peak_bytes is the sum of the breakdown, and the breakdown is sorted.
     let sum: u64 = est.breakdown.iter().map(|t| t.bytes).sum();
     assert_eq!(est.peak_bytes, sum);
@@ -66,6 +67,12 @@ fn mp2_adds_correlation_terms() {
     let hf = estimate_memory(&job(Method::Rhf, JobOptions::default())).unwrap();
     let mp2 = estimate_memory(&job(Method::Mp2, JobOptions::default())).unwrap();
     assert!(mp2.peak_bytes > hf.peak_bytes);
+    let dense = mp2
+        .breakdown
+        .iter()
+        .find(|t| t.label == "eri_dense")
+        .unwrap();
+    assert_eq!(dense.bytes, 7u64.pow(4) * 8);
     assert!(mp2.breakdown.iter().any(|t| t.label == "mp2_mo_integrals"));
     assert!(
         mp2.breakdown
@@ -189,17 +196,18 @@ fn estimate_is_serde_round_trippable() {
 }
 
 #[test]
-fn automatic_backend_model_applies_margin_and_capability_gate() {
+fn automatic_backend_model_applies_memory_limit_and_capability_gate() {
     let eligible = job(Method::Rhf, JobOptions::default());
-    let small = resolve_backend_for_size(&eligible, 20, 10);
+    // 250 AOs pack into 3.9 GiB, inside the 4 GiB automatic in-core limit; 260 do not.
+    let small = resolve_backend_for_size(&eligible, 250);
     assert_eq!(small.backend, EstimateBackend::Conventional);
     assert_eq!(small.reason, BackendSelectionReason::Performance);
-    let large = resolve_backend_for_size(&eligible, 100, 45);
+    let large = resolve_backend_for_size(&eligible, 260);
     assert_eq!(large.backend, EstimateBackend::Direct);
     assert_eq!(large.reason, BackendSelectionReason::Performance);
 
     let required = job(Method::Mp2, JobOptions::default());
-    let resolution = resolve_backend_for_size(&required, 100, 45);
+    let resolution = resolve_backend_for_size(&required, 400);
     assert_eq!(resolution.backend, EstimateBackend::Conventional);
     assert_eq!(
         resolution.reason,

@@ -206,7 +206,6 @@ fn ch3_uhf_gradient() {
 }
 
 #[test]
-#[ignore = "slow (~2 min): toy-size cc-pVDZ eri_grad; run with --ignored"]
 fn water_ccpvdz_invariances() {
     let mol = Molecule::new(
         vec![

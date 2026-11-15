@@ -126,10 +126,11 @@ Run `hartree --help` for the full CLI surface.
 
 ### Exact integral backend selection
 
-For eligible SCF single points, the default exact backend is selected from the
-conventional in-core and integral-direct implementations by a fixed, calibrated
-cost model. Direct is selected for performance only when its estimated cost is
-at least 15% lower; methods that require stored ERIs remain conventional.
+For eligible SCF single points and geometry optimizations, the default exact
+backend is the conventional in-core one whenever its symmetry-packed ERI store
+(`nao⁴/8` doubles) fits a fixed 4 GiB limit, and integral-direct above that: an
+in-core SCF evaluates each unique integral once, a direct SCF once per
+iteration. Methods that require stored ERIs remain conventional.
 `--direct` and `--ri` are explicit, authoritative choices, and RI is never
 selected automatically because it changes the approximation. Every CLI run
 prints the resolved backend and selection reason. Library callers can inspect

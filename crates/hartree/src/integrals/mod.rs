@@ -9,6 +9,9 @@ use crate::linalg::{
 use rayon::prelude::*;
 use thiserror::Error;
 
+mod gradient;
+mod packed;
+
 pub struct JkResult {
     pub coulomb: Vec<Mat>,
     pub exchange: Vec<Mat>,
@@ -116,11 +119,23 @@ pub trait GradientProvider {
 
     fn nuclear_gradient(&self) -> Result<MatrixGradient, GradientError>;
 
-    fn eri_gradient_contract(&self, gamma: &[f64]) -> Result<Vec<[f64; 3]>, GradientError>;
-
-    fn eri_gradient_contract_erf(
+    /// `Σ Γ[μνλσ]·∂(μν|λσ)/∂R` per atom for the two-particle density of the spin
+    /// densities `Dα`, `Dβ` (row-major `nao²`, symmetric):
+    /// `Γ = ½·P[μν]P[λσ] − ½·c_x·(Dα[μλ]Dα[νσ] + Dβ[μλ]Dβ[νσ])`, `P = Dα + Dβ`.
+    fn eri_gradient(
         &self,
-        _gamma: &[f64],
+        density_alpha: &[f64],
+        density_beta: &[f64],
+        c_x: f64,
+    ) -> Result<Vec<[f64; 3]>, GradientError>;
+
+    /// The exchange part of [`Self::eri_gradient`] alone, over the `erf(ω·r₁₂)/r₁₂`
+    /// kernel. `None` when the backend has no erf-attenuated ERI derivative.
+    fn eri_gradient_erf(
+        &self,
+        _density_alpha: &[f64],
+        _density_beta: &[f64],
+        _c_x: f64,
         _omega: f64,
     ) -> Result<Option<Vec<[f64; 3]>>, GradientError> {
         Ok(None)
@@ -134,97 +149,15 @@ pub trait GradientProvider {
     }
 }
 
-fn matrix_gradient_from_integral(g: &integral::Gradient1e) -> MatrixGradient {
-    let natom = g.natom();
-    let n = g.nao();
-    let nn = n * n;
-    let mut data = vec![0.0; natom * 3 * nn];
-    for atom in 0..natom {
-        for axis in 0..3 {
-            let off = (atom * 3 + axis) * nn;
-            data[off..off + nn].copy_from_slice(g.block(atom, axis));
-        }
-    }
-    MatrixGradient { natom, n, data }
-}
-
-impl GradientProvider for ConventionalProvider {
-    fn overlap_gradient(&self) -> Result<MatrixGradient, GradientError> {
-        let g = self
-            .basis
-            .overlap_grad()
-            .map_err(|e| GradientError::Backend(e.to_string()))?;
-        Ok(matrix_gradient_from_integral(&g))
-    }
-
-    fn kinetic_gradient(&self) -> Result<MatrixGradient, GradientError> {
-        let g = self
-            .basis
-            .kinetic_grad()
-            .map_err(|e| GradientError::Backend(e.to_string()))?;
-        Ok(matrix_gradient_from_integral(&g))
-    }
-
-    fn nuclear_gradient(&self) -> Result<MatrixGradient, GradientError> {
-        let g = self
-            .basis
-            .nuclear_grad(&self.charges)
-            .map_err(|e| GradientError::Backend(e.to_string()))?;
-        Ok(matrix_gradient_from_integral(&g))
-    }
-
-    fn eri_gradient_contract(&self, gamma: &[f64]) -> Result<Vec<[f64; 3]>, GradientError> {
-        let n4 = self.n_basis * self.n_basis * self.n_basis * self.n_basis;
-        assert_eq!(
-            gamma.len(),
-            n4,
-            "gamma must be nao⁴ = {n4} elements, got {}",
-            gamma.len()
-        );
-        self.basis
-            .eri_grad_contract(gamma)
-            .map_err(|e| GradientError::Backend(e.to_string()))
-    }
-
-    fn eri_gradient_contract_erf(
-        &self,
-        gamma: &[f64],
-        omega: f64,
-    ) -> Result<Option<Vec<[f64; 3]>>, GradientError> {
-        let n4 = self.n_basis * self.n_basis * self.n_basis * self.n_basis;
-        assert_eq!(
-            gamma.len(),
-            n4,
-            "gamma must be nao⁴ = {n4} elements, got {}",
-            gamma.len()
-        );
-        self.basis
-            .eri_grad_contract_kernel(gamma, integral::EriKernel::Erf { omega })
-            .map(Some)
-            .map_err(|e| GradientError::Backend(e.to_string()))
-    }
-
-    fn ecp_gradient_contract(
-        &self,
-        density: &[f64],
-    ) -> Result<Option<Vec<[f64; 3]>>, GradientError> {
-        if self.ecps.is_empty() {
-            return Ok(None);
-        }
-        self.basis
-            .ecp_grad_contract(&self.ecps, density)
-            .map(Some)
-            .map_err(|e| GradientError::Backend(e.to_string()))
-    }
-}
-
 pub struct ConventionalProvider {
     basis: integral::Basis,
     charges: Vec<([f64; 3], f64)>,
     ecps: Vec<integral::Ecp>,
     n_basis: usize,
     eri: std::sync::OnceLock<Vec<f64>>,
+    eri_packed: std::sync::OnceLock<packed::PackedEri>,
     eri_lr: std::sync::OnceLock<(f64, Vec<f64>)>,
+    grad_contractor: gradient::GradContractorCell,
 }
 
 impl ConventionalProvider {
@@ -236,7 +169,9 @@ impl ConventionalProvider {
             ecps: Vec::new(),
             n_basis,
             eri: std::sync::OnceLock::new(),
+            eri_packed: std::sync::OnceLock::new(),
             eri_lr: std::sync::OnceLock::new(),
+            grad_contractor: std::sync::OnceLock::new(),
         }
     }
 
@@ -246,14 +181,27 @@ impl ConventionalProvider {
         self
     }
 
+    /// The dense `nao⁴` tensor the post-HF consumers index directly. The SCF never
+    /// asks for it: its J/K builds run on [`Self::packed_eri`].
     fn eri_tensor(&self) -> &[f64] {
-        self.eri.get_or_init(|| {
-            if rayon::current_num_threads() == 1 {
-                self.basis.eri()
-            } else {
-                build_eri_parallel(&self.basis)
-            }
+        self.eri.get_or_init(|| match self.eri_packed.get() {
+            Some(packed) => packed.expand(),
+            None if rayon::current_num_threads() == 1 => self.basis.eri(),
+            None => build_eri_parallel(&self.basis),
         })
+    }
+
+    fn packed_eri(&self) -> &packed::PackedEri {
+        self.eri_packed
+            .get_or_init(|| packed::PackedEri::build(&self.basis, PACKED_SCREENING_TAU))
+    }
+
+    fn contract_packed(&self, densities: &[Mat], want_k: bool) -> (Vec<Mat>, Vec<Mat>) {
+        let n = self.n_basis;
+        let densities: Vec<Vec<f64>> = densities.iter().map(mat_to_row_major).collect();
+        let (j, k) = self.packed_eri().contract(&densities, want_k);
+        let to_mats = |v: &[Vec<f64>]| v.iter().map(|m| mat_from_row_major(n, m)).collect();
+        (to_mats(&j), if want_k { to_mats(&k) } else { Vec::new() })
     }
 
     fn eri_lr_tensor(&self, omega: f64) -> &[f64] {
@@ -435,68 +383,12 @@ impl IntegralProvider for ConventionalProvider {
     }
 
     fn build_jk(&self, densities: &[Mat]) -> JkResult {
-        let n = self.n_basis;
-        let eri = self.eri_tensor();
-        let mut coulomb = Vec::with_capacity(densities.len());
-        let mut exchange = Vec::with_capacity(densities.len());
-
-        for density in densities {
-            let d = mat_to_row_major(density);
-            let mut j = vec![0.0; n * n];
-            let mut k = vec![0.0; n * n];
-            j.par_chunks_mut(n)
-                .zip(k.par_chunks_mut(n))
-                .enumerate()
-                .for_each(|(mu, (j_row, k_row))| {
-                    for (nu, (j_slot, k_slot)) in j_row.iter_mut().zip(k_row.iter_mut()).enumerate()
-                    {
-                        let mut j_sum = 0.0;
-                        let mut k_sum = 0.0;
-                        for lambda in 0..n {
-                            let coulomb_base = ((mu * n + nu) * n + lambda) * n;
-                            let exchange_base = ((mu * n + lambda) * n + nu) * n;
-                            let d_row = lambda * n;
-                            for sigma in 0..n {
-                                let d_ls = d[d_row + sigma];
-                                j_sum += eri[coulomb_base + sigma] * d_ls;
-                                k_sum += eri[exchange_base + sigma] * d_ls;
-                            }
-                        }
-                        *j_slot = j_sum;
-                        *k_slot = k_sum;
-                    }
-                });
-            coulomb.push(mat_from_row_major(n, &j));
-            exchange.push(mat_from_row_major(n, &k));
-        }
-
+        let (coulomb, exchange) = self.contract_packed(densities, true);
         JkResult { coulomb, exchange }
     }
 
     fn build_j(&self, densities: &[Mat]) -> Vec<Mat> {
-        let n = self.n_basis;
-        let eri = self.eri_tensor();
-        densities
-            .iter()
-            .map(|density| {
-                let d = mat_to_row_major(density);
-                let mut j = vec![0.0; n * n];
-                j.par_chunks_mut(n).enumerate().for_each(|(mu, j_row)| {
-                    for (nu, j_slot) in j_row.iter_mut().enumerate() {
-                        let mut j_sum = 0.0;
-                        for lambda in 0..n {
-                            let coulomb_base = ((mu * n + nu) * n + lambda) * n;
-                            let d_row = lambda * n;
-                            for sigma in 0..n {
-                                j_sum += eri[coulomb_base + sigma] * d[d_row + sigma];
-                            }
-                        }
-                        *j_slot = j_sum;
-                    }
-                });
-                mat_from_row_major(n, &j)
-            })
-            .collect()
+        self.contract_packed(densities, false).0
     }
 
     fn grid_coulomb(&self, points: &[[f64; 3]]) -> Option<Vec<f64>> {
@@ -524,12 +416,18 @@ impl IntegralProvider for ConventionalProvider {
 
 pub const DEFAULT_SCREENING_TAU: f64 = 1e-12;
 
+/// Schwarz cutoff on `Q_ij·Q_kl` for the stored in-core integrals. Unlike the
+/// direct backend's bound it carries no density factor, so it sits well below
+/// [`DEFAULT_SCREENING_TAU`].
+const PACKED_SCREENING_TAU: f64 = 1e-15;
+
 pub struct DirectProvider {
     basis: integral::Basis,
     charges: Vec<([f64; 3], f64)>,
     ecps: Vec<integral::Ecp>,
     n_basis: usize,
     contractor: integral::DirectContractor,
+    grad_contractor: gradient::GradContractorCell,
     tau: f64,
 }
 
@@ -547,6 +445,7 @@ impl DirectProvider {
             ecps: Vec::new(),
             n_basis,
             contractor,
+            grad_contractor: std::sync::OnceLock::new(),
             tau,
         }
     }
